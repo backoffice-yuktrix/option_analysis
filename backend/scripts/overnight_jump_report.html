@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Overnight Jump Analysis — NIFTY ATM CE+PE</title>
+<style>
+  :root {
+    color-scheme: light;
+    --surface: #fcfcfb; --page: #f9f9f7; --ink: #0b0b0b; --ink2: #52514e; --muted: #898781;
+    --grid: #e1e0d9; --border: rgba(11,11,11,0.10);
+    --red: 227,73,72; --blue: 42,120,214;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:where(:not([data-theme="light"])) {
+      color-scheme: dark;
+      --surface: #1a1a19; --page: #0d0d0d; --ink: #ffffff; --ink2: #c3c2b7; --muted: #898781;
+      --grid: #2c2c2a; --border: rgba(255,255,255,0.10);
+      --red: 230,103,103; --blue: 57,135,229;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --surface: #1a1a19; --page: #0d0d0d; --ink: #ffffff; --ink2: #c3c2b7; --muted: #898781;
+    --grid: #2c2c2a; --border: rgba(255,255,255,0.10);
+    --red: 230,103,103; --blue: 57,135,229;
+  }
+  * { box-sizing: border-box; }
+  body { background: var(--page); color: var(--ink); font-family: system-ui, -apple-system, "Segoe UI", sans-serif; margin: 0; padding: 24px; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .subtitle { color: var(--ink2); font-size: 13px; margin-bottom: 20px; }
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 16px 20px; margin-bottom: 20px; }
+  .stat-row { display: flex; gap: 24px; flex-wrap: wrap; }
+  .stat { min-width: 140px; }
+  .stat .v { font-size: 24px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .stat .l { font-size: 12px; color: var(--muted); }
+  .legend { display: flex; flex-wrap: wrap; gap: 14px; margin: 10px 0 6px; font-size: 12px; color: var(--ink2); }
+  .legend-item { display: inline-flex; align-items: center; gap: 6px; }
+  .swatch { width: 12px; height: 12px; border-radius: 3px; display: inline-block; }
+  .bin-0, .swatch.bin-0 { background: rgba(var(--red), 1.0); }
+  .bin-1, .swatch.bin-1 { background: rgba(var(--red), 0.72); }
+  .bin-2, .swatch.bin-2 { background: rgba(var(--red), 0.46); }
+  .bin-3, .swatch.bin-3 { background: rgba(var(--red), 0.24); }
+  .bin-4, .swatch.bin-4 { background: rgba(var(--blue), 0.24); }
+  .bin-5, .swatch.bin-5 { background: rgba(var(--blue), 0.46); }
+  .bin-6, .swatch.bin-6 { background: rgba(var(--blue), 0.72); }
+  .bin-7, .swatch.bin-7 { background: rgba(var(--blue), 1.0); }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th { text-align: left; color: var(--muted); font-weight: 500; font-size: 11px; text-transform: uppercase; letter-spacing: .03em; padding: 6px 8px; border-bottom: 1px solid var(--grid); }
+  td { padding: 6px 8px; border-bottom: 1px solid var(--grid); vertical-align: middle; }
+  td.label { white-space: nowrap; font-variant-numeric: tabular-nums; }
+  td.n { color: var(--muted); text-align: right; width: 50px; }
+  td.price { text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
+  td.price .range { color: var(--muted); font-size: 11px; }
+  td.legs { color: var(--ink2); font-size: 11px; white-space: nowrap; }
+  td.barcell { width: 220px; }
+  .bar { display: flex; height: 14px; width: 100%; border-radius: 4px; overflow: hidden; background: var(--grid); }
+  .seg { height: 100%; }
+  .topbins { color: var(--ink2); font-size: 12px; }
+  .table-scroll { overflow-x: auto; }
+  .table-scroll.tall { max-height: 480px; overflow-y: auto; }
+</style>
+</head>
+<body>
+
+<h1>Overnight Jump Analysis — NIFTY ATM Call + Put</h1>
+<div class="subtitle">Buy ATM CE+PE high (15:25-15:29) &rarr; sell low (09:15-10:59 next trading day) &middot; 2026-01-01 to 2026-07-31</div>
+
+<div class="card">
+  <div class="stat-row">
+    <div class="stat"><div class="v">2</div><div class="l">minute-samples analyzed</div></div>
+    <div class="stat"><div class="v">1</div><div class="l">profit samples</div></div>
+    <div class="stat"><div class="v">1</div><div class="l">loss samples</div></div>
+    <div class="stat"><div class="v">50.0%</div><div class="l">overall win rate</div></div>
+  </div>
+  <div class="legend"><span class="legend-item"><span class="swatch bin-0"></span>loss >10%</span><span class="legend-item"><span class="swatch bin-1"></span>loss 5-10%</span><span class="legend-item"><span class="swatch bin-2"></span>loss 1-5%</span><span class="legend-item"><span class="swatch bin-3"></span>loss 0-1%</span><span class="legend-item"><span class="swatch bin-4"></span>profit 0-1%</span><span class="legend-item"><span class="swatch bin-5"></span>profit 1-5%</span><span class="legend-item"><span class="swatch bin-6"></span>profit 5-10%</span><span class="legend-item"><span class="swatch bin-7"></span>profit >10%</span></div>
+  <div class="bar"><div class="seg bin-2" style="width:50.000%" title="loss 1-5%: 50.0%"></div><div class="seg bin-5" style="width:50.000%" title="profit 1-5%: 50.0%"></div></div>
+  <div class="topbins" style="margin-top:8px"><span class="topbin bin-2-text">loss 1-5%: 50.0% (avg -3.10%)</span> &nbsp;·&nbsp; <span class="topbin bin-5-text">profit 1-5%: 50.0% (avg +2.50%)</span></div>
+</div>
+
+<div class="card">
+  <h2 style="font-size:15px;margin:0 0 10px">Monthly</h2>
+  <div class="table-scroll"><table><thead><tr><th>Month</th><th>N</th><th>Distribution</th><th>Top bins (avg diff%)</th></tr></thead><tbody>
+  <tr><td class='label'>2026-01</td><td class='n'>2</td><td class='barcell'><div class="bar"><div class="seg bin-2" style="width:50.000%" title="loss 1-5%: 50.0%"></div><div class="seg bin-5" style="width:50.000%" title="profit 1-5%: 50.0%"></div></div></td><td class='topbins'><span class="topbin bin-2-text">loss 1-5%: 50.0% (avg -3.10%)</span> &nbsp;·&nbsp; <span class="topbin bin-5-text">profit 1-5%: 50.0% (avg +2.50%)</span></td></tr>
+  </tbody></table></div>
+</div>
+
+<div class="card">
+  <h2 style="font-size:15px;margin:0 0 10px">Weekly</h2>
+  <div class="table-scroll tall"><table><thead><tr><th>Week</th><th>N</th><th>Distribution</th><th>Top bins (avg diff%)</th></tr></thead><tbody>
+  <tr><td class='label'>Week of 2025-12-29</td><td class='n'>2</td><td class='barcell'><div class="bar"><div class="seg bin-2" style="width:50.000%" title="loss 1-5%: 50.0%"></div><div class="seg bin-5" style="width:50.000%" title="profit 1-5%: 50.0%"></div></div></td><td class='topbins'><span class="topbin bin-2-text">loss 1-5%: 50.0% (avg -3.10%)</span> &nbsp;·&nbsp; <span class="topbin bin-5-text">profit 1-5%: 50.0% (avg +2.50%)</span></td></tr>
+  </tbody></table></div>
+</div>
+
+<div class="card">
+  <h2 style="font-size:15px;margin:0 0 10px">Daily</h2>
+  <div class="subtitle" style="margin-bottom:10px">Buy Price = total_buy_price at 15:25-15:29 &middot; Sell Price = avg (min–max) of total_sell_price across the next day's 09:15-10:59 candles</div>
+  <div class="table-scroll tall"><table><thead><tr><th>Date</th><th>N</th><th>Buy Price</th><th>Sell Price</th><th>Legs (CE / PE)</th><th>Distribution</th><th>Top bins (avg diff%)</th></tr></thead><tbody>
+  <tr><td class='label'>2026-01-02</td><td class='n'>2</td><td class='price'>300.00</td><td class='price'>300.00 <span class='range'>(290.00–310.00)</span></td><td class='legs'>NIFTY 26150 CE 06 JAN 26 / NIFTY 26150 PE 06 JAN 26</td><td class='barcell'><div class="bar"><div class="seg bin-2" style="width:50.000%" title="loss 1-5%: 50.0%"></div><div class="seg bin-5" style="width:50.000%" title="profit 1-5%: 50.0%"></div></div></td><td class='topbins'><span class="topbin bin-2-text">loss 1-5%: 50.0% (avg -3.10%)</span> &nbsp;·&nbsp; <span class="topbin bin-5-text">profit 1-5%: 50.0% (avg +2.50%)</span></td></tr>
+  </tbody></table></div>
+</div>
+
+</body>
+</html>

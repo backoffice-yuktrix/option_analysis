@@ -1,0 +1,46 @@
+# ── Credentials & secrets ────────────────────────────────────────────────────
+upstox_config.txt
+backend/.env
+backend/*.env
+
+# ── Backend — Python ─────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# Virtual environments
+backend/.venv/
+backend/venv/
+backend/env/
+.venv/
+venv/
+env/
+
+# Run output (can be large; load manually from disk)
+backend/results/
+
+# Packaging / eggs
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# ── Frontend — Node ──────────────────────────────────────────────────────────
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/*.local
+package-lock.json
+
+# ── OS ───────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+*.log

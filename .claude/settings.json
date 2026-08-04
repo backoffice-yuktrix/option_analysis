@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import ast; ast.parse\\(open\\('routers/module2.py'\\).read\\(\\)\\)\")",
+      "Bash(curl -sL -o complete.json.gz \"https://assets.upstox.com/market-quote/instruments/exchange/complete.json.gz\" --max-time 60)",
+      "Bash(gunzip -k -f complete.json.gz)",
+      "Bash(python3 -c ' *)",
+      "Bash(python -c ' *)",
+      "Bash(rm -f /tmp/complete.json /tmp/complete.json.gz)",
+      "WebSearch",
+      "WebFetch(domain:zerodha.com)",
+      "Bash(python -c \"import sys; print\\(sys.executable\\)\")",
+      "Bash(./.venv/Scripts/python.exe -c ' *)",
+      "WebFetch(domain:upstox.com)"
+    ],
+    "additionalDirectories": [
+      "\\tmp"
+    ]
+  }
+}
