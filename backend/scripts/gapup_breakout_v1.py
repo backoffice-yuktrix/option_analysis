@@ -33,12 +33,21 @@ STEP 4 - TARGET
 
 KNOWN PITFALLS IN THIS DATA - both of these were shipped wrong once
 -------------------------------------------------------------------
-1. PDC MUST COME FROM THE DAILY CANDLES.  The 1-minute feed's last candle is
-   15:29 and misses the closing print; it differs from the official close on
-   94 of 124 sessions, by up to 85 NIFTY points.  Using it for PDC moved
-   GapUp% enough to mis-classify 7 days around the 0.30% line - 2 days traded
-   that never gapped up, 4 real gap-ups skipped.  load_daily() is the only
-   source of PDC.
+1. THE PDC BASIS IS A RULE CHOICE, AND IT IS NOT FREE.  --pdc selects it:
+
+     last1m  the previous session's last traded print (its 15:29 candle).
+             THE DEFAULT, settled with the user 2026-09-09 - it is the
+             previous close a chart shows, and the one the gap is judged
+             against in practice.
+     daily   the previous session's OFFICIAL close, from the daily candles.
+
+   They are not the same number: the 1-minute feed stops at 15:29 and carries
+   the last print, while the official close comes from the closing session.
+   Over 2026-03-09..2026-09-07 they differ on 98 of 124 sessions, by up to
+   85.70 points (2026-03-19), which moves the gap across the 0.30% line on 8
+   days.  Every day row carries pdc_alt / gap_pct_alt - the reading NOT in use
+   - so a day sitting on the threshold stays visible instead of silently
+   vanishing, which is how 2026-03-18 went unnoticed in the sibling script.
 
 2. A CLOSE-CONFIRMED STOP DOES NOT CAP THE LOSS AT 1R.  Reporting "risk =
    entry - SL" and then filling at a candle close silently understates the
@@ -68,12 +77,17 @@ from collections import defaultdict
 from datetime import date, timedelta
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.join(SCRIPT_DIR, ".."))
+BACKEND_DIR = os.path.join(SCRIPT_DIR, "..")
+sys.path.insert(0, BACKEND_DIR)
 
 from services.upstox_client import INSTRUMENT_KEYS, get_candles  # noqa: E402
 
-CONFIG_FILE = os.path.join(SCRIPT_DIR, "..", "upstox_config.txt")
-REPORT_HTML = os.path.join(SCRIPT_DIR, "gapup_breakout_v1_report.html")
+# backend/scripts holds only strategy code; the candle caches live in
+# backend/data and the generated reports in backend/reports.
+DATA_DIR = os.path.join(BACKEND_DIR, "data")
+REPORTS_DIR = os.path.join(BACKEND_DIR, "reports")
+CONFIG_FILE = os.path.join(BACKEND_DIR, "upstox_config.txt")
+REPORT_HTML = os.path.join(REPORTS_DIR, "gapup_breakout_v1_report.html")
 
 UNDERLYING = "NIFTY"
 UNDERLYING_KEY = INSTRUMENT_KEYS[UNDERLYING]
@@ -82,6 +96,15 @@ UNDERLYING_KEY = INSTRUMENT_KEYS[UNDERLYING]
 LOT_SIZE = 65
 
 GAP_PCT = 0.30                 # step 1 threshold, % of PDC
+# Which previous close the gap is measured against.  The 1-minute feed's last
+# candle is 15:29 and carries the last traded print; the daily feed carries the
+# official close.  They differ on 98 of 124 sessions here, by up to 85.70
+# points, which moves the gap across the 0.30% line on 8 days - so this is a
+# rule choice, not a data detail.  Default settled with the user 2026-09-09:
+# the last traded print, because that is the previous close a chart shows.
+PDC_MODES = [("last1m", "Previous session's last traded print (15:29 candle)"),
+             ("daily", "Previous session's OFFICIAL close (daily candles)")]
+DEFAULT_PDC = "last1m"
 RR_VALUES = [2.0, 3.0, 4.0, 5.0]
 DEFAULT_RR = 2.0
 # Two readings of step 3.  See KNOWN PITFALLS above.
@@ -116,13 +139,13 @@ def _read_access_token() -> str | None:
 
 def nifty_cache_path(from_date: date, to_date: date) -> str:
     return os.path.join(
-        SCRIPT_DIR, f"nifty_1m_{from_date.isoformat()}_{to_date.isoformat()}.json")
+        DATA_DIR, f"nifty_1m_{from_date.isoformat()}_{to_date.isoformat()}.json")
 
 
 def _slice_existing_cache(from_date: date, to_date: date) -> list[dict] | None:
     """Reuse a wider cache file that already covers the requested window."""
     best: tuple[int, list[dict], str] | None = None
-    for name in os.listdir(SCRIPT_DIR):
+    for name in os.listdir(DATA_DIR):
         if not (name.startswith("nifty_1m_") and name.endswith(".json")):
             continue
         stem = name[len("nifty_1m_"):-len(".json")]
@@ -133,7 +156,7 @@ def _slice_existing_cache(from_date: date, to_date: date) -> list[dict] | None:
             continue
         if c_from > from_date or c_to < from_date:
             continue
-        with open(os.path.join(SCRIPT_DIR, name)) as f:
+        with open(os.path.join(DATA_DIR, name)) as f:
             candles = json.load(f)
         kept = [c for c in candles
                 if from_date.isoformat() <= c.get("timestamp", "")[:10] <= to_date.isoformat()]
@@ -173,16 +196,16 @@ async def load_nifty(offline: bool, from_date: date, to_date: date) -> list[dict
 
 def daily_cache_path(from_date: date, to_date: date) -> str:
     return os.path.join(
-        SCRIPT_DIR, f"nifty_1d_{from_date.isoformat()}_{to_date.isoformat()}.json")
+        DATA_DIR, f"nifty_1d_{from_date.isoformat()}_{to_date.isoformat()}.json")
 
 
 async def load_daily(offline: bool, from_date: date, to_date: date) -> dict[str, float]:
     """{'YYYY-MM-DD': official session close} from the daily candle feed.
 
-    PDC must come from here, not from the last 1-minute candle: the 1-minute
-    feed stops at 15:29 and misses the closing print, which differs from the
-    official close by up to ~85 NIFTY points.  That error lands straight in
-    GapUp% and mis-classifies days on both sides of the 0.30% line.
+    This is the `--pdc daily` basis.  It is loaded even when --pdc is last1m,
+    because the report shows both readings side by side (pdc / pdc_alt) and
+    the difference is what decides the days sitting on the 0.30% line - see
+    KNOWN PITFALLS 1.
     """
     lookback = from_date - timedelta(days=15)       # enough to have a PDC for day 1
     cache = daily_cache_path(lookback, to_date)
@@ -415,10 +438,15 @@ async def run(args) -> None:
     if not days:
         raise RuntimeError("No sessions in the requested window.")
 
-    # PDC = previous session's OFFICIAL close, from the daily candles.
+    # PDC basis - see PDC_MODES.  The daily feed is loaded either way so the
+    # report can show both readings and the choice stays visible.
     daily_close = await load_daily(args.offline, args.from_date, args.to_date)
     dd = sorted(daily_close)
-    prev_close = {d: daily_close[dd[i - 1]] for i, d in enumerate(dd) if i}
+    official_prev = {d: daily_close[dd[i - 1]] for i, d in enumerate(dd) if i}
+    sess = sorted(by_day)
+    last1m_prev = {d: float(by_day[sess[i - 1]][-1]["close"])
+                   for i, d in enumerate(sess) if i}
+    prev_close = official_prev if args.pdc == "daily" else last1m_prev
 
     rr_values = args.rr_values
     labels = [rr_label(r) for r in rr_values]
@@ -430,10 +458,16 @@ async def run(args) -> None:
             rows.append({"date": d, "status": "no PDC", "gap_pct": None,
                          "met": False, "ex": {k: {} for k in stop_modes}})
             continue
-        rows.append(simulate_day(
+        row = simulate_day(
             d, by_day[d], prev_close[d], gap_pct=args.gap, scan_from=args.scan_from,
             scan_to=args.scan_to, square_off=args.square_off, rr_values=rr_values,
-            stop_modes=stop_modes))
+            stop_modes=stop_modes)
+        # the reading NOT used, so a day sitting on the threshold stays visible
+        alt = last1m_prev if args.pdc == "daily" else official_prev
+        if d in alt and row.get("open") is not None:
+            row["pdc_alt"] = round(alt[d], 2)
+            row["gap_pct_alt"] = round((row["open"] - alt[d]) / alt[d] * 100.0, 3)
+        rows.append(row)
 
     trades = sorted([r for r in rows if r["status"] == "trade"], key=lambda r: r["date"])
 
@@ -470,6 +504,7 @@ async def run(args) -> None:
         "meta": {
             "from": days[0], "to": days[-1], "sessions": len(days),
             "gap": args.gap, "rr_values": labels, "default_rr": rr_label(args.default_rr),
+            "pdc_mode": args.pdc, "pdc_label": dict(PDC_MODES)[args.pdc],
             "stop_modes": [{"key": k, "label": v} for k, v in STOP_MODES],
             "default_stop": args.stop_mode,
             "scan_from": args.scan_from, "scan_to": args.scan_to,
@@ -1086,6 +1121,9 @@ def main() -> None:
     ap.add_argument("--scan-to", default=SCAN_TO)
     ap.add_argument("--square-off", default=SQUARE_OFF)
     ap.add_argument("--offline", action="store_true", help="use local caches only")
+    ap.add_argument("--pdc", choices=[k for k, _ in PDC_MODES], default=DEFAULT_PDC,
+                    help="which previous close the gap is measured against "
+                         "(default: the previous session's last traded print)")
     ap.add_argument("--out", default=REPORT_HTML)
     ap.add_argument("--from", dest="from_date", type=date.fromisoformat,
                     default=today - timedelta(days=183), help="default: 6 months back")
@@ -1093,6 +1131,7 @@ def main() -> None:
     args = ap.parse_args()
     if args.default_rr not in args.rr_values:
         args.default_rr = args.rr_values[0]
+    os.makedirs(REPORTS_DIR, exist_ok=True)
     asyncio.run(run(args))
 
 
