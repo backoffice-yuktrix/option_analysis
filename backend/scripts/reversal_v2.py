@@ -52,20 +52,31 @@ from urllib.parse import quote
 import httpx
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.join(SCRIPT_DIR, ".."))
+BACKEND_DIR = os.path.join(SCRIPT_DIR, "..")
+sys.path.insert(0, BACKEND_DIR)
+
+# backend/scripts holds only strategy code; the candle caches live in
+# backend/data and the generated reports in backend/reports.
+DATA_DIR = os.path.join(BACKEND_DIR, "data")
+REPORTS_DIR = os.path.join(BACKEND_DIR, "reports")
 
 from services.upstox_client import (  # noqa: E402
     INSTRUMENT_KEYS, get_candles, get_option_contracts)
+from services.option_pricing import (  # noqa: E402
+    RateLimiter, api_get, ContractResolver, OptionCandleStore,
+    get_expired_expiries, get_expired_option_contracts,
+    get_option_day_candles)
 
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 
-CONFIG_FILE = os.path.join(SCRIPT_DIR, "..", "upstox_config.txt")
-CONTRACT_CACHE = os.path.join(SCRIPT_DIR, "reversal_contract_cache.json")
-OPTION_CACHE = os.path.join(SCRIPT_DIR, "reversal_option_cache.json")
-EXPIRY_CACHE = os.path.join(SCRIPT_DIR, "reversal_expiry_cache.json")
+CONFIG_FILE = os.path.join(BACKEND_DIR, "upstox_config.txt")
+# The contract / option-candle / expiry caches now live in
+# backend/services/option_pricing.py and are SHARED with every other
+# strategy, so a contract fetched once is never fetched again.
+EXPIRY_CACHE = os.path.join(DATA_DIR, "nifty_expiry_cache.json")
 
 BASE_V2 = "https://api.upstox.com/v2"
 UNDERLYING = "NIFTY"
@@ -109,14 +120,14 @@ FALLBACK_EXPIRIES_2026: list[date] = [
 ]
 
 
-REPORT_HTML = os.path.join(SCRIPT_DIR, "reversal_v2_report.html")
+REPORT_HTML = os.path.join(REPORTS_DIR, "reversal_v2_report.html")
 DEFAULT_RR = [2.0, 3.0, 3.5, 4.0, 4.5, 5.0]
 
 
 def nifty_cache_path(from_date: date, to_date: date) -> str:
     """One cache file per date range, so widening the range never reuses stale data."""
     return os.path.join(
-        SCRIPT_DIR, f"nifty_1m_{from_date.isoformat()}_{to_date.isoformat()}.json")
+        DATA_DIR, f"nifty_1m_{from_date.isoformat()}_{to_date.isoformat()}.json")
 
 
 def rr_label(r: float) -> str:
@@ -135,87 +146,9 @@ def _read_access_token() -> str:
     return lines[3]
 
 
-class RateLimiter:
-    """Crude but effective: at most one request every `interval` seconds."""
-
-    def __init__(self, interval: float = 0.25) -> None:
-        self._interval = interval
-        self._lock = asyncio.Lock()
-        self._next_at = 0.0
-
-    async def wait(self) -> None:
-        async with self._lock:
-            loop = asyncio.get_running_loop()
-            now = loop.time()
-            if now < self._next_at:
-                await asyncio.sleep(self._next_at - now)
-                now = loop.time()
-            self._next_at = now + self._interval
-
-
-async def api_get(client: httpx.AsyncClient, url: str, token: str, limiter: RateLimiter,
-                  params: dict | None = None, *, retries: int = 4) -> dict:
-    delay = 2.0
-    for attempt in range(retries + 1):
-        await limiter.wait()
-        headers = {"Accept": "application/json", "Authorization": f"Bearer {token}"}
-        try:
-            resp = await client.get(url, headers=headers, params=params)
-        except httpx.RequestError as exc:
-            if attempt == retries:
-                raise RuntimeError(f"network error for {url}: {exc}") from exc
-            await asyncio.sleep(delay)
-            delay *= 2
-            continue
-        if resp.status_code == 200:
-            return resp.json()
-        if resp.status_code in (429, 500, 502, 503, 504) and attempt < retries:
-            print(f"    ~ HTTP {resp.status_code}, backing off {delay:.0f}s")
-            await asyncio.sleep(delay)
-            delay *= 2
-            continue
-        raise RuntimeError(f"Upstox HTTP {resp.status_code} for {url}: {resp.text[:200]}")
-    raise RuntimeError(f"exhausted retries for {url}")
-
-
 # ---------------------------------------------------------------------------
 # Upstox endpoints (expired-instruments variants)
 # ---------------------------------------------------------------------------
-
-async def get_expired_expiries(client, token, limiter) -> list[date]:
-    data = await api_get(
-        client, f"{BASE_V2}/expired-instruments/expiries", token, limiter,
-        {"instrument_key": UNDERLYING_KEY},
-    )
-    return sorted(date.fromisoformat(s) for s in data.get("data", []) or [])
-
-
-async def get_expired_option_contracts(client, token, limiter, expiry: date) -> list[dict]:
-    data = await api_get(
-        client, f"{BASE_V2}/expired-instruments/option/contract", token, limiter,
-        {"instrument_key": UNDERLYING_KEY, "expiry_date": expiry.isoformat()},
-    )
-    return data.get("data", []) or []
-
-
-async def get_option_day_candles(client, token, limiter, instrument_key: str,
-                                 expired: bool, day: date) -> dict[str, float]:
-    """Return {"HH:MM": close} of 1-minute option candles for one day."""
-    key_enc = quote(instrument_key, safe="")
-    if expired:
-        url = (f"{BASE_V2}/expired-instruments/historical-candle/{key_enc}"
-               f"/1minute/{day.isoformat()}/{day.isoformat()}")
-    else:
-        url = (f"https://api.upstox.com/v3/historical-candle/{key_enc}"
-               f"/minutes/1/{day.isoformat()}/{day.isoformat()}")
-    data = await api_get(client, url, token, limiter)
-    raw = (data.get("data", {}) or {}).get("candles", []) or []
-    out: dict[str, float] = {}
-    for c in raw:
-        if len(c) >= 5:
-            out[c[0][11:16]] = float(c[4])
-    return out
-
 
 # ---------------------------------------------------------------------------
 # NIFTY spot data
@@ -464,101 +397,6 @@ def simulate_exit(day_map: dict[str, dict], t: str, side: str, entry_spot: float
 # ---------------------------------------------------------------------------
 # Contract resolution / option candles
 # ---------------------------------------------------------------------------
-
-class ContractResolver:
-    def __init__(self, client, token, limiter, all_expiries, live_expiries, live_by_key, offline):
-        self.client = client
-        self.token = token
-        self.limiter = limiter
-        self.all_expiries = all_expiries
-        self.live_expiries = set(live_expiries)
-        self.live_by_key = live_by_key
-        self.offline = offline
-        self.expired_contracts: dict[date, list[dict]] = {}
-        self.failed_expiries: set[date] = set()   # lookups that errored, not genuine misses
-        self.cache: dict[str, dict | None] = {}
-        if os.path.exists(CONTRACT_CACHE):
-            with open(CONTRACT_CACHE) as f:
-                self.cache = json.load(f)
-
-    def save(self) -> None:
-        with open(CONTRACT_CACHE, "w") as f:
-            json.dump(self.cache, f, indent=0)
-
-    def expiries_for(self, d: date, limit: int = 3) -> list[date]:
-        return [e for e in self.all_expiries if e >= d][:limit]
-
-    async def resolve(self, expiry: date, strike: float, option_type: str) -> dict | None:
-        key = f"{expiry.isoformat()}|{strike:.0f}|{option_type}"
-        if key in self.cache:
-            return self.cache[key]
-        if self.offline:
-            return None
-        found: dict | None = None
-        if expiry in self.live_expiries:
-            c = self.live_by_key.get((expiry.isoformat(), strike, option_type))
-            if c:
-                found = {"trading_symbol": c["trading_symbol"],
-                         "instrument_key": c["instrument_key"], "expired": False,
-                         "lot_size": int(c.get("lot_size") or 0)}
-        else:
-            if expiry not in self.expired_contracts:
-                try:
-                    self.expired_contracts[expiry] = await get_expired_option_contracts(
-                        self.client, self.token, self.limiter, expiry)
-                except RuntimeError as exc:
-                    print(f"    ! contracts for {expiry}: {exc}")
-                    self.expired_contracts[expiry] = []
-                    self.failed_expiries.add(expiry)
-            for c in self.expired_contracts[expiry]:
-                if float(c.get("strike_price", 0)) == strike and c.get("instrument_type") == option_type:
-                    found = {"trading_symbol": c.get("trading_symbol", ""),
-                             "instrument_key": c.get("instrument_key", ""), "expired": True,
-                             "lot_size": int(c.get("lot_size") or 0)}
-                    break
-        if found and found.get("lot_size") and found["lot_size"] != LOT_SIZE:
-            print(f"    !! lot size mismatch: {found['trading_symbol']} is "
-                  f"{found['lot_size']}, LOT_SIZE is {LOT_SIZE} - rupee PnL will be wrong")
-        if found is None and expiry in self.failed_expiries:
-            # The API call errored (expired token, rate limit, outage).  Caching
-            # this as "contract does not exist" would make every later run
-            # silently reproduce the gap, so leave it uncached and retry next time.
-            return None
-        self.cache[key] = found
-        return found
-
-
-class OptionCandleStore:
-    def __init__(self, client, token, limiter, offline):
-        self.client = client
-        self.token = token
-        self.limiter = limiter
-        self.offline = offline
-        self.cache: dict[str, dict[str, float]] = {}
-        if os.path.exists(OPTION_CACHE):
-            with open(OPTION_CACHE) as f:
-                self.cache = json.load(f)
-
-    def save(self) -> None:
-        with open(OPTION_CACHE, "w") as f:
-            json.dump(self.cache, f)
-
-    async def get(self, contract: dict, day: date) -> dict[str, float]:
-        key = f"{contract['instrument_key']}|{day.isoformat()}"
-        if key in self.cache:
-            return self.cache[key]
-        if self.offline:
-            return {}
-        try:
-            candles = await get_option_day_candles(
-                self.client, self.token, self.limiter,
-                contract["instrument_key"], contract["expired"], day)
-        except RuntimeError as exc:
-            print(f"    ! candles for {contract['trading_symbol']} {day}: {exc}")
-            return {}          # transient failure - do not cache the empty result
-        self.cache[key] = candles
-        return candles
-
 
 # ---------------------------------------------------------------------------
 # Grouping / summaries
@@ -1310,6 +1148,7 @@ def main() -> None:
     if args.side != "both":
         tag.append(f"{args.side.upper()} only")
 
+    os.makedirs(REPORTS_DIR, exist_ok=True)
     asyncio.run(run(
         args.trend, args.offline, args.out,
         detect_fn=make_detector("v2", side=args.side),

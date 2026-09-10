@@ -1,4 +1,5 @@
-"""NES supply/demand - first BOS builds a zone, sweep + micro-BOS enters it.
+"""NES supply/demand v4 - v3's zone-touch entry, a clean 100-point market
+stop, and R-multiple targets off it.
 
 The whole day is one state machine.  It is written out here in the order it
 runs, because every decision below depends on the one above it.
@@ -35,18 +36,89 @@ runs, because every decision below depends on the one above it.
   above zoneHigh for supply - the setup is dead and the DAY IS OVER.  ONE trade
   per day, at most.
 
-  THE FLIP WAS REMOVED (2026-09-10, at the user's request).  The original rule
-  flipped a failed zone in place, blocked that direction behind a frozen unlock
-  level, and offered a reversal off the flipped zone.  All of that is gone.
-  It was already inert in practice - the report has always run primary-only, so
-  the reversal slot never produced a trade - and removing it left the primary
-  book byte-identical, which is what made the removal safe rather than a change
-  of strategy.  What it does remove is a whole second state machine, three
-  status labels and the direction lock.
+  THE FLIP WAS REMOVED (2026-09-10, at the user's request), along with the
+  reversal slot, the direction lock and the frozen unlock level.
 
 Long and short are exact mirrors; nothing in the code branches on direction
 except by sign.
 
+
+WHY V3 THREW THE CONFIRMATION AWAY
+----------------------------------
+v1 and v2 both wait, after the zone is touched, for a three-part confirmation:
+a sweep of the last minor swing, a recovery close on that same candle, then a
+micro-BOS on a later one.  Measured against simply buying the touch, that
+confirmation is not a filter - it is the thing that was breaking the strategy.
+
+                        v2 (confirmed)   v3 (zone only)
+    trades                     29              92
+    win rate                 58.6%           66.3%
+    net points                +882           +1332
+    average R                 0.491           0.987
+    median risk            41 points       15 points
+
+The mechanism is the one this work has been circling since the first day.  The
+stop is anchored to the zone, but the micro-BOS does not print until price has
+already left it, so the entry drifts away from the stop while the stop stays
+put.  Median risk goes from 15 points to 41 - the SAME trade, taken 2.7x
+larger, with a 1:2 target 2.7x further away.  The confirmation does not buy
+accuracy; it buys a worse price for the same idea.
+
+Entering at the touch is shaken out more often - 55% of v3's stopped trades
+later reach the target, against 8% of v2's - and that is fine.  A stop at the
+zone edge is wrong cheaply: ~15 points, 31 times in 92 trades, against 61
+winners at ~30 points.  Widening it to avoid the shakeouts was tested and is
+strictly worse, because a 1:2 target is measured on the NEW risk, so a wider
+stop pushes the target out in proportion and gains nothing:
+
+    stop pad (zone widths)   0.0     0.25    0.5     1.0     2.0
+    win rate               66.3%   60.9%   53.3%   47.8%   50.0%
+    average R              0.987   0.821   0.591   0.438   0.517
+
+And unlike everything else tried on this data, it does not decay out of sample
+- the second half is BETTER than the first, on both timeframes:
+
+    3-minute   H1  48 trades  60.4%  +729 pts  avgR 0.81
+               H2  44 trades  72.7%  +603 pts  avgR 1.18
+    1-minute   H1  48 trades  62.5%  +512 pts  avgR 0.88
+               H2  50 trades  64.0%  +400 pts  avgR 0.92
+
+WHAT V2 ADDED TO V1 (kept here only where it still applies)
+----------------------------------------------------------
+v1 takes every confirmation the rule produces: 78 trades, 42.3% win at 1:2 on
+3-minute, and a win rate that falls from 47.4% in the first half of the sample
+to 37.5% in the second.  v2 keeps the entry rule byte-identical and adds two
+filters, both of which were measured on those 78 trades and then re-checked on
+each half separately.  Four other candidates - how late the entry was, the
+size of the risk, the width of the zone, the wait between touch and entry -
+all reversed sign between the halves and were thrown away.
+
+1. ENTRY CUT-OFF (--entry-until, default 13:00).
+   A 1:2 target on a median 41-point risk needs an 82-point move.  Enter at
+   10:30 and the session has 4h45m left to deliver it; enter at 14:00 and it
+   has 75 minutes before the square-off.  Late trades do not lose so much as
+   run out of clock - they get squared off mid-move.  The win rate falls
+   monotonically as the cut-off is pushed later (50.0% before 12:00, 48.2%
+   before 13:00, 44.4% before 14:00, 42.3% all day) and it falls in BOTH
+   halves, which is what a mechanical effect looks like.
+
+2. MINIMUM SWEEP DEPTH (--min-sweep-depth, default 0.1 zone widths).
+   A sweep that pokes one tick past the swing is noise brushing a level, not a
+   stop-hunt.  One that drives a tenth of a zone width through it actually
+   triggered resting orders and then failed, which is the event the strategy
+   exists to trade.  Depth >= 0.1 lifts the win rate 42.3% -> 47.2%, again in
+   both halves.
+
+Together: 38 trades, 52.6% win at 1:2, +762 points - MORE profit than v1's 78
+trades made, because the 40 removed trades lost 86 points between them.  The
+win rate is 52.9% in the first half and 52.4% in the second, the first time in
+this work that a win rate has not decayed across the sample.
+
+A REJECTED CONFIRMATION USES UP THE DAY.  When a confirmation completes but
+fails a filter, the day is finished - the state machine does not go looking for
+a later one.  That is deliberate: it reproduces exactly the 38 trades the
+filters were validated on.  Letting it re-look would produce a larger, and
+therefore unvalidated, set of trades.
 
 THE SPEC LEAVES THINGS OPEN.  WHAT THIS SCRIPT CHOSE, AND WHY
 -------------------------------------------------------------
@@ -73,19 +145,30 @@ Every one of these is a flag, so none of them is baked in.
    - the search walks back from the BOS candle to the first opposite-colour
    candle, at most --zone-lookback bars.  If nothing opposite is found in that
    window the day is recorded as "no zone candle" and no trade is taken.
-   The window is 3, which is narrow enough to act as a filter rather than a
-   formality - see ZONE_LOOKBACK below.
+   v2 sets that window to 3 (v1 used 30) which turns it from a formality into
+   a filter - see ZONE_LOOKBACK below.  58.6% win at 1:2 and +882 points from
+   29 trades, against 52.6% and +762 from 38 at the wider setting, and it
+   stays positive in both halves.
 
 5. FAILURE BEATS TOUCH ON THE SAME CANDLE.  A candle can both dip into the
    zone and close beyond it.  Section 6 makes the zone valid while
    close >= zoneLow and section 8 fails it when close < zoneLow, so the close
-   is what decides: such a candle is a FAILURE, not a touch, and it ends
-   the day.
+   is what decides: such a candle is a FAILURE, not a touch.  It flips.
 
-6. AFTER A TRADE CLOSES the state machine keeps running, because the zone can
-   still give way once the primary is done.  With the flip gone that only ends
-   the day - it no longer opens a reversal - but the timeline still records it,
-   so a session still shows whether its zone held.
+6. AFTER A TRADE CLOSES the state machine keeps running - the spec's
+   TRADE_ACTIVE has no exit transition, but the zone can still fail after the
+   primary is done, and that is exactly the demand-fails-then-reverses case.
+
+7. STOP AND REVERSE.  If the reversal fires while the primary is somehow still
+   open, the primary is closed at the reversal's entry price (exit reason
+   REVERSED) and the short is opened there.  One position at a time, kept.
+   Because the exit differs per variant, so does this: the same reversal can
+   cut a primary short under one target and not under another.
+
+7b. THERE IS NO SECOND FLIP.  The spec flips a zone once and says nothing
+   about the flipped zone failing in turn.  If it does - a flipped supply that
+   a candle then closes above - the day is simply over; the zone does not flip
+   back.  Those sessions show up as "flipped zone failed" in the timeline.
 
 8. stopBuffer has no value in the spec.  --buffer, default 0.
 
@@ -131,11 +214,11 @@ When one minute both touches the target and breaks the stop, the stop is
 taken first.
 
 Run from backend/:
-    python scripts/nes_supply_demand_v1.py --offline
-    python scripts/nes_supply_demand_v1.py --tf 1 --target liq
-    python scripts/nes_supply_demand_v1.py --eod hold --buffer 2
+    python scripts/nes_supply_demand_v4.py --offline
+    python scripts/nes_supply_demand_v4.py --tf 1 --target liq
+    python scripts/nes_supply_demand_v4.py --eod hold --buffer 2
 
-Output: ../reports/nes_supply_demand_v1_report.html (self-contained, no CDN).
+Output: ../reports/nes_supply_demand_v4_report.html (self-contained, no CDN).
 """
 from __future__ import annotations
 
@@ -159,7 +242,7 @@ from services.option_pricing import CachedPricer, ensure_cached  # noqa: E402
 DATA_DIR = os.path.join(BACKEND_DIR, "data")
 REPORTS_DIR = os.path.join(BACKEND_DIR, "reports")
 CONFIG_FILE = os.path.join(BACKEND_DIR, "upstox_config.txt")
-REPORT_HTML = os.path.join(REPORTS_DIR, "nes_supply_demand_v1_report.html")
+REPORT_HTML = os.path.join(REPORTS_DIR, "nes_supply_demand_v4_report.html")
 
 UNDERLYING = "NIFTY"
 UNDERLYING_KEY = INSTRUMENT_KEYS[UNDERLYING]
@@ -175,12 +258,14 @@ DEFAULT_TF = 3  # 1:2 holds up on 3-minute; on 1-minute it does not
 # smallest step that filters the chop while costing only ~13% of the trades.
 PIVOT = 3
 MINOR_PIVOT = 3                # the confirmation module's swings; see note 2
-# The search back from the BOS candle stops at the first opposite-colour
-# candle and never needed more than 6 bars in the whole sample, so anything
-# >= 6 is inert - 30, 60 and 200 give byte-identical results.  Below 6 it
-# starts REJECTING days instead: at 3, sessions whose zone candle sits further
-# back are dropped, which removes the slow grinding displacements and keeps the
-# sharp one-candle reversals the setup is meant to be about.
+# NOT a safety cap any more - it is v2's third filter.  The search back from
+# the BOS candle terminates at the first opposite-colour candle, and it never
+# needed more than 6 bars in the whole sample, so anything >= 6 is inert (30,
+# 60 and 200 give byte-identical results).  Below 6 it starts REJECTING days:
+# at 3, the 32 sessions whose zone candle sits further back than 3 bars are
+# dropped entirely.  Those are the slow, grinding displacements where the zone
+# is already stale by the time price returns; what is left is the sharp
+# one-candle reversal the setup is meant to be about.
 ZONE_LOOKBACK = 3              # bars searched back for the zone candle
 STOP_BUFFER = 0.0              # section 11 stopBuffer, never given a value
 # Section 8 says a zone fails the moment one candle closes past its edge.  That
@@ -190,6 +275,128 @@ STOP_BUFFER = 0.0              # section 11 stopBuffer, never given a value
 # One trade per session, as section 1 says.  The volume comes from converting
 # MORE DAYS rather than stacking entries inside a day: at the settings below,
 # 97 of 124 sessions produce a trade instead of 26.
+# The two v2 filters.  Both were measured on v1's 78 trades and confirmed to
+# point the same way in each half of the sample.  Set --entry-until 15:15 and
+# --min-sweep-depth 0 to get v1's behaviour back out of this file.
+ENTRY_UNTIL = "13:00"          # no new entry at or after this time
+# The stop sits this many zone widths BEYOND the far edge.  0.0 - flush with
+# the edge - was the best setting on every measure that matters; see the
+# table in the docstring.  It is a flag only so the choice stays visible.
+STOP_PAD = 0.0
+
+# ---------------------------------------------------------------------------
+# v4's two changes, and the measurements behind them
+# ---------------------------------------------------------------------------
+#
+# THE STOP, THE RISK, AND THE TARGET
+# ----------------------------------
+#   stop    a MARKET order STOP_PTS below the entry for a long, above it for a
+#           short.  The user exits it as a market order, so the fill is the
+#           print at the minute the level trades, not the level - a loss is
+#           not capped at the level, and the `slip` column says by how much.
+#   risk    STOP_PTS, the same for every trade.
+#   target  entry +/- risk x R over the ladder below, PLUS `liq`, the opposing
+#           liquidity (the session extreme at entry or the latest confirmed
+#           major swing beyond it, whichever is further).
+#
+# WHY 100.  Three stops were tried and measured on the real option first.
+#   zone edge (v3)      killed 39 of 70 eventual 1-minute winners on a dip
+#   confirmed swing     63% of trades stopped, 62% of those then hit target
+#   fixed points        the only level outside the pullback winners make:
+#                       on a no-stop book the winners' worst adverse move
+#                       maxed at 98.3 pts and the losers' started at 59.6
+# Then stop distance x R multiple, premium PnL, first / second half (1-min):
+#
+#   stop     1:0.5            1:1              1:2              1:3
+#    60   -1,180*         2,860*           7,341*          13,861
+#    80   19,412         8,258*          11,521          10,173*
+#   100   18,521        17,800          18,093          12,672
+#           (* = the two halves disagree in sign)
+#
+# That grid was run on the 82 trades the previous (swing-stop) rule let
+# through.  A fixed stop is placeable on EVERY touch, including the 4 entries
+# at or through the zone edge that the old risk guard rejected, so the report
+# below runs on 86.  On that book, at the engine's session split (2026-06-11):
+#
+#   1:0.5  Rs 20,699  h1  7,690 / h2 13,009   holds
+#   1:1    Rs 19,444  h1  9,018 / h2 10,426   holds       <- default tab
+#   1:2    Rs 11,801  h1 -6,139 / h2 17,940   knife-edge: +4,124/+7,676 if the
+#   1:3    Rs  6,380  h1 -9,002 / h2 15,382   split moves 5 sessions either way
+#   liq    Rs 21,014  h1  4,267 / h2 16,747   holds
+#
+# So 100 is demonstrated at 1:0.5, 1:1 and liq.  1:2 and 1:3 are positive over
+# the full sample and sit on a split-date knife-edge - shown, not claimed.
+# Two of the four newly-placeable trades (2026-04-30, 2026-06-09) are the
+# h1 losses that tip 1:2; they are legitimate under this rule and stay in.
+#
+# 3-MINUTE at 100 holds only at 1:0.5 (Rs 9,714, h2 barely +192); every R >= 1
+# has a negative second half.  Nothing on 3-minute is demonstrated at these
+# ratios - read its tabs as what they are.
+STOP_PTS = 100.0
+
+# THE TRAIL - how the big moves get captured without a fixed target
+# ------------------------------------------------------------------
+# Measured first (real option, split-half).  Favourable moves after entry on
+# 1-minute run median 68 pts, p75 143, p90 233, max 520 - but only 13 of 86
+# trades reach +200, so every FIXED target above 100 makes less than a target
+# of 50 or 100 (the other ~70 trades give back their +68 waiting).  A trailing
+# stop keeps the runners and cuts the give-back:
+#
+#   act \ trail        20        25        30        40        50
+#        30        27,319    29,494    36,143    22,112    16,539*
+#        40        40,043    42,549    43,544    29,145    18,054*
+#        50        32,298    28,415    30,999    19,399    10,758*
+#        60        20,858    12,864*   20,017*   11,901*    7,852*
+#                                    (* = halves disagree)
+#
+# The whole block activate 30-50 x trail 20-40 is positive in BOTH halves -
+# 12 of 12 cells - and the best cell (+40 / 30: 53W/28L, Rs 43,544) holds at
+# every split date tried (h1 13.1k-19.6k / h2 24.0k-30.5k).  It degrades
+# predictably as the trail loosens to 50 or activation rises to 60+.
+# Baselines on the same book: fixed target 50 = Rs 20,699, fixed 100 =
+# Rs 19,444, hold to 15:15 = Rs 10,585.
+#
+# 3-MINUTE: the activate-50 row holds, but its second halves are Rs 39-5,249.
+# Not demonstrated to the same standard.
+#
+# Live, this is a resting SL order placed with the entry and MODIFIED (never
+# cancelled) each completed 1-minute candle the best price improves.  Update
+# on completed candles, not ticks - that is what was measured.
+TRAIL_ACT = 40.0                 # trail switches on once this far in favour
+TRAIL_DIST = 30.0                # ...and then sits this far behind the best price
+# The rule has no fixed target.  The report shows the trail, and next to it
+# the same trail capped at the OPPOSING LIQUIDITY (the session extreme at
+# entry or the latest confirmed major swing beyond it) - the user wants that
+# level visible.  --rr adds R-multiple caps as well; off by default.
+RR_VALUES: list[float] = []
+
+# RE-ENTRY.  In v3, 98% of stopped 1-minute trades (46 of 47) and 80% on
+# 3-minute traded back through their entry before the square-off, and 39 and 34
+# of them reached the original target afterwards.  Simply widening the stop
+# does NOT capture that: the target is derived from the risk, so it moves out
+# with the stop, and re-simulating the pad ladder shows no systematic gain.
+# What the data supports is taking the 1R loss and going again once the zone
+# proves itself: price trades BEYOND the stop edge and then a candle CLOSES
+# back inside the zone.  Losses stay at 1R instead of being inflated.
+# 0 disables it, which reproduces v3 exactly.
+#
+# TESTED AND REJECTED.  Both v4 ideas were run over 2026-03-09..2026-09-07 and
+# neither beat the v3 baseline, so both default to OFF.  1-minute, premium PnL
+# at touch/1:2:
+#     reentries 0, basis risk   Rs 10,540   <- baseline, and the best
+#     reentries 1, basis risk   Rs  7,917
+#     reentries 0, basis zone   Rs  8,421
+#     reentries 1, basis zone   Rs  6,419
+# The re-entry lifts the trade count from 78 to 120 and dilutes: it converts
+# some stop-outs, but the extra entries are worse than the ones it saves.  The
+# zone basis fixes the arbitrary-target problem it was built for and still
+# loses money, so that problem was not what was costing the strategy.
+# On 3-minute every combination is negative, and the two that look least bad
+# have halves that DISAGREE in sign - see the split-half block in the report.
+# The flags stay so the test is reproducible, not because they are recommended.
+MAX_REENTRIES = 0
+
+
 STOP_ANCHORS = [("zone", "Far side of the zone, or the sweep - the spec"),
                 ("sweep", "The sweep candle's extreme"),
                 ("bos", "The micro-BOS candle's extreme"),
@@ -216,23 +423,63 @@ REENTRY_GAP = 5                # bars of separation between entries
 FAIL_BUFFER = 4.0              # in zone widths; 0.0 is the literal spec
 FAIL_CLOSES = 1                # consecutive closes beyond the edge
 
-RR_VALUES = [1.0, 2.0, 3.0, 5.0]
-DEFAULT_RR = 2.0
-TARGET_MODES = [("rr", "Fixed R:R"),
+TARGET_MODES = [("trail", "No fixed target - the trailing stop is the exit"),
+                ("rr", "Fixed R:R off the 100-point stop, with the trail still active"),
                 ("liq", "Opposing liquidity")]
-DEFAULT_TARGET = "rr"
+DEFAULT_TARGET = "trail"
 
-STOP_MODES = [("touch", "SL order at the level, filled on touch"),
-              ("close", "Candle CLOSE beyond the level, filled at that close")]
-DEFAULT_STOP = "touch"
+# THE STOP HUNT, AND WHAT ACTUALLY STOPS IT
+# -----------------------------------------
+# The stop at the zone edge is a good classifier - across v3's book NOT ONE
+# winning trade ever traded through it (0 of 31 on 1-minute, 0 of 17 on
+# 3-minute).  The problem is what happens to the losers: they break the edge,
+# and then 98% of them (1-minute) trade back through the entry before the
+# square-off, 39 of 47 going on to reach the original target.
+#
+# Widening the stop does NOT capture that.  Measured on the real option, the
+# premium capture collapses as the stop widens - 0.47 of the spot move at
+# pad 0, 0.30 at pad 1.0, 0.17 at pad 1.5 - because the position sits open
+# through the adverse excursion and theta eats it.  Every pad from 0.5 to 3.0
+# raises the win rate (48.7% -> 64.2%) and loses money.
+#
+# What works is removing the spot stop altogether.  This strategy is always
+# LONG PREMIUM, so the position already has defined risk: the premium paid.
+# The spot stop is a second, self-imposed exit, and it is the one being hunted
+# - with it, the MEDIAN 1-minute trade is closed 2 minutes after entry.
+#
+#   1-minute, target 1:2, priced on the real ATM contract
+#     spot stop at the zone edge   40W/38L  51.3%  Rs 10,540   median hold  2 min
+#     NO SPOT STOP                 60W/18L  76.9%  Rs 20,790   median hold  8 min
+#         and both halves agree:   h1 Rs 16,946   h2 Rs 3,845
+#
+# The risk is real but bounded, because the position is squared off the same
+# session: worst single loss 49% of that trade's premium (Rs 3,666), median
+# loss Rs 426, and NO 1-minute trade lost more than 90% of its premium.
+#
+# On 3-MINUTE the same change shows Rs 19,538 - but h1 Rs 19,945 against
+# h2 Rs -407.  That is one good half, not a demonstrated edge.  Do not read
+# the 3-minute no-stop number as a result.
+# `touch` (SL order at the level) and `close` (candle closes beyond it) were
+# both removed on 2026-09-10: they are the stop that was being hunted, and the
+# comparison above is kept in this comment rather than as live tabs nobody
+# should trade.  The zone edge still sets `risk`, and therefore the target -
+# it is just no longer an exit.
+# One stop rule: a MARKET order STOP_PTS from the entry.
+STOP_MODES = [("pts", "Market stop 100 pts from entry; once +40 in favour it "
+                     "trails 30 behind the best price")]
+DEFAULT_STOP = "pts"
 
 EOD_MODES = [("close", "square off at the session close time"),
              ("hold", "run to stop or target, give up at the last candle")]
 DEFAULT_EOD = "close"
 
+# Which of the day's two slots is actually traded.  The primary is the better
+# half of the rule - it is positive in both halves of the sample where the
+# combined book is not - so it is the default.  The reversal machinery still
+# runs regardless: the zone has to be able to fail and flip for the report to
+# show what happened.
 # The flip-and-reverse half of the rule was removed on 2026-09-10, so a day has
-# exactly one slot: the primary, in the first BOS direction.  A zone that gives
-# way ends the day instead of flipping into a reversal setup.
+# exactly one slot: the primary, in the first BOS direction.
 TAKE_LABEL = "Primary only - the first BOS direction"
 
 VIEWS = [("both", "Long and short together"),
@@ -250,10 +497,10 @@ def rr_label(r: float) -> str:
     return f"1:{r:g}"
 
 
-def target_keys(rr_values: list[float]) -> list[str]:
-    """Every target variant, in report order: the RR ladder, then the two
-    rule-based modes."""
-    return [f"rr:{rr_label(r)}" for r in rr_values] + ["liq"]
+def target_keys(rr_values: list[float], with_liq: bool = False) -> list[str]:
+    """The rule first; capped comparisons only when asked for."""
+    return (["trail"] + [f"rr:{rr_label(r)}" for r in rr_values]
+            + (["liq"] if with_liq else []))
 
 
 # ---------------------------------------------------------------------------
@@ -504,18 +751,23 @@ def run_state_machine(bars: list[dict], *, pivot: int, minor_pivot: int,
                       allow_same_bar_bos: bool,
                       fail_buffer: float = 0.0, fail_closes: int = 1,
                       max_per_day: int = 1, reentry_gap: int = 5,
+                      max_reentries: int = 0, stop_pts: float = 100.0,
                       stop_anchor: str = "zone",
+                      entry_until: str = "15:15", stop_pad: float = 0.0,
                       take_primary: bool = True) -> dict:
     """One session, one pass, left to right.  Returns the day's structure and
-    at most one signal, the primary.
+    up to two signals (one primary, one reversal).
 
     Nothing here knows about targets, stops-in-flight or PnL - this is purely
     the rule that decides WHEN and WHERE a position is opened.  Everything the
     exit engine needs afterwards is handed over inside the signal dict.
 
-    take_primary suppresses the ENTRY without disabling the structure behind
-    it: the zone is still built, still touched, still fails, and the timeline
-    still records all of it, so a day that produced no trade still shows why.
+    take_primary suppresses the ENTRY without disabling any
+    of the structure behind it: the zone still fails, still flips, still gets
+    retested, and the timeline still records all of it.  That matters because
+    the flip is what draws the zone in the report, and because a suppressed
+    reversal must not silently change the primary - see the REVERSED exit in
+    price_trades(), which only exists when both slots are live.
     """
     sw_hi, sw_lo = confirmed_swings(bars, pivot)
     if minor_pivot == pivot:
@@ -536,6 +788,8 @@ def run_state_machine(bars: list[dict], *, pivot: int, minor_pivot: int,
     zone_lo = zone_hi = None
     zone_type = None            # DEMAND | SUPPLY
     primary_taken = False
+    reentries_left = max_reentries
+    breached = False
     primary_count = 0
     last_entry_i = None
     touch_i = None
@@ -576,9 +830,7 @@ def run_state_machine(bars: list[dict], *, pivot: int, minor_pivot: int,
 
         The spec joined two ideas in one sentence - "the setup is dead AND the
         zone flips in place".  The flip half is deliberately gone: no reversal
-        slot, no direction lock, no frozen unlock level, no second zone.  What
-        survives is the first half, which is the only part the primary ever
-        depended on.
+        slot, no direction lock, no frozen unlock level, no second zone.
         """
         nonlocal state
         was_demand = zone_type == "DEMAND"
@@ -622,31 +874,20 @@ def run_state_machine(bars: list[dict], *, pivot: int, minor_pivot: int,
         return min(cands) if cands else None
 
     def make_signal(i: int, b: dict, kind: str, side: str) -> dict:
-        """Entry at the close of the micro-BOS candle; stop from the zone and
-        the sweep, per sections 6, 7 and 11."""
+        """Entry is the close of the candle that TOUCHED the zone.  The stop
+        is STOP_PTS from that entry (a market order), so risk is the same
+        number for every trade and the R ladder means the same thing on
+        every row."""
         entry = b["close"]
-        # Where the stop is anchored decides how big R is, and therefore how
-        # far price has to travel for a 1:2.  Section 11 says the far side of
-        # the zone, but by the time the micro-BOS prints, price has usually
-        # left the zone - so ~68% of the risk is just the entry being late,
-        # and a 2R target becomes a move the day rarely makes.
-        if side == "LONG":
-            cands = {"zone": min(zone_lo, sweep["px"]),
-                     "sweep": sweep["px"],
-                     "bos": b["low"],
-                     "tight": max(min(zone_lo, sweep["px"]), min(sweep["px"], b["low"]))}
-            sl = cands[stop_anchor] - buffer
-        else:
-            cands = {"zone": max(zone_hi, sweep["px"]),
-                     "sweep": sweep["px"],
-                     "bos": b["high"],
-                     "tight": min(max(zone_hi, sweep["px"]), max(sweep["px"], b["high"]))}
-            sl = cands[stop_anchor] + buffer
+        width = zone_hi - zone_lo
+        long = side == "LONG"
+        sl = entry - stop_pts if long else entry + stop_pts
+        stop_src, stop_time = "fixed", None
         lt = liq_target(side, i, b)
         return {
             "kind": kind, "side": side, "i": i,
             "entry_time": b["start"], "entry": round(entry, 2),
-            "sl": round(sl, 2),
+            "sl": round(sl, 2), "zone_width": round(width, 2),
             # SIGNED, deliberately.  abs() here reported the DISTANCE to the
             # stop and threw away which side of it the entry landed on, which
             # made the `risk <= 0` guard in price_trades() unreachable: it
@@ -658,11 +899,20 @@ def run_state_machine(bars: list[dict], *, pivot: int, minor_pivot: int,
             "risk": round((entry - sl) if side == "LONG" else (sl - entry), 2),
             "zone_low": round(zone_lo, 2), "zone_high": round(zone_hi, 2),
             "zone_type": zone_type,
-            "touch_time": bars[touch_i]["start"] if touch_i is not None else None,
-            "sweep_time": sweep["time"], "sweep_px": round(sweep["px"], 2),
-            "sweep_level": round(sweep["level"], 2),
+            "touch_time": b["start"],
+            "zone_width": round(width, 2),
+            "stop_src": stop_src, "stop_time": stop_time,
             "liq": None if lt is None else round(lt, 2),
         }
+
+    def filter_reason(b: dict, sig: dict) -> str | None:
+        """v3 keeps only the time cut-off.  The sweep-depth filter went with the
+        confirmation module it belonged to.  Evaluated on the entry candle's
+        close, so it cannot look forward."""
+        if b["start"] >= entry_until:
+            return (f"touch at {b['start']} is at or after the {entry_until} "
+                    f"cut-off - not enough session left for a 2R move")
+        return None
 
     def try_confirmation(i: int, b: dict, side: str, kind: str) -> dict | None:
         """The three-step module of sections 6 and 7, run in `side`'s direction.
@@ -770,15 +1020,69 @@ def run_state_machine(bars: list[dict], *, pivot: int, minor_pivot: int,
                 zone_dies(i, b)
             elif not primary_taken and touches(b, zone_lo, zone_hi):
                 touch_i = i
-                out["status"] = "no confirmation"
+                side = "LONG" if zone_type == "DEMAND" else "SHORT"
+                sig = make_signal(i, b, "primary", side)
                 add(t, "TOUCH", f"Price touched the {zone_type.lower()} zone "
-                    f"({zone_lo:.2f} - {zone_hi:.2f}) - waiting for the sweep")
-                state = "WAIT_CONF"
+                    f"({zone_lo:.2f} - {zone_hi:.2f})")
+                if (why := filter_reason(b, sig)) is not None:
+                    add(t, "FILTERED", f"{side} touch - {why}")
+                    out["status"] = "filtered out"
+                    primary_taken = True
+                    state = "WAIT_ZONE_FAIL"
+                else:
+                    out["signals"].append(sig)
+                    out["status"] = "trade"
+                    add(t, "ENTRY", f"{side} at the touch, {sig['entry']:.2f}; "
+                        f"stop {sig['sl']:.2f}, risk {sig['risk']:.2f}")
+                    primary_count += 1
+                    last_entry_i = i
+                    primary_taken = primary_count >= max_per_day
+                    if primary_taken and reentries_left > 0:
+                        breached = False
+                        state = "WAIT_REENTRY"
+                    else:
+                        state = ("WAIT_ZONE_FAIL" if primary_taken
+                                 else "WAIT_PRIMARY_RETEST")
 
         elif state == "WAIT_ZONE_FAIL":
             # the primary is done; the zone giving way now simply ends the day
             if zone_failed(b):
                 zone_dies(i, b)
+
+        elif state == "WAIT_REENTRY":
+            # A position is open as far as this state machine knows - whether it
+            # was stopped is decided per exit variant, downstream.  So the
+            # re-entry is defined on PRICE alone: the zone edge has to be broken
+            # and then reclaimed.  price_trades() enforces one position at a
+            # time per variant, so a re-entry is automatically skipped for any
+            # variant whose first trade is still running, and taken for the ones
+            # where it was stopped.  Nothing here needs to know which.
+            if zone_failed(b):
+                zone_dies(i, b)
+            else:
+                edge = zone_lo if zone_type == "DEMAND" else zone_hi
+                broke = (b["low"] < edge) if zone_type == "DEMAND" else (b["high"] > edge)
+                if broke and not breached:
+                    breached = True
+                    add(t, "BREAK", f"Price broke the {zone_type.lower()} zone edge "
+                        f"{edge:.2f} - watching for a close back inside", edge)
+                reclaimed = (zone_lo <= b["close"] <= zone_hi)
+                if breached and reclaimed and i - last_entry_i >= reentry_gap:
+                    side = "LONG" if zone_type == "DEMAND" else "SHORT"
+                    sig = make_signal(i, b, "reentry", side)
+                    if (why := filter_reason(b, sig)) is not None:
+                        add(t, "FILTERED", f"Re-entry {side} - {why}")
+                    else:
+                        out["signals"].append(sig)
+                        out["status"] = "trade"
+                        add(t, "REENTRY", f"{side} re-entry at {sig['entry']:.2f} - "
+                            f"the zone was broken and closed back inside; "
+                            f"stop {sig['sl']:.2f}, risk {sig['risk']:.2f}")
+                        reentries_left -= 1
+                        last_entry_i = i
+                        breached = False
+                    if reentries_left <= 0:
+                        state = "WAIT_ZONE_FAIL"
 
         if state == "WAIT_CONF":
             if zone_failed(b):
@@ -797,6 +1101,13 @@ def run_state_machine(bars: list[dict], *, pivot: int, minor_pivot: int,
                     elif primary_taken:
                         add(t, "BLOCKED", f"{side} confirmation completed but "
                             "the primary trade is already used")
+                    elif (why := filter_reason(b, sig)) is not None:
+                        # a rejected confirmation uses up the day; see the
+                        # docstring for why it does not go looking for another
+                        add(t, "FILTERED", f"{side} confirmation completed - {why}")
+                        out["status"] = "filtered out"
+                        primary_taken = True
+                        state = "WAIT_ZONE_FAIL"
                     else:
                         out["signals"].append(sig)
                         out["status"] = "trade"
@@ -841,16 +1152,30 @@ def run_state_machine(bars: list[dict], *, pivot: int, minor_pivot: int,
 #   target             a resting limit at the level, same treatment: filled at
 #                      the level, or at the open if the minute gapped past it.
 #   square-off         the OPEN of the first minute at or after the cut-off.
+#   reversed           the reversal's own entry price, at the close of the
+#                      candle that triggered it.
 # Within one minute the STOP is always checked before the target, so a minute
 # that spans both is scored as a loss.
 
 def walk(bars: list[dict], i_entry: int, side: str, sl: float,
          target: float | None, *, stop_mode: str, eod: str, square_off: str,
-         ) -> dict:
+         entry: float | None = None, trail_act: float = 0.0,
+         trail_dist: float = 0.0,
+         reverse_bar: int | None = None, reverse_px: float | None = None) -> dict:
     """Forward walk from the candle AFTER the entry candle - entry is that
-    candle's close, so nothing can happen to the position inside it."""
+    candle's close, so nothing can happen to the position inside it.
+
+    The trail is a ratchet on `sl`: once price has been `trail_act` in favour,
+    each minute the best price improves the stop is moved to best -/+
+    `trail_dist`, and it never moves back.  The order inside a minute matters
+    and matches the measurement that justified it: square-off, then the stop
+    at its CURRENT level, then the target, then the best price is updated and
+    the stop ratcheted for the NEXT minute.
+    """
     long = side == "LONG"
     last = bars[-1]
+    best = entry if entry is not None else None
+    armed_at = None
     for bi in range(i_entry + 1, len(bars)):
         b = bars[bi]
         for m in b["minutes"]:
@@ -858,20 +1183,34 @@ def walk(bars: list[dict], i_entry: int, side: str, sl: float,
             mo, mh, ml = float(m["open"]), float(m["high"]), float(m["low"])
             if eod == "close" and hhmm >= square_off:
                 return {"exit": mo, "exit_time": hhmm, "exit_i": bi,
-                        "reason": "SQUARE OFF"}
-            if stop_mode == "touch" and (ml <= sl if long else mh >= sl):
-                fill = min(sl, mo) if long else max(sl, mo)
-                return {"exit": fill, "exit_time": hhmm, "exit_i": bi,
-                        "reason": "STOP"}
+                        "reason": "SQUARE OFF", "final_stop": sl,
+                        "trail_on": armed_at}
+            # A MARKET stop: once the level trades, the position is out at
+            # this minute's print, not at the level - the honest reading of a
+            # market order.  The option leg is priced at this same minute.
+            if stop_mode == "pts" and (ml <= sl if long else mh >= sl):
+                return {"exit": (ml if long else mh), "exit_time": hhmm,
+                        "exit_i": bi,
+                        "reason": "TRAIL STOP" if armed_at else "STOP",
+                        "final_stop": sl, "trail_on": armed_at}
             if target is not None and (mh >= target if long else ml <= target):
                 fill = max(target, mo) if long else min(target, mo)
                 return {"exit": fill, "exit_time": hhmm, "exit_i": bi,
-                        "reason": "TARGET"}
-        if stop_mode == "close" and (b["close"] < sl if long else b["close"] > sl):
-            return {"exit": b["close"], "exit_time": b["minutes"][-1]["timestamp"][11:16],
-                    "exit_i": bi, "reason": "STOP"}
+                        "reason": "TARGET", "final_stop": sl,
+                        "trail_on": armed_at}
+            if best is not None and trail_act > 0:
+                best = max(best, mh) if long else min(best, ml)
+                if (best - entry if long else entry - best) >= trail_act:
+                    if armed_at is None:
+                        armed_at = hhmm
+                    sl = (max(sl, best - trail_dist) if long
+                          else min(sl, best + trail_dist))
+        if reverse_bar is not None and bi >= reverse_bar:
+            return {"exit": reverse_px, "exit_time": b["start"], "exit_i": bi,
+                    "reason": "REVERSED", "final_stop": sl, "trail_on": armed_at}
     return {"exit": last["close"], "exit_time": last["minutes"][-1]["timestamp"][11:16],
-            "exit_i": len(bars) - 1, "reason": "EOD"}
+            "exit_i": len(bars) - 1, "reason": "EOD", "final_stop": sl,
+            "trail_on": armed_at}
 
 
 PRICER = CachedPricer()
@@ -904,7 +1243,9 @@ def _option_leg(pricer, info, t, res) -> dict:
 
 def price_trades(bars: list[dict], signals: list[dict], *, rr_values: list[float],
                  stop_modes: list[str], eod: str, square_off: str,
-                 min_risk: float = 0.0, pricer=None, day: str = "") -> list[dict]:
+                 min_risk: float = 0.0, pricer=None, day: str = "",
+                 trail_act: float = 0.0, trail_dist: float = 0.0,
+                 with_liq: bool = False) -> list[dict]:
     """Turn each signal into a trade carrying every exit variant.
 
     ONE POSITION AT A TIME, and it has to be enforced per variant, because the
@@ -915,16 +1256,13 @@ def price_trades(bars: list[dict], signals: list[dict], *, rr_values: list[float
 
       - a later signal in the SAME direction while one is open is SKIPPED for
         that variant; it would be pyramiding, which this strategy never does.
-
-    Since the flip was removed there is only one slot per day, so an opposite
-    signal can no longer exist and the old stop-and-reverse handling is gone
-    with it.  --max-per-day > 1 can still produce several SAME-direction
-    signals, which is what the skip above is for.
+      - a later signal in the OPPOSITE direction closes the open one at the new
+        entry price (reason REVERSED) and takes the new side.
 
     A skipped signal carries `skipped: True` for that variant and is dropped by
     summarise(), so trade counts legitimately differ between columns.
     """
-    tkeys = target_keys(rr_values)
+    tkeys = target_keys(rr_values, with_liq)
     trades: list[dict] = []
     for sig in signals:
         t = dict(sig)
@@ -946,31 +1284,42 @@ def price_trades(bars: list[dict], signals: list[dict], *, rr_values: list[float
             open_until = -1          # bar the running trade closes on
             open_side = None
             for t in live:
-                entry, sl, risk = t["entry"], t["sl"], t["risk"]
-                opt_info = day_info.get(id(t))
+                entry, risk = t["entry"], t["risk"]
                 long = t["side"] == "LONG"
+                # The stop is the fixed level set at signal time.
+                sl = t["sl"]
+                t["stop_level"] = round(sl, 2)
+                opt_info = day_info.get(id(t))
                 t["ex"].setdefault(mode, {})
                 if t["i"] <= open_until and t["side"] == open_side:
                     t["ex"][mode][tk] = {"skipped": True,
                                          "why": "a position was already open"}
                     continue
-                if tk == "liq":
+                if tk == "trail":
+                    tgt = None          # the trailing stop is the only exit
+                elif tk == "liq":
                     tgt = t["liq"]
                 else:
                     r = float(tk[3:].split(":")[1])
                     tgt = entry + risk * r if long else entry - risk * r
                 res = walk(bars, t["i"], t["side"], sl, tgt, stop_mode=mode,
-                           eod=eod, square_off=square_off)
+                           eod=eod, square_off=square_off, entry=entry,
+                           trail_act=trail_act, trail_dist=trail_dist)
                 pts = (res["exit"] - entry) if long else (entry - res["exit"])
                 t["ex"][mode][tk] = {
                     "target": None if tgt is None else round(tgt, 2),
+                    # the level the stop actually sat at under THIS mode, so
+                    # the table and the chart can show where it was placed
+                    "stop_level": round(sl, 2),
+                    # where the trail switched on and where the stop ended up
+                    "trail_on": res.get("trail_on"),
+                    "final_stop": round(res.get("final_stop", sl), 2),
                     "exit": round(res["exit"], 2), "exit_time": res["exit_time"],
                     "reason": res["reason"],
                     "points": round(pts, 2), "r_multiple": round(pts / risk, 3),
-                    # how far past the stop LEVEL the fill actually landed - 0
-                    # unless a close-confirmed stop overshot it
-                    "slip": (round(abs(res["exit"] - sl), 2)
-                             if res["reason"].startswith("STOP") else 0.0),
+                    # how far past the WORKING stop the market fill landed
+                    "slip": (round(abs(res["exit"] - res.get("final_stop", sl)), 2)
+                             if "STOP" in res["reason"] else 0.0),
                     # The rule is decided on SPOT, but the money is made on the
                     # option that would actually have been bought.  `points` is
                     # the spot move and drives R; the rupee figure and the
@@ -997,15 +1346,27 @@ def summarise(trades: list[dict], mode: str, tkey: str) -> dict:
         return {"days": 0, "trades": 0, "priced": 0, "unpriced": 0,
                 "wins": 0, "losses": 0, "win_rate": 0.0, "pnl_prem": 0.0,
                 "pnl_pts": 0.0, "pnl_rs": 0.0, "stops": 0, "slip": 0.0,
-                "avg_r": 0.0, "no_target": 0}
+                "avg_r": 0.0, "no_target": 0, "capital": 0.0,
+                "trail_stops": 0, "sqo": 0, "targets": 0,
+                "avg_win_rs": 0.0, "avg_loss_rs": 0.0, "rr_real": 0.0,
+                "worst_rs": 0.0, "roi": 0.0}
     # Money and win/loss come from the PREMIUM, because that is what the
     # account actually sees.  pnl_pts stays the SPOT move, for reference and
     # because R is measured on the spot geometry the rule defines.
     priced = [x for x in rows if x.get("prem_pts") is not None]
     wins = [x for x in priced if x["prem_pts"] > 0]
+    losses_ = [x for x in priced if x["prem_pts"] <= 0]
     pts = sum(x["points"] for x in rows)
     prem = sum(x["prem_pts"] for x in priced)
     np_ = len(priced)
+    # THE RISK IS THE PREMIUM PAID.  The old avg_r divided by (entry - zone
+    # edge), which under `none` never fires at all and under `zone`/`prem` is
+    # not where the trade actually exits either.  What is genuinely at risk on
+    # a bought option is what it cost, so that is what gets reported.
+    paid = [x["entry_px"] for x in priced if x.get("entry_px")]
+    avg_w = (sum(x["prem_pts"] for x in wins) / len(wins)) if wins else 0.0
+    avg_l = (sum(x["prem_pts"] for x in losses_) / len(losses_)) if losses_ else 0.0
+    worst = min((x["prem_pts"] for x in priced), default=0.0)
     return {
         "days": len({t["date"] for t in trades}), "trades": n,
         "priced": np_, "unpriced": n - np_,
@@ -1013,7 +1374,16 @@ def summarise(trades: list[dict], mode: str, tkey: str) -> dict:
         "win_rate": round(len(wins) / np_ * 100, 1) if np_ else 0.0,
         "pnl_prem": round(prem, 2),
         "pnl_pts": round(pts, 2), "pnl_rs": round(prem * LOT_SIZE, 2),
-        "stops": len([x for x in rows if x["reason"].startswith("STOP")]),
+        "capital": round(sum(paid) * LOT_SIZE, 2),
+        "avg_win_rs": round(avg_w * LOT_SIZE, 2),
+        "avg_loss_rs": round(avg_l * LOT_SIZE, 2),
+        "rr_real": round(abs(avg_w / avg_l), 2) if avg_l else 0.0,
+        "worst_rs": round(worst * LOT_SIZE, 2),
+        "roi": round(prem / sum(paid) * 100, 2) if paid else 0.0,
+        "stops": len([x for x in rows if x["reason"] == "STOP"]),
+        "trail_stops": len([x for x in rows if x["reason"] == "TRAIL STOP"]),
+        "sqo": len([x for x in rows if x["reason"].startswith("SQUARE")]),
+        "targets": len([x for x in rows if x["reason"] == "TARGET"]),
         "slip": round(sum(x["slip"] for x in rows), 2),
         "avg_r": round(sum(x["r_multiple"] for x in rows) / n, 3),
         "no_target": len([x for x in rows if x["target"] is None]),
@@ -1052,7 +1422,9 @@ def simulate_day(day: str, minutes: list[dict], tf: int, args) -> dict:
         allow_same_bar_bos=args.allow_same_bar_bos,
         fail_buffer=args.fail_buffer, fail_closes=args.fail_closes,
         max_per_day=args.max_per_day, reentry_gap=args.reentry_gap,
+        max_reentries=args.max_reentries, stop_pts=args.stop_pts,
         stop_anchor=args.stop_anchor,
+        entry_until=args.entry_until, stop_pad=args.stop_pad,
         take_primary=True)
     row.update({k: st[k] for k in ("status", "bos", "zone", "dead", "events",
                                    "swings")})
@@ -1063,7 +1435,9 @@ def simulate_day(day: str, minutes: list[dict], tf: int, args) -> dict:
             bars, st["signals"], rr_values=args.rr_values,
             stop_modes=[k for k, _ in STOP_MODES], eod=args.eod,
             square_off=args.square_off, min_risk=args.min_risk,
-            pricer=PRICER, day=day)
+            pricer=PRICER, day=day,
+            trail_act=args.trail_act, trail_dist=args.trail_dist,
+            with_liq=args.with_liq)
         for t in trades:
             t["date"] = day
             t.pop("i", None)
@@ -1088,7 +1462,7 @@ async def run(args) -> None:
         raise RuntimeError("No sessions in the requested window.")
     daily_close = await load_daily(args.offline, args.from_date, args.to_date)
 
-    tkeys = target_keys(args.rr_values)
+    tkeys = target_keys(args.rr_values, args.with_liq)
     stop_modes = [k for k, _ in STOP_MODES]
     views = [k for k, _ in VIEWS]
 
@@ -1116,6 +1490,19 @@ async def run(args) -> None:
         tf_rows[str(tf)] = rows
         tf_trades[str(tf)] = [t for r in rows for t in r["trades"] if t.get("ex")]
 
+    # ---- split-half ------------------------------------------------------
+    # 146 trades is a small sample and every parameter here was chosen by
+    # looking at it.  Reporting each combination over the first and second half
+    # of the sessions separately is the cheapest guard against shipping a
+    # number that only exists in one half.  A setting that flips sign between
+    # halves has not been demonstrated, whatever the full-sample figure says.
+    mid = days[len(days) // 2]
+
+    def half(trades, which):
+        if which == "h1":
+            return [t for t in trades if t["date"] < mid]
+        return [t for t in trades if t["date"] >= mid]
+
     summaries = {
         str(tf): {
             v: {m: {tk: summarise([t for t in tf_trades[str(tf)] if in_view(t, v)],
@@ -1137,6 +1524,13 @@ async def run(args) -> None:
             if OPEN_TIME <= c["timestamp"][11:16] <= DAY_END]
         for d in trade_days}
 
+    halves = {
+        str(tf): {h: {m: {tk: summarise(half(tf_trades[str(tf)], h), m, tk)
+                          for tk in tkeys}
+                      for m in stop_modes}
+                  for h in ("h1", "h2")}
+        for tf in TIMEFRAMES}
+
     payload = {
         "meta": {
             "from": days[0], "to": days[-1], "sessions": len(days),
@@ -1145,6 +1539,8 @@ async def run(args) -> None:
             "major_pivot": args.major_pivot, "buffer": args.buffer,
             "zone_lookback": args.zone_lookback,
             "rr_values": [rr_label(r) for r in args.rr_values],
+            "stop_pts": args.stop_pts,
+            "trail_act": args.trail_act, "trail_dist": args.trail_dist,
             "target_keys": tkeys, "default_target": args.default_target,
             "target_modes": [{"key": k, "label": v} for k, v in TARGET_MODES],
             "stop_modes": [{"key": k, "label": v} for k, v in STOP_MODES],
@@ -1153,8 +1549,12 @@ async def run(args) -> None:
             "default_view": args.view,
             "fail_buffer": args.fail_buffer, "fail_closes": args.fail_closes,
             "max_per_day": args.max_per_day, "reentry_gap": args.reentry_gap,
+            "max_reentries": args.max_reentries,
+
             "min_risk": args.min_risk,
             "stop_anchor": args.stop_anchor,
+            "entry_until": args.entry_until,
+            "stop_pad": args.stop_pad,
             "take": "primary",
             "take_label": TAKE_LABEL,
             "eod": args.eod,
@@ -1165,6 +1565,8 @@ async def run(args) -> None:
             "lot": LOT_SIZE, "generated": date.today().isoformat(),
         },
         "summaries": summaries,
+        "halves": halves,
+        "split_at": mid,
         "tf_days": tf_rows,
         "tf_trades": tf_trades,
         "chart_days": chart_days,
@@ -1182,7 +1584,7 @@ async def run(args) -> None:
         print(f"\n  {tf}-minute: {len(trades)} trades on "
               f"{len({t['date'] for t in trades})} days "
               f"(primary {len([t for t in trades if t['kind'] == 'primary'])}, "
-              f"one slot per day)")
+              f"reversal {len([t for t in trades if t['kind'] == 'reversal'])})")
         print("    days by outcome: "
               + ", ".join(f"{k} {v}" for k, v in sorted(status.items(),
                                                         key=lambda kv: -kv[1])))
@@ -1191,11 +1593,25 @@ async def run(args) -> None:
                 o = summaries[str(tf)]["both"][m][tk]
                 if not o["trades"]:
                     continue
-                nt = f"  no-target {o['no_target']}" if o["no_target"] else ""
+                nt = (f"  no-target {o['no_target']}"
+                      if o["no_target"] and tk not in ("trail",) else "")
                 print(f"    stop {m:<5} target {tk:<8}: {o['wins']}W/{o['losses']}L "
                       f" win {o['win_rate']:>5}%  {o['pnl_pts']:>9} pts  "
-                      f"Rs {o['pnl_rs']:>10,.0f}  avgR {o['avg_r']:>6}  "
+                      f"Rs {o['pnl_rs']:>10,.0f}  R:R {o['rr_real']:>5}:1  "
                       f"stops {o['stops']}  slip {o['slip']}{nt}")
+    print(f"\n  SPLIT-HALF at {mid} - a setting that flips sign here is not "
+          f"demonstrated, whatever the full-sample number says")
+    for tf in TIMEFRAMES:
+        for m in stop_modes:
+            tk = args.default_target
+            f_ = summaries[str(tf)]["both"][m][tk]
+            a = halves[str(tf)]["h1"][m][tk]
+            b = halves[str(tf)]["h2"][m][tk]
+            agree = "" if (a["pnl_rs"] >= 0) == (b["pnl_rs"] >= 0) else "   <-- HALVES DISAGREE"
+            print(f"    {tf}m {m:<5} {tk:<8} full Rs {f_['pnl_rs']:>9,.0f} "
+                  f"({f_['win_rate']:>5}%)   h1 Rs {a['pnl_rs']:>9,.0f} "
+                  f"({a['win_rate']:>5}%)   h2 Rs {b['pnl_rs']:>9,.0f} "
+                  f"({b['win_rate']:>5}%){agree}")
     print(f"\nReport: {args.out}")
 
 # ---------------------------------------------------------------------------
@@ -1312,6 +1728,7 @@ HTML_TEMPLATE = r"""<!doctype html>
   .k.SWEEP { background:rgba(184,134,11,.18); color:var(--warn); }
   .k.MICROBOS { background:rgba(var(--upN),.18); color:var(--up); }
   .k.DEAD, .k.CANCEL { background:rgba(var(--downN),.16); color:var(--down); }
+  .k.FILTERED { background:rgba(184,134,11,.18); color:var(--warn); }
   .k.DEAD, .k.BLOCKED, .k.SKIPPED { background:rgba(127,127,127,.18); color:var(--ink2); }
   .k.UNLOCK { background:rgba(127,127,127,.18); color:var(--ink2); }
 </style>
@@ -1327,46 +1744,51 @@ HTML_TEMPLATE = r"""<!doctype html>
   through is not a BOS. <b>2</b> &mdash; the <b>zone</b> is the last opposite-colour candle
   before that displacement, taken as its full high&ndash;low range: a bullish BOS builds
   <b class="pos">demand</b>, a bearish BOS builds <b class="neg">supply</b>. <b>3</b> &mdash;
-  price has to come back and <b>touch</b> the zone, which is not yet an entry. <b>4</b> &mdash;
-  then the three-step confirmation, in order: a candle <b>sweeps</b> the last confirmed minor
-  swing, that <b>same</b> candle closes back the right side of it, and a <b>later</b> candle
-  closes beyond the latest confirmed minor swing the other way. Entry is that
-  <b>micro-BOS candle's close</b>; the stop is min(zone low, sweep low) for a long and the
-  mirror for a short.<br>
-  If the zone gives way &mdash; a candle <b>closing</b> below a demand zone's low, or above a
-  supply zone's high &mdash; the setup is dead and the <b>day is over</b>. At most
-  <b>one</b> trade per day. The original rule flipped a failed zone in place and offered a
-  reversal off it; that half was <b>removed</b> on 2026-09-10. It never produced a trade
-  here (the report has always run primary-only), so removing it left the book unchanged.<br>
+  price comes back and <b>touches</b> the zone; the entry is the <b>close of that touching
+  candle</b> &mdash; long in demand, short in supply. One trade per day.<br>
+  <b>Stop</b> &mdash; a <b>market order __STOPPTS__ points from the entry</b>, below it for a
+  long and above it for a short, placed with the entry. <b>Risk</b> = __STOPPTS__ points on
+  every trade. <b>Trail</b> &mdash; once the trade is <b>__TRAILACT__ points in favour</b>, the
+  stop moves to <b>__TRAILDIST__ behind the best price</b> and is re-set each completed
+  1-minute candle the best price improves; it only ever tightens. A stop that fires after the
+  trail switched on is a <b>TRAIL STOP</b>; before that it is a plain STOP at &minus;__STOPPTS__.
+  Exits are market orders, so the fill is the print at the minute the level trades, not the
+  level itself &mdash; the <b>slip</b> column shows by how much.
+  <b>Target</b> &mdash; the rule has <b>no fixed target</b>: the trailing stop is the exit
+  (the <b>trail</b> tab). The 1:0.5 / 1:1 / 1:2 / 1:3 and <b>liq</b> tabs are shown for
+  comparison and mean &ldquo;the same trail, but also take profit at that level&rdquo;. Every
+  fixed target above 100 was measured to make <i>less</i> than the trail, because only 13 of
+  86 trades ever reach +200 and the rest give back their move waiting. The split-half block
+  below flags any tab whose two halves disagree.<br>
+  If the zone gives way &mdash; a candle closing beyond its far edge by more than the fail
+  buffer &mdash; the setup is dead and the day is over. There is no flip and no reversal.<br>
   Swings never repaint: a pivot needs __PIVOT__ candles after it to confirm, so at candle
   <i>i</i> the newest usable swing is the one at <i>i</i>&minus;__PIVOT__.
-  <b>Trading __TAKE__.</b> Signals stop at <b>__SIGUNTIL__</b>; open positions are __EODLABEL__.
+  Signals stop at <b>__SIGUNTIL__</b>; open positions are __EODLABEL__.
   The rule is decided on NIFTY <b>spot</b>, but the money is the <b>option that would
   actually have been bought</b>: ATM strike at entry, nearest expiry on/after the day,
   long &rarr; CE and short &rarr; PE, filled at that contract's 1-minute closes. The
   &#8377; column is premium &times; __LOT__, not NIFTY points &times; __LOT__ &mdash; the
-  latter is a <b>futures</b> payoff and overstates a bought option, because premium moves
-  at delta and bleeds theta. Rows with no option data stay in the table and are left out
-  of the money totals. R is still measured on the spot geometry the rule defines.
-  Shorts are scored as
+  latter is a <b>futures</b> payoff and overstates a bought option. <b>Reward : risk</b> is
+  the real one &mdash; average winning premium against average losing premium &mdash; and
+  <b>return on premium</b> is net premium over premium deployed. Rows with no option data
+  stay in the table and are left out of the money totals. Shorts are scored as
   Entry &minus; Exit.<br>
-  A <b>close</b>-confirmed stop fills at the candle's close, so the loss is not capped at 1R;
-  the <b>slip</b> column is how far past the level the fill actually landed. A target reached
-  inside a candle beats that candle's close; when one minute both touches the target and
-  breaks the stop, the stop is taken first.<br>
+  A target reached inside a candle beats that candle's close; when one minute both touches
+  the target and trades the stop, the stop is taken first.<br>
   Range __FROM__ &rarr; __TO__ &middot; __NDAYS__ trading days.
 </div>
 
 <div class="card">
   <div class="tabrow"><span class="cap">Timeframe</span><span id="tabsF" style="display:flex;gap:6px;flex-wrap:wrap"></span></div>
   <div class="tabrow"><span class="cap">View</span><span id="tabsV" style="display:flex;gap:6px;flex-wrap:wrap"></span></div>
-  <div class="tabrow"><span class="cap">Stop rule</span><span id="tabsS" style="display:flex;gap:6px;flex-wrap:wrap"></span></div>
-  <div class="tabrow"><span class="cap">Target</span><span id="tabsT" style="display:flex;gap:6px;flex-wrap:wrap"></span></div>
+  <div class="tabrow" style="display:none"><span class="cap">Stop rule</span><span id="tabsS" style="display:flex;gap:6px;flex-wrap:wrap"></span></div>
+  <div class="tabrow" id="tabrowT"><span class="cap">Exit</span><span id="tabsT" style="display:flex;gap:6px;flex-wrap:wrap"></span></div>
   <div class="tabrow" style="margin-bottom:0"><span class="cap">Selected</span><span id="selDesc" style="font-size:12.5px;color:var(--ink2)"></span></div>
 </div>
 
 <div class="card">
-  <h2>Every timeframe &times; stop rule &times; target</h2>
+  <h2>The rule on each timeframe</h2>
   <div class="ctrl dim" id="matrixNote"></div>
   <div class="scroll"><table class="matrix" id="matrix"></table></div>
 </div>
@@ -1402,7 +1824,7 @@ HTML_TEMPLATE = r"""<!doctype html>
   </div>
   <div class="chart-wrap"><svg id="chart" viewBox="0 0 1200 430"></svg><div id="tip"></div></div>
   <div class="legend">
-    <span><i style="background:var(--zone)"></i>The zone (the day ends if it fails)</span>
+    <span><i style="background:var(--zone)"></i>The zone (flips in place if it fails)</span>
     <span><i style="background:var(--warn)"></i>BOS level &mdash; the swing that was broken</span>
     <span><i style="background:var(--up)"></i>Target</span>
     <span><i style="background:var(--down)"></i>Stop</span>
@@ -1448,14 +1870,19 @@ const LOT = M.lot;
 let curF = M.default_tf, curV = M.default_view, curS = M.default_stop, curT = M.default_target;
 
 const stopLabel = k => (M.stop_modes.find(m => m.key === k) || {}).label || k;
-const stopShort = k => k === 'touch' ? 'Touch the level' : 'Close beyond the level';
+// the column, the tabs and the headers all read the rule's own label from
+// M.stop_modes - never a hard-coded string, which is how a stale label once
+// outlived the rule it described
+const stopShort = k => (M.stop_modes.find(m => m.key === k) || {}).label || k;
 const viewLabel = k => (M.views.find(v => v.key === k) || {}).label || k;
 const viewShort = k => ({both:'Both', long:'Long', short:'Short'})[k] || k;
-const tgtShort = k => k.startsWith('rr:') ? k.slice(3)
-                    : 'Opposing liquidity';
-const tgtLabel = k => k.startsWith('rr:')
-  ? `Entry &plusmn; Risk &times; ${k.slice(3).split(':')[1]}, taken on touch`
-  : (M.target_modes.find(t => t.key === k) || {}).label || k;
+const tgtShort = k => k === 'trail' ? 'Trail only'
+                    : k.startsWith('rr:') ? k.slice(3) : 'Opposing liquidity';
+const tgtLabel = k => k === 'trail'
+  ? 'No fixed target - the trailing stop is the exit'
+  : k.startsWith('rr:')
+  ? `Entry &plusmn; Risk &times; ${k.slice(3).split(':')[1]}, risk = the stop distance`
+  : 'Opposing liquidity - the session extreme or the latest confirmed major swing beyond it';
 const sidePill = s => s === 'LONG'
   ? '<span class="pill long">BUY</span>' : '<span class="pill short">SELL</span>';
 
@@ -1494,6 +1921,11 @@ function summarise(rows) {
                   slip:0, avg_r:0};
   const priced = rows.filter(r => r.prem_pts !== null && r.prem_pts !== undefined);
   const wins = priced.filter(r => r.prem_pts > 0).length;
+  const wRows = priced.filter(r => r.prem_pts > 0);
+  const lRows = priced.filter(r => r.prem_pts <= 0);
+  const paid = priced.reduce((a,r) => a + (r.entry_px||0), 0);
+  const aW = wRows.length ? wRows.reduce((a,r)=>a+r.prem_pts,0)/wRows.length : 0;
+  const aL = lRows.length ? lRows.reduce((a,r)=>a+r.prem_pts,0)/lRows.length : 0;
   const pts = rows.reduce((a,r) => a + r.points, 0);
   const prem = priced.reduce((a,r) => a + r.prem_pts, 0);
   const np = priced.length;
@@ -1502,7 +1934,14 @@ function summarise(rows) {
     priced: np, unpriced: n - np,
     wins, losses: np - wins, win_rate: np ? wins / np * 100 : 0,
     pnl_prem: prem, pnl_pts: pts, pnl_rs: prem * LOT,
-    stops: rows.filter(r => (r.reason||'').startsWith('STOP')).length,
+    capital: paid * LOT, avg_win_rs: aW * LOT, avg_loss_rs: aL * LOT,
+    rr_real: aL ? Math.abs(aW/aL) : 0,
+    worst_rs: priced.length ? Math.min(...priced.map(r=>r.prem_pts)) * LOT : 0,
+    roi: paid ? prem / paid * 100 : 0,
+    stops: rows.filter(r => r.reason === 'STOP').length,
+    trail_stops: rows.filter(r => r.reason === 'TRAIL STOP').length,
+    sqo: rows.filter(r => (r.reason||'').startsWith('SQUARE')).length,
+    targets: rows.filter(r => r.reason === 'TARGET').length,
     slip: rows.reduce((a,r) => a + r.slip, 0),
     avg_r: rows.reduce((a,r) => a + r.r_multiple, 0) / n,
   };
@@ -1546,7 +1985,9 @@ function buildTabs() {
   mkTabs('tabsT', M.target_keys.map(t => ({key: t, html: tgtShort(t)})),
     () => curT, k => { curT = k; });
 }
-function syncTabs() { buildTabs(); }
+function syncTabs() { buildTabs();
+  // with a single exit there is nothing to choose - hide the selector row
+  document.getElementById('tabrowT').style.display = M.target_keys.length > 1 ? '' : 'none'; }
 
 function table(el, head, rows, empty) {
   document.getElementById(el).innerHTML =
@@ -1560,10 +2001,13 @@ function renderMatrix() {
   let max = 1;
   M.timeframes.forEach(f => M.stop_modes.forEach(m => M.target_keys.forEach(t =>
     max = Math.max(max, Math.abs(DATA.summaries[f][curV][m.key][t].pnl_rs)))));
-  const head = '<th class="rh">Timeframe</th><th class="rh">Stop rule</th>'
-    + '<th class="rh">Target</th><th>Trade days</th><th>Trades</th><th>Success</th>'
-    + '<th>Fail</th><th>Win rate</th><th>Avg R</th><th>Stops</th>'
-    + '<th>Slip past SL (pts)</th><th>Net PnL (&#8377;/lot)</th><th>Net PnL (pts)</th>';
+  const multiT = M.target_keys.length > 1;
+  const head = '<th class="rh">Timeframe</th>' + (multiT ? '<th class="rh">Exit</th>' : '')
+    + '<th>Trades</th><th class="pos">Won</th><th class="neg">Lost</th><th>Win rate</th>'
+    + '<th>Exit: trail stop</th><th>Exit: stop &minus;100</th><th>Exit: square-off</th>'
+    + (multiT ? '<th>Target cap</th>' : '')
+    + '<th>Avg win (&#8377;)</th><th>Avg loss (&#8377;)</th><th>Reward : risk</th>'
+    + '<th>Worst loss (&#8377;)</th><th>Net (&#8377;/lot)</th><th>Return on premium</th>';
   const rows = [];
   M.timeframes.forEach(f => M.stop_modes.forEach(m => M.target_keys.forEach(t => {
     const st = DATA.summaries[f][curV][m.key][t];
@@ -1571,15 +2015,17 @@ function renderMatrix() {
     const bg = st.pnl_rs >= 0 ? `rgba(var(--upN),${a})` : `rgba(var(--downN),${a})`;
     const sel = (f === curF && m.key === curS && t === curT) ? ' sel' : '';
     rows.push(`<tr data-tf="${f}" data-sm="${m.key}" data-tg="${t}">`
-      + `<td class="rh${sel}">${f}-minute</td><td class="rh${sel}">${stopShort(m.key)}</td>`
-      + `<td class="rh${sel}">${tgtShort(t)}</td>`
-      + `<td>${st.days}</td><td>${st.trades}</td>`
+      + `<td class="rh${sel}">${f}-minute</td>`
+      + (multiT ? `<td class="rh${sel}">${tgtShort(t)}</td>` : '')
+      + `<td>${st.trades}</td>`
       + `<td class="pos">${st.wins}</td><td class="neg">${st.losses}</td>`
-      + `<td>${st.win_rate.toFixed(1)}%</td><td>${sgn(st.avg_r,2)}</td>`
-      + `<td>${st.stops}</td>`
-      + `<td class="${st.slip > 0 ? 'neg' : 'dim'}">${st.slip.toFixed(2)}</td>`
+      + `<td>${st.win_rate.toFixed(1)}%</td>`
+      + `<td class="pos">${st.trail_stops}</td><td class="neg">${st.stops}</td><td>${st.sqo}</td>`
+      + (multiT ? `<td>${st.targets}</td>` : '')
+      + `<td>${sgnRs(st.avg_win_rs)}</td><td>${sgnRs(st.avg_loss_rs)}</td>`
+      + `<td>${st.rr_real.toFixed(2)} : 1</td><td>${sgnRs(st.worst_rs)}</td>`
       + `<td class="${sel}" style="background:${bg}">${sgnRs(st.pnl_rs)}</td>`
-      + `<td>${sgn(st.pnl_pts)}</td></tr>`);
+      + `<td>${st.roi.toFixed(2)}%</td></tr>`);
   })));
   table('matrix', head, rows);
   document.querySelectorAll('#matrix tr[data-tf]').forEach(tr => {
@@ -1596,11 +2042,15 @@ function statBlock(s) {
     [s.days, 'trade days'], [s.trades, 'trades'],
     [s.wins, 'success'], [s.losses, 'fail'],
     [s.win_rate.toFixed(1)+'%', 'win rate'],
-    [(s.avg_r>0?'+':'')+s.avg_r.toFixed(2), 'avg R'],
+    [s.rr_real.toFixed(2)+' : 1', 'reward : risk (real)'],
     [(s.pnl_pts>0?'+':'')+s.pnl_pts.toFixed(2), 'NIFTY move (pts)'],
     [(s.pnl_prem>0?'+':'')+s.pnl_prem.toFixed(2), 'option premium (pts)'],
     [(s.pnl_rs>0?'+':'')+Math.round(s.pnl_rs).toLocaleString('en-IN'), 'net PnL (1 lot ₹, premium)'],
-    [s.stops, 'stopped out'], [s.slip.toFixed(2), 'slip past SL (pts)'],
+    [sgnRs(s.avg_win_rs), 'avg win (₹)'],
+    [sgnRs(s.avg_loss_rs), 'avg loss (₹)'],
+    [sgnRs(s.worst_rs), 'worst single loss (₹)'],
+    [Math.round(s.capital).toLocaleString('en-IN'), 'premium deployed (₹)'],
+    [s.roi.toFixed(2)+'%', 'return on premium'],
   ].map(([v,l]) => `<div class="stat"><div class="v">${v}</div><div class="l">${l}</div></div>`).join('');
 }
 function summaryTable(el, rows, label) {
@@ -1650,6 +2100,7 @@ function renderStatus() {
     'no touch': 'the zone was built but price never came back to it',
     'no confirmation': 'the zone was touched but the sweep + micro-BOS never completed',
     'zone failed': 'the zone gave way before the confirmation completed - day over',
+    'filtered out': 'the rule fired but the trade failed a v2 entry filter',
     'no data': 'the session is missing candles',
   };
   const rows = [...counts.entries()].sort((a,b) => b[1]-a[1]).map(([k,v]) =>
@@ -1663,6 +2114,7 @@ function renderStatus() {
 function closePill(ct) {
   const base = (ct||'').split(' ')[0];
   if (base === 'TARGET') return '<span class="pill tgt">TARGET</span>';
+  if (base === 'TRAIL') return '<span class="pill tgt">TRAIL STOP</span>';
   if (base === 'STOP') return '<span class="pill sl">STOP</span>';
   if (base === 'SQUARE') return '<span class="pill eod">SQUARE OFF</span>';
   return `<span class="pill eod">${base||'&ndash;'}</span>`;
@@ -1673,9 +2125,9 @@ function renderDays() {
   const byDay = new Map();
   trades.forEach(t => { if (!byDay.has(t.date)) byDay.set(t.date, []); byDay.get(t.date).push(t); });
   const head = `<th>Date</th><th>Dir</th><th>Zone</th><th>BOS</th>
-    <th>Touch</th><th>Sweep</th><th class="num">Swept</th><th>Entry time</th>
+    <th>Touch</th><th class="num">Zone width</th><th>Entry time</th>
     <th class="num">Entry</th><th class="num">Stop</th><th class="num">Risk</th>
-    <th class="num">Target</th><th class="num">Exit</th><th>Close type</th>
+    <th class="num">Stop</th><th class="num">Target</th><th class="num">Exit</th><th>Close type</th>
     <th class="num">NIFTY pts</th><th class="num">R</th>
     <th>Contract</th><th class="num">Prem in</th><th class="num">Prem out</th>
     <th class="num">Prem pts</th><th class="num">PnL (₹)</th>
@@ -1696,9 +2148,12 @@ function renderDays() {
         <td class="dim">${n2(r.zone_low)} &ndash; ${n2(r.zone_high)}</td>
         <td class="dim">${d.bos ? d.bos.time+' @ '+n2(d.bos.level) : '&mdash;'}</td>
         <td class="dim">${r.touch_time||'&mdash;'}</td>
-        <td class="dim">${r.sweep_time}</td><td class="num dim">${n2(r.sweep_level)}</td>
+        <td class="num dim">${n2(r.zone_width)}</td>
         <td>${r.entry_time}</td><td class="num">${n2(r.entry)}</td>
         <td class="num dim">${n2(r.sl)}</td><td class="num dim">${n2(r.risk)}</td>
+        <td class="num dim">${n2(r.stop_level)}${r.trail_on
+            ? ` <small>&rarr; ${n2(r.final_stop)} (trail on ${r.trail_on})</small>`
+            : ' <small>market</small>'}</td>
         <td class="num dim">${r.target===null?'<span class="pill no">none</span>':n2(r.target)}</td>
         <td class="num">${n2(r.exit)}</td><td>${closePill(r.reason)}</td>
         <td class="num">${sgn(r.points)}</td><td class="num">${sgn(r.r_multiple,2)}</td>
@@ -1707,7 +2162,7 @@ function renderDays() {
         <td class="num">${sgn(r.prem_pts)}</td>
         <td class="num">${r.pnl_rs===null||r.pnl_rs===undefined?'<span class="pill no">no option data</span>':sgnRs(r.pnl_rs)}</td>
         <td>${r.exit_time}</td>
-        <td class="dim">${r.slip > 0 ? `<span class="neg">filled ${n2(r.slip)} past the level</span>` : 'clean fill'}</td></tr>`);
+        <td class="dim">${r.opt_reason ? `<span class="neg">${r.opt_reason}</span>` : 'priced'}</td></tr>`);
     });
   });
   table('tblDays', head, body, 'no trades in this view');
@@ -1781,7 +2236,7 @@ function drawChart() {
        + `stroke="var(--zone)" stroke-width="1" stroke-dasharray="3 3"/>`
        + `<text x="${(zx+4).toFixed(1)}" y="${(yt-4).toFixed(1)}" font-size="10" fill="var(--zone)">`
        + `${drow.zone.type} ${drow.zone.low.toFixed(2)}&ndash;${drow.zone.high.toFixed(2)}`
-       + `${drow.dead ? ' &rarr; zone failed at ' + drow.dead.time : ''}</text>`;
+       + `${drow.flip ? ' &rarr; flipped ' + drow.flip.to + ' at ' + drow.flip.time : ''}</text>`;
   }
   for (let k = 0; k <= 6; k++) {
     const v = lo + (hi - lo) * k / 6, yy = y(v);
@@ -1820,7 +2275,16 @@ function drawChart() {
     (drow.bos.dir === 'BULLISH' ? 'BOS swing high' : 'BOS swing low'), true);
 
   trades.forEach(t => {
-    s += hline(t.sl, 'var(--down)', '6 3', 'Stop');
+    // The zone edge still sets `risk`, and the target is entry +/- risk x R,
+    // so it is worth seeing - but it is NOT an exit any more and must not be
+    // drawn as one.  Muted, dotted, and labelled for what it actually is.
+    // the level the stop is actually working at under the selected rule
+    if (t.stop_level != null)
+      s += hline(t.stop_level, 'var(--down)', '6 3',
+                 'Stop at entry (' + n2(t.risk) + ' pts)');
+    if (t.trail_on && t.final_stop != null && t.final_stop !== t.stop_level)
+      s += hline(t.final_stop, 'var(--up)', '2 3',
+                 'Trailed stop (on ' + t.trail_on + ')', true);
     if (t.target !== null) s += hline(t.target, 'var(--up)', '6 3', 'Target');
     const ei = at(t.entry_time);
     if (ei >= 0) {
@@ -1955,7 +2419,7 @@ function renderAll() {
          + `side and ran on the stop and the square-off alone.</span>` : '');
   document.getElementById('overall').innerHTML = statBlock(sm);
   document.getElementById('matrixNote').innerHTML =
-    `${viewShort(curV)} trades, every timeframe &times; stop rule &times; target. `
+    `${viewShort(curV)} trades. One stop (market, 100 pts, trailing 30 behind the best price once +40) and one exit (that trail); `
     + 'The timeframe changes which swings exist, so it changes the trades themselves, '
     + 'not just the exits &mdash; the trade counts differ down the table. Click any row to select it.';
   renderMatrix();
@@ -1998,6 +2462,10 @@ def write_report(payload: dict, out_path: str) -> None:
             .replace("__EODLABEL__", m["eod_label"])
             .replace("__TAKE__", m["take_label"].split(" - ")[0].lower())
             .replace("__SQO__", m["square_off"])
+            .replace("__STOPPTS__", f"{m['stop_pts']:g}")
+            .replace("__TRAILACT__", f"{m['trail_act']:g}")
+            .replace("__TRAILDIST__", f"{m['trail_dist']:g}")
+
             .replace("__LOT__", str(m["lot"]))
             .replace("__NDAYS__", str(m["sessions"]))
             .replace("__FROM__", m["from"])
@@ -2032,7 +2500,19 @@ def main() -> None:
                          "a value)")
     ap.add_argument("--rr", dest="rr_values", type=float, nargs="+",
                     default=RR_VALUES, metavar="R",
-                    help="reward:risk multiples to compare (default 1 2 3 5)")
+                    help="OPTIONAL comparison tabs: the same trail, but also take "
+                         "profit at entry +/- stop x R (e.g. --rr 1 2). Off by default")
+    ap.add_argument("--no-liq", dest="with_liq", action="store_false", default=True,
+                    help="drop the opposing-liquidity tab (shown by default: the same "
+                         "trail, but also take profit at the opposing liquidity)")
+    ap.add_argument("--stop-pts", type=float, default=STOP_PTS,
+                    help="market stop this many NIFTY points from the entry")
+    ap.add_argument("--trail-act", type=float, default=TRAIL_ACT,
+                    help="the trail switches on once the trade is this many "
+                         "points in favour (0 disables the trail)")
+    ap.add_argument("--trail-dist", type=float, default=TRAIL_DIST,
+                    help="once on, the stop sits this many points behind the "
+                         "best price and only ever tightens")
     ap.add_argument("--target", dest="default_target", default=None,
                     help="target variant selected when the report opens: "
                          "an R:R like 1:2, or liq")
@@ -2040,6 +2520,13 @@ def main() -> None:
                     default=DEFAULT_STOP,
                     help="stop rule selected when the report opens; both are "
                          "always computed")
+    ap.add_argument("--entry-until", default=ENTRY_UNTIL,
+                    help="no new entry at or after this time (v2 filter 1)")
+    ap.add_argument("--max-reentries", type=int, default=MAX_REENTRIES,
+                    help="re-entries allowed after the zone edge is broken and "
+                         "then closed back inside (0 = v3 behaviour)")
+    ap.add_argument("--stop-pad", type=float, default=STOP_PAD,
+                    help="stop sits this many zone widths beyond the far edge")
     ap.add_argument("--stop-anchor", choices=[k for k, _ in STOP_ANCHORS],
                     default=DEFAULT_ANCHOR,
                     help="what the stop is placed behind")
@@ -2083,9 +2570,10 @@ def main() -> None:
 
     if args.signal_until is None:
         args.signal_until = args.square_off
-    keys = target_keys(args.rr_values)
+    keys = target_keys(args.rr_values, args.with_liq)
     if args.default_target is None:
-        args.default_target = f"rr:{rr_label(DEFAULT_RR)}"
+        # the report opens on the RULE - the trail - not on an R rung
+        args.default_target = DEFAULT_TARGET if DEFAULT_TARGET in keys else keys[0]
     elif args.default_target not in keys:
         cand = f"rr:{args.default_target}"
         args.default_target = cand if cand in keys else keys[0]

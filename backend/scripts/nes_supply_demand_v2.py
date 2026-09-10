@@ -32,12 +32,11 @@ runs, because every decision below depends on the one above it.
   ->      TRADE_ACTIVE                   one position at a time
 
   Any time the zone gives way - a candle CLOSING below zoneLow for demand, or
-  above zoneHigh for supply - the setup is dead and the zone FLIPS in place:
-  the same low/high becomes the opposite zone, that direction is blocked, and
-  the unlock level is frozen at the session high (or low) as it stood BEFORE
-  the failure candle.  Then WAIT_REVERSAL_RETEST: wait for a retest of the
-  flipped zone, run the same three-step confirmation the other way, and take
-  the reversal.  One primary and one reversal per day, so at most two trades.
+  above zoneHigh for supply - the setup is dead and the DAY IS OVER.  ONE trade
+  per day, at most.
+
+  THE FLIP WAS REMOVED (2026-09-10, at the user's request), along with the
+  reversal slot, the direction lock and the frozen unlock level.
 
 Long and short are exact mirrors; nothing in the code branches on direction
 except by sign.
@@ -195,6 +194,7 @@ BACKEND_DIR = os.path.join(SCRIPT_DIR, "..")
 sys.path.insert(0, BACKEND_DIR)
 
 from services.upstox_client import INSTRUMENT_KEYS, get_candles  # noqa: E402
+from services.option_pricing import CachedPricer, ensure_cached  # noqa: E402
 
 # backend/scripts holds only strategy code; the candle caches live in
 # backend/data and the generated reports in backend/reports.
@@ -285,10 +285,9 @@ DEFAULT_EOD = "close"
 # combined book is not - so it is the default.  The reversal machinery still
 # runs regardless: the zone has to be able to fail and flip for the report to
 # show what happened.
-TAKE_MODES = [("primary", "Primary only - the first BOS direction"),
-              ("reversal", "Reversal only - after the zone flipped"),
-              ("both", "Both slots, the full spec")]
-DEFAULT_TAKE = "primary"
+# The flip-and-reverse half of the rule was removed on 2026-09-10, so a day has
+# exactly one slot: the primary, in the first BOS direction.
+TAKE_LABEL = "Primary only - the first BOS direction"
 
 VIEWS = [("both", "Long and short together"),
          ("long", "Long trades only"),
@@ -561,8 +560,7 @@ def run_state_machine(bars: list[dict], *, pivot: int, minor_pivot: int,
                       max_per_day: int = 1, reentry_gap: int = 5,
                       stop_anchor: str = "zone",
                       entry_until: str = "15:15", min_sweep_depth: float = 0.0,
-                      take_primary: bool = True,
-                      take_reversal: bool = True) -> dict:
+                      take_primary: bool = True) -> dict:
     """One session, one pass, left to right.  Returns the day's structure and
     up to two signals (one primary, one reversal).
 
@@ -570,7 +568,7 @@ def run_state_machine(bars: list[dict], *, pivot: int, minor_pivot: int,
     the rule that decides WHEN and WHERE a position is opened.  Everything the
     exit engine needs afterwards is handed over inside the signal dict.
 
-    take_primary / take_reversal suppress a slot's ENTRY without disabling any
+    take_primary suppresses the ENTRY without disabling any
     of the structure behind it: the zone still fails, still flips, still gets
     retested, and the timeline still records all of it.  That matters because
     the flip is what draws the zone in the report, and because a suppressed
@@ -587,7 +585,7 @@ def run_state_machine(bars: list[dict], *, pivot: int, minor_pivot: int,
     else:
         mj_hi, mj_lo = confirmed_swings(bars, major_pivot)
 
-    out: dict = {"status": "no BOS", "bos": None, "zone": None, "flip": None,
+    out: dict = {"status": "no BOS", "bos": None, "zone": None, "dead": None,
                  "events": [], "signals": [], "swings": None,
                  "original_dir": None}
     ev = out["events"]
@@ -595,13 +593,9 @@ def run_state_machine(bars: list[dict], *, pivot: int, minor_pivot: int,
     state = "WAIT_FIRST_BOS"
     zone_lo = zone_hi = None
     zone_type = None            # DEMAND | SUPPLY
-    zone_flipped = False
-    long_allowed = short_allowed = True
-    primary_taken = reversal_taken = False
+    primary_taken = False
     primary_count = 0
     last_entry_i = None
-    unlock_level = None
-    flip_i = None
     touch_i = None
     sweep = None                # {"i", "level", "px", "time"}
     sess_hi = sess_lo = None    # running extremes, EXCLUDING the current bar
@@ -635,35 +629,24 @@ def run_state_machine(bars: list[dict], *, pivot: int, minor_pivot: int,
         fail_streak = fail_streak + 1 if beyond else 0
         return fail_streak >= fail_closes
 
-    def do_flip(i: int, b: dict) -> None:
-        """Sections 8 and 9 - the zone fails and flips in place, keeping its
-        original boundaries."""
-        nonlocal state, zone_type, zone_flipped, long_allowed, short_allowed
-        nonlocal unlock_level, flip_i, sweep, touch_i
+    def zone_dies(i: int, b: dict) -> None:
+        """The zone gives way, so the setup is dead and the day is over.
+
+        The spec joined two ideas in one sentence - "the setup is dead AND the
+        zone flips in place".  The flip half is deliberately gone: no reversal
+        slot, no direction lock, no frozen unlock level, no second zone.
+        """
+        nonlocal state
         was_demand = zone_type == "DEMAND"
-        zone_type = "SUPPLY" if was_demand else "DEMAND"
-        zone_flipped = True
-        if was_demand:
-            long_allowed = False
-            unlock_level = sess_hi
-        else:
-            short_allowed = False
-            unlock_level = sess_lo
-        flip_i = i
-        sweep = None
-        touch_i = None
-        state = "WAIT_REVERSAL_RETEST"
-        out["flip"] = {"time": b["start"], "close": round(b["close"], 2),
-                       "from": "DEMAND" if was_demand else "SUPPLY",
-                       "to": zone_type,
-                       "unlock": None if unlock_level is None else round(unlock_level, 2)}
-        lvl = "-" if unlock_level is None else f"{unlock_level:.2f}"
-        add(b["start"], "FLIP",
+        state = "DONE"
+        if out["status"] in ("no touch", "no confirmation"):
+            out["status"] = "zone failed"
+        out["dead"] = {"time": b["start"], "close": round(b["close"], 2),
+                       "zone": zone_type}
+        add(b["start"], "DEAD",
             f"{'Demand' if was_demand else 'Supply'} failed - close "
             f"{b['close']:.2f} {'below' if was_demand else 'above'} the zone. "
-            f"Zone flips to {zone_type.lower()} in place; "
-            f"{'longs' if was_demand else 'shorts'} blocked until a close "
-            f"{'above' if was_demand else 'below'} {lvl}", b["close"])
+            f"The setup is dead; there is no reversal.", b["close"])
 
     def liq_target(side: str, i: int, b: dict) -> float | None:
         """Section 11 OPPOSING_LIQUIDITY - the session extreme at entry, or the
@@ -730,7 +713,7 @@ def run_state_machine(bars: list[dict], *, pivot: int, minor_pivot: int,
             # lets the confirmation fire that far past the zone; see below.)
             "risk": round((entry - sl) if side == "LONG" else (sl - entry), 2),
             "zone_low": round(zone_lo, 2), "zone_high": round(zone_hi, 2),
-            "zone_type": zone_type, "flipped": zone_flipped,
+            "zone_type": zone_type,
             "touch_time": bars[touch_i]["start"] if touch_i is not None else None,
             "sweep_time": sweep["time"], "sweep_px": round(sweep["px"], 2),
             "sweep_level": round(sweep["level"], 2),
@@ -814,19 +797,6 @@ def run_state_machine(bars: list[dict], *, pivot: int, minor_pivot: int,
         if t >= signal_until or state == "DONE":
             break
 
-        # ---- section 10: the frozen unlock level ---------------------------
-        if unlock_level is not None:
-            if not long_allowed and b["close"] > unlock_level:
-                long_allowed = True
-                add(t, "UNLOCK", f"Close {b['close']:.2f} above the frozen "
-                    f"pre-failure session high {unlock_level:.2f} - longs "
-                    f"allowed again", b["close"])
-            elif not short_allowed and b["close"] < unlock_level:
-                short_allowed = True
-                add(t, "UNLOCK", f"Close {b['close']:.2f} below the frozen "
-                    f"pre-failure session low {unlock_level:.2f} - shorts "
-                    f"allowed again", b["close"])
-
         if state == "WAIT_FIRST_BOS":
             sh = usable_swing(sw_hi, i)
             sl_ = usable_swing(sw_lo, i)
@@ -868,7 +838,7 @@ def run_state_machine(bars: list[dict], *, pivot: int, minor_pivot: int,
             # the close decides: a candle that dips in AND closes beyond the far
             # boundary is a failure, not a touch
             if zone_failed(b):
-                do_flip(i, b)
+                zone_dies(i, b)
             elif not primary_taken and touches(b, zone_lo, zone_hi):
                 touch_i = i
                 out["status"] = "no confirmation"
@@ -877,46 +847,27 @@ def run_state_machine(bars: list[dict], *, pivot: int, minor_pivot: int,
                 state = "WAIT_CONF"
 
         elif state == "WAIT_ZONE_FAIL":
-            # the primary is done, but the zone can still give way and reverse
+            # the primary is done; the zone giving way now simply ends the day
             if zone_failed(b):
-                do_flip(i, b)
-
-        elif state == "WAIT_REVERSAL_RETEST":
-            if reversal_taken:
-                state = "DONE"
-            elif zone_failed(b):
-                # the flipped zone failed too; the spec has no second flip
-                add(t, "DEAD", f"The flipped {zone_type.lower()} zone failed too "
-                    f"(close {b['close']:.2f}) - no reversal", b["close"])
-                state = "DONE"
-            elif flip_i is not None and i > flip_i and touches(b, zone_lo, zone_hi):
-                touch_i = i
-                if out["status"] in ("no touch", "no confirmation"):
-                    out["status"] = "no reversal confirmation"
-                add(t, "RETEST", f"Retested the flipped {zone_type.lower()} zone "
-                    f"({zone_lo:.2f} - {zone_hi:.2f}) from "
-                    f"{'below' if zone_type == 'SUPPLY' else 'above'} - waiting "
-                    f"for the sweep")
-                state = "WAIT_REV_CONF"
+                zone_dies(i, b)
 
         if state == "WAIT_CONF":
             if zone_failed(b):
                 add(t, "CANCEL", "Zone failed while waiting for the "
                     "confirmation - the pending setup is cancelled")
-                do_flip(i, b)
+                zone_dies(i, b)
             else:
                 side = "LONG" if zone_type == "DEMAND" else "SHORT"
                 sig = try_confirmation(i, b, side, "primary")
                 if sig is not None:
-                    allowed = long_allowed if side == "LONG" else short_allowed
                     if not take_primary:
                         add(t, "SKIPPED", f"{side} primary confirmation "
                             "completed - not taken, primary is switched off")
                         primary_taken = True
                         state = "WAIT_ZONE_FAIL"
-                    elif not allowed or primary_taken:
+                    elif primary_taken:
                         add(t, "BLOCKED", f"{side} confirmation completed but "
-                            f"{'that direction is locked' if not allowed else 'the primary trade is already used'}")
+                            "the primary trade is already used")
                     elif (why := filter_reason(b, sig)) is not None:
                         # a rejected confirmation uses up the day; see the
                         # docstring for why it does not go looking for another
@@ -935,33 +886,6 @@ def run_state_machine(bars: list[dict], *, pivot: int, minor_pivot: int,
                         # day at one, which traded 26 of 124 sessions.
                         sweep = None
                         state = "WAIT_ZONE_FAIL" if primary_taken else "WAIT_CONF"
-
-        elif state == "WAIT_REV_CONF":
-            if zone_failed(b):
-                add(t, "DEAD", "The flipped zone failed while waiting for the "
-                    "reversal confirmation")
-                state = "DONE"
-            else:
-                side = "LONG" if zone_type == "DEMAND" else "SHORT"
-                sig = try_confirmation(i, b, side, "reversal")
-                if sig is not None:
-                    allowed = long_allowed if side == "LONG" else short_allowed
-                    if not take_reversal:
-                        add(t, "SKIPPED", f"Reversal {side} confirmation "
-                            "completed - not taken, reversal is switched off")
-                        state = "DONE"
-                    elif not allowed or reversal_taken:
-                        add(t, "BLOCKED", f"Reversal {side} confirmation "
-                            f"completed but that direction is locked")
-                    elif (why := filter_reason(b, sig)) is not None:
-                        add(t, "FILTERED", f"Reversal {side} confirmation - {why}")
-                        out["status"] = "filtered out"
-                        state = "DONE"
-                    else:
-                        out["signals"].append(sig)
-                        out["status"] = "trade"
-                        reversal_taken = True
-                        state = "DONE"
 
         sess_hi = b["high"] if sess_hi is None else max(sess_hi, b["high"])
         sess_lo = b["low"] if sess_lo is None else min(sess_lo, b["low"])
@@ -1033,9 +957,37 @@ def walk(bars: list[dict], i_entry: int, side: str, sl: float,
             "exit_i": len(bars) - 1, "reason": "EOD"}
 
 
+PRICER = CachedPricer()
+
+
+def _option_leg(pricer, info, t, res) -> dict:
+    """The premium fields for one exit variant.
+
+    Returns pnl_rs=None and opt_reason set when the contract or its candles
+    could not be had.  Such a trade STAYS in the book and stays visible - it is
+    simply left out of the money totals.  Dropping it would quietly shrink the
+    sample, which is the failure mode this whole exercise exists to remove.
+    """
+    if pricer is None or info is None:
+        return {"pnl_rs": None, "win": None, "opt_reason": "not priced"}
+    if info["reason"]:
+        return {"strike": info["strike"], "opt_type": info["option_type"],
+                "opt_symbol": info["symbol"], "entry_px": None, "exit_px": None,
+                "prem_pts": None, "pnl_rs": None, "win": None,
+                "opt_reason": info["reason"]}
+    o = CachedPricer.price_from(info, t["entry_time"], res["exit_time"])
+    prem = o["prem_pts"]
+    return {"strike": o["strike"], "opt_type": o["option_type"],
+            "opt_symbol": o["symbol"], "entry_px": o["entry_px"],
+            "exit_px": o["exit_px"], "prem_pts": prem,
+            "pnl_rs": None if prem is None else round(prem * LOT_SIZE, 2),
+            "win": None if prem is None else prem > 0,
+            "opt_reason": o["reason"]}
+
+
 def price_trades(bars: list[dict], signals: list[dict], *, rr_values: list[float],
                  stop_modes: list[str], eod: str, square_off: str,
-                 min_risk: float = 0.0) -> list[dict]:
+                 min_risk: float = 0.0, pricer=None, day: str = "") -> list[dict]:
     """Turn each signal into a trade carrying every exit variant.
 
     ONE POSITION AT A TIME, and it has to be enforced per variant, because the
@@ -1063,6 +1015,11 @@ def price_trades(bars: list[dict], signals: list[dict], *, rr_values: list[float
             t["dead"] = f"risk {sig['risk']} below the {min_risk:g}-point floor"
         trades.append(t)
 
+    day_info = {}
+    if pricer is not None:
+        for t in trades:
+            day_info[id(t)] = pricer.day_prices(day, t["side"], t["entry"])
+
     live = [t for t in trades if "dead" not in t]
     for mode in stop_modes:
         for tk in tkeys:
@@ -1070,6 +1027,7 @@ def price_trades(bars: list[dict], signals: list[dict], *, rr_values: list[float
             open_side = None
             for t in live:
                 entry, sl, risk = t["entry"], t["sl"], t["risk"]
+                opt_info = day_info.get(id(t))
                 long = t["side"] == "LONG"
                 t["ex"].setdefault(mode, {})
                 if t["i"] <= open_until and t["side"] == open_side:
@@ -1093,7 +1051,13 @@ def price_trades(bars: list[dict], signals: list[dict], *, rr_values: list[float
                     # unless a close-confirmed stop overshot it
                     "slip": (round(abs(res["exit"] - sl), 2)
                              if res["reason"].startswith("STOP") else 0.0),
-                    "pnl_rs": round(pts * LOT_SIZE, 2), "win": pts > 0,
+                    # The rule is decided on SPOT, but the money is made on the
+                    # option that would actually have been bought.  `points` is
+                    # the spot move and drives R; the rupee figure and the
+                    # win/loss flag come from the PREMIUM, because that is what
+                    # the account sees.  spot points x LOT_SIZE is a NIFTY
+                    # FUTURES payoff and was what this reported before.
+                    **_option_leg(pricer, opt_info, t, res),
                     "skipped": False,
                 }
                 open_until = res["exit_i"]
@@ -1110,16 +1074,25 @@ def summarise(trades: list[dict], mode: str, tkey: str) -> dict:
             if t.get("ex") and not t["ex"][mode][tkey].get("skipped")]
     n = len(rows)
     if not n:
-        return {"days": 0, "trades": 0, "wins": 0, "losses": 0, "win_rate": 0.0,
+        return {"days": 0, "trades": 0, "priced": 0, "unpriced": 0,
+                "wins": 0, "losses": 0, "win_rate": 0.0, "pnl_prem": 0.0,
                 "pnl_pts": 0.0, "pnl_rs": 0.0, "stops": 0, "slip": 0.0,
                 "avg_r": 0.0, "no_target": 0}
-    wins = [x for x in rows if x["points"] > 0]
+    # Money and win/loss come from the PREMIUM, because that is what the
+    # account actually sees.  pnl_pts stays the SPOT move, for reference and
+    # because R is measured on the spot geometry the rule defines.
+    priced = [x for x in rows if x.get("prem_pts") is not None]
+    wins = [x for x in priced if x["prem_pts"] > 0]
     pts = sum(x["points"] for x in rows)
+    prem = sum(x["prem_pts"] for x in priced)
+    np_ = len(priced)
     return {
         "days": len({t["date"] for t in trades}), "trades": n,
-        "wins": len(wins), "losses": n - len(wins),
-        "win_rate": round(len(wins) / n * 100, 1),
-        "pnl_pts": round(pts, 2), "pnl_rs": round(pts * LOT_SIZE, 2),
+        "priced": np_, "unpriced": n - np_,
+        "wins": len(wins), "losses": np_ - len(wins),
+        "win_rate": round(len(wins) / np_ * 100, 1) if np_ else 0.0,
+        "pnl_prem": round(prem, 2),
+        "pnl_pts": round(pts, 2), "pnl_rs": round(prem * LOT_SIZE, 2),
         "stops": len([x for x in rows if x["reason"].startswith("STOP")]),
         "slip": round(sum(x["slip"] for x in rows), 2),
         "avg_r": round(sum(x["r_multiple"] for x in rows) / n, 3),
@@ -1141,7 +1114,7 @@ def simulate_day(day: str, minutes: list[dict], tf: int, args) -> dict:
     """One session on one timeframe: structure, signals, priced trades."""
     bars = build_buckets(minutes, tf)
     row: dict = {"date": day, "status": "no data", "bos": None, "zone": None,
-                 "flip": None, "events": [], "trades": [], "swings": None,
+                 "dead": None, "events": [], "trades": [], "swings": None,
                  "day_open": None, "day_high": None, "day_low": None,
                  "day_close": None}
     if not bars or bars[0]["start"] != OPEN_TIME:
@@ -1161,9 +1134,8 @@ def simulate_day(day: str, minutes: list[dict], tf: int, args) -> dict:
         max_per_day=args.max_per_day, reentry_gap=args.reentry_gap,
         stop_anchor=args.stop_anchor,
         entry_until=args.entry_until, min_sweep_depth=args.min_sweep_depth,
-        take_primary=args.take in ("primary", "both"),
-        take_reversal=args.take in ("reversal", "both"))
-    row.update({k: st[k] for k in ("status", "bos", "zone", "flip", "events",
+        take_primary=True)
+    row.update({k: st[k] for k in ("status", "bos", "zone", "dead", "events",
                                    "swings")})
     row["original_dir"] = st["original_dir"]
 
@@ -1171,7 +1143,8 @@ def simulate_day(day: str, minutes: list[dict], tf: int, args) -> dict:
         trades = price_trades(
             bars, st["signals"], rr_values=args.rr_values,
             stop_modes=[k for k, _ in STOP_MODES], eod=args.eod,
-            square_off=args.square_off, min_risk=args.min_risk)
+            square_off=args.square_off, min_risk=args.min_risk,
+            pricer=PRICER, day=day)
         for t in trades:
             t["date"] = day
             t.pop("i", None)
@@ -1199,6 +1172,20 @@ async def run(args) -> None:
     tkeys = target_keys(args.rr_values)
     stop_modes = [k for k, _ in STOP_MODES]
     views = [k for k, _ in VIEWS]
+
+    # ---- two passes, and the order is the whole point --------------------
+    # Pass 1 runs the rule on SPOT alone.  Entry, stop and target are decided
+    # there and nowhere else; the option cannot move a level or change which
+    # trades exist.  Only once the signals are known do we resolve the ATM
+    # contracts they imply and fetch whatever the requested date range is
+    # missing.  Pass 2 then re-runs the identical simulation with those prices
+    # available, purely so each trade carries a rupee figure.
+    global PRICER
+    needs = {(t["date"], t["side"], t["entry"])
+             for tf in TIMEFRAMES for d in days
+             for t in simulate_day(d, by_day[d], tf, args)["trades"] if t.get("ex")}
+    PRICER = await ensure_cached(
+        needs, None if args.offline else _read_access_token(), args.offline)
 
     tf_rows: dict[str, list[dict]] = {}
     tf_trades: dict[str, list[dict]] = {}
@@ -1251,8 +1238,8 @@ async def run(args) -> None:
             "stop_anchor": args.stop_anchor,
             "entry_until": args.entry_until,
             "min_sweep_depth": args.min_sweep_depth,
-            "take": args.take,
-            "take_label": dict(TAKE_MODES)[args.take],
+            "take": "primary",
+            "take_label": TAKE_LABEL,
             "eod": args.eod,
             "eod_label": dict(EOD_MODES)[args.eod],
             "square_off": args.square_off, "signal_until": args.signal_until,
@@ -1407,7 +1394,7 @@ HTML_TEMPLATE = r"""<!doctype html>
   .k.TOUCH, .k.RETEST { background:rgba(42,120,214,.16); color:var(--accent); }
   .k.SWEEP { background:rgba(184,134,11,.18); color:var(--warn); }
   .k.MICROBOS { background:rgba(var(--upN),.18); color:var(--up); }
-  .k.FLIP, .k.CANCEL { background:rgba(var(--downN),.16); color:var(--down); }
+  .k.DEAD, .k.CANCEL { background:rgba(var(--downN),.16); color:var(--down); }
   .k.FILTERED { background:rgba(184,134,11,.18); color:var(--warn); }
   .k.DEAD, .k.BLOCKED, .k.SKIPPED { background:rgba(127,127,127,.18); color:var(--ink2); }
   .k.UNLOCK { background:rgba(127,127,127,.18); color:var(--ink2); }
@@ -1439,7 +1426,14 @@ HTML_TEMPLATE = r"""<!doctype html>
   Swings never repaint: a pivot needs __PIVOT__ candles after it to confirm, so at candle
   <i>i</i> the newest usable swing is the one at <i>i</i>&minus;__PIVOT__.
   <b>Trading __TAKE__.</b> Signals stop at <b>__SIGUNTIL__</b>; open positions are __EODLABEL__.
-  PnL is in NIFTY points and in &#8377; for 1 lot (__LOT__); shorts are scored as
+  The rule is decided on NIFTY <b>spot</b>, but the money is the <b>option that would
+  actually have been bought</b>: ATM strike at entry, nearest expiry on/after the day,
+  long &rarr; CE and short &rarr; PE, filled at that contract's 1-minute closes. The
+  &#8377; column is premium &times; __LOT__, not NIFTY points &times; __LOT__ &mdash; the
+  latter is a <b>futures</b> payoff and overstates a bought option, because premium moves
+  at delta and bleeds theta. Rows with no option data stay in the table and are left out
+  of the money totals. R is still measured on the spot geometry the rule defines.
+  Shorts are scored as
   Entry &minus; Exit.<br>
   A <b>close</b>-confirmed stop fills at the candle's close, so the loss is not capped at 1R;
   the <b>slip</b> column is how far past the level the fill actually landed. A target reached
@@ -1559,7 +1553,6 @@ const sgnRs = v => (v===null||v===undefined||isNaN(v)) ? '&ndash;'
 
 function inView(t, v) {
   if (v === 'both') return true;
-  if (v === 'primary' || v === 'reversal') return t.kind === v;
   return t.side === (v === 'long' ? 'LONG' : 'SHORT');
 }
 /* every trade of the selected timeframe and view, flattened onto the selected
@@ -1581,14 +1574,19 @@ function S() { return DATA.summaries[curF][curV][curS][curT]; }
    headline stats can never drift apart */
 function summarise(rows) {
   const n = rows.length;
-  if (!n) return {days:0, trades:0, wins:0, losses:0, win_rate:0, pnl_pts:0,
-                  pnl_rs:0, stops:0, slip:0, avg_r:0};
-  const wins = rows.filter(r => r.points > 0).length;
+  if (!n) return {days:0, trades:0, priced:0, unpriced:0, wins:0, losses:0,
+                  win_rate:0, pnl_prem:0, pnl_pts:0, pnl_rs:0, stops:0,
+                  slip:0, avg_r:0};
+  const priced = rows.filter(r => r.prem_pts !== null && r.prem_pts !== undefined);
+  const wins = priced.filter(r => r.prem_pts > 0).length;
   const pts = rows.reduce((a,r) => a + r.points, 0);
+  const prem = priced.reduce((a,r) => a + r.prem_pts, 0);
+  const np = priced.length;
   return {
     days: new Set(rows.map(r => r.date)).size, trades: n,
-    wins, losses: n - wins, win_rate: wins / n * 100,
-    pnl_pts: pts, pnl_rs: pts * LOT,
+    priced: np, unpriced: n - np,
+    wins, losses: np - wins, win_rate: np ? wins / np * 100 : 0,
+    pnl_prem: prem, pnl_pts: pts, pnl_rs: prem * LOT,
     stops: rows.filter(r => (r.reason||'').startsWith('STOP')).length,
     slip: rows.reduce((a,r) => a + r.slip, 0),
     avg_r: rows.reduce((a,r) => a + r.r_multiple, 0) / n,
@@ -1684,8 +1682,9 @@ function statBlock(s) {
     [s.wins, 'success'], [s.losses, 'fail'],
     [s.win_rate.toFixed(1)+'%', 'win rate'],
     [(s.avg_r>0?'+':'')+s.avg_r.toFixed(2), 'avg R'],
-    [(s.pnl_pts>0?'+':'')+s.pnl_pts.toFixed(2), 'net PnL (NIFTY pts)'],
-    [(s.pnl_rs>0?'+':'')+Math.round(s.pnl_rs).toLocaleString('en-IN'), 'net PnL (1 lot ₹)'],
+    [(s.pnl_pts>0?'+':'')+s.pnl_pts.toFixed(2), 'NIFTY move (pts)'],
+    [(s.pnl_prem>0?'+':'')+s.pnl_prem.toFixed(2), 'option premium (pts)'],
+    [(s.pnl_rs>0?'+':'')+Math.round(s.pnl_rs).toLocaleString('en-IN'), 'net PnL (1 lot ₹, premium)'],
     [s.stops, 'stopped out'], [s.slip.toFixed(2), 'slip past SL (pts)'],
   ].map(([v,l]) => `<div class="stat"><div class="v">${v}</div><div class="l">${l}</div></div>`).join('');
 }
@@ -1735,7 +1734,7 @@ function renderStatus() {
     'risk below the floor': 'the stop was closer than --min-risk points - noise-width, so no trade',
     'no touch': 'the zone was built but price never came back to it',
     'no confirmation': 'the zone was touched but the sweep + micro-BOS never completed',
-    'no reversal confirmation': 'the zone flipped but the reversal never confirmed',
+    'zone failed': 'the zone gave way before the confirmation completed - day over',
     'filtered out': 'the rule fired but the trade failed a v2 entry filter',
     'no data': 'the session is missing candles',
   };
@@ -1763,7 +1762,9 @@ function renderDays() {
     <th>Touch</th><th>Sweep</th><th class="num">Swept</th><th>Entry time</th>
     <th class="num">Entry</th><th class="num">Stop</th><th class="num">Risk</th>
     <th class="num">Target</th><th class="num">Exit</th><th>Close type</th>
-    <th class="num">PnL (pts)</th><th class="num">R</th><th class="num">PnL (₹)</th>
+    <th class="num">NIFTY pts</th><th class="num">R</th>
+    <th>Contract</th><th class="num">Prem in</th><th class="num">Prem out</th>
+    <th class="num">Prem pts</th><th class="num">PnL (₹)</th>
     <th>Exit time</th><th>Note</th>`;
   const body = [];
   daysFor().forEach(d => {
@@ -1787,7 +1788,11 @@ function renderDays() {
         <td class="num dim">${r.target===null?'<span class="pill no">none</span>':n2(r.target)}</td>
         <td class="num">${n2(r.exit)}</td><td>${closePill(r.reason)}</td>
         <td class="num">${sgn(r.points)}</td><td class="num">${sgn(r.r_multiple,2)}</td>
-        <td class="num">${sgnRs(r.pnl_rs)}</td><td>${r.exit_time}</td>
+        <td class="dim">${r.opt_symbol || '<span class="pill no">'+(r.opt_reason||'not priced')+'</span>'}</td>
+        <td class="num dim">${n2(r.entry_px)}</td><td class="num dim">${n2(r.exit_px)}</td>
+        <td class="num">${sgn(r.prem_pts)}</td>
+        <td class="num">${r.pnl_rs===null||r.pnl_rs===undefined?'<span class="pill no">no option data</span>':sgnRs(r.pnl_rs)}</td>
+        <td>${r.exit_time}</td>
         <td class="dim">${r.slip > 0 ? `<span class="neg">filled ${n2(r.slip)} past the level</span>` : 'clean fill'}</td></tr>`);
     });
   });
@@ -2145,10 +2150,6 @@ def main() -> None:
     ap.add_argument("--fail-closes", type=int, default=FAIL_CLOSES,
                     help="consecutive closes beyond the edge needed to fail "
                          "the zone (1 = the literal spec)")
-    ap.add_argument("--take", choices=[k for k, _ in TAKE_MODES], default=DEFAULT_TAKE,
-                    help="which of the day's two slots is actually traded "
-                         "(default: primary only). The zone still flips and the "
-                         "timeline still records it either way")
     ap.add_argument("--view", choices=[k for k, _ in VIEWS], default=DEFAULT_VIEW,
                     help="view selected when the report opens; all are always "
                          "computed")

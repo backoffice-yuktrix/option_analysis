@@ -93,6 +93,7 @@ BACKEND_DIR = os.path.join(SCRIPT_DIR, "..")
 sys.path.insert(0, BACKEND_DIR)
 
 from services.upstox_client import INSTRUMENT_KEYS, get_candles  # noqa: E402
+from services.option_pricing import CachedPricer, ensure_cached  # noqa: E402
 
 # backend/scripts holds only strategy code; the candle caches live in
 # backend/data and the generated reports in backend/reports.
@@ -106,6 +107,10 @@ UNDERLYING_KEY = INSTRUMENT_KEYS[UNDERLYING]
 
 # NIFTY lot size verified against the Upstox contract master for this period.
 LOT_SIZE = 65
+# The rule is decided on SPOT, but the money is the option that would actually
+# have been bought.  `points x LOT_SIZE` is a NIFTY FUTURES payoff: premium
+# moves at delta and bleeds theta, so that figure overstates a bought option.
+PRICER = CachedPricer()
 
 GAP_PCT = 0.30                 # step 1 threshold, % of PDC
 # Which previous close the gap is measured against.  The 1-minute feed's last
@@ -331,6 +336,24 @@ def walk(bars: list[dict], i_from: int, sl: float, target: float,
             "reason": "EOD"}
 
 
+def _option_leg(info: dict, entry_hhmm: str, exit_hhmm: str | None) -> dict:
+    """Premium fields for one exit variant.
+
+    pnl_rs is None with opt_reason set when the contract or its candles could
+    not be had.  Such a trade STAYS in the table and is simply left out of the
+    money totals - dropping it would quietly shrink the sample.
+    """
+    if info["reason"]:
+        return {"entry_px": None, "exit_px": None, "prem_pts": None,
+                "pnl_rs": None, "win": None, "opt_reason": info["reason"]}
+    o = CachedPricer.price_from(info, entry_hhmm, exit_hhmm)
+    prem = o["prem_pts"]
+    return {"entry_px": o["entry_px"], "exit_px": o["exit_px"], "prem_pts": prem,
+            "pnl_rs": None if prem is None else round(prem * LOT_SIZE, 2),
+            "win": None if prem is None else prem > 0,
+            "opt_reason": o["reason"]}
+
+
 def simulate_day(day: str, minutes: list[dict], pdc: float, *,
                  gap_pct: float, scan_from: str, scan_to: str,
                  square_off: str, rr_values: list[float],
@@ -395,6 +418,12 @@ def simulate_day(day: str, minutes: list[dict], pdc: float, *,
     # ---- Step 4: the same trade at every RR, under both stop rules ------
     row["status"] = "trade"
     row["met"] = True
+    # gap DOWN then a break of the 15m HIGH - the reversal is bought, so this leg is always LONG,
+    # so the option bought is the ATM CE.
+    opt_info = PRICER.day_prices(day, "LONG", entry)
+    row["strike"] = opt_info["strike"]
+    row["opt_type"] = opt_info["option_type"]
+    row["opt_symbol"] = opt_info["symbol"]
     for mode in stop_modes:
         for r in rr_values:
             target = entry + risk * r                # ---- Step 4
@@ -407,7 +436,7 @@ def simulate_day(day: str, minutes: list[dict], pdc: float, *,
                 # how far the fill landed beyond the stop level - 0 unless the
                 # close-confirmed stop overshot it
                 "slip": round(sl - res["exit"], 2) if res["reason"] == "STOP" else 0.0,
-                "pnl_rs": round(pts * LOT_SIZE, 2), "win": pts > 0,
+                **_option_leg(opt_info, row["entry_time"], res["exit_time"]),
             }
 
     return row
@@ -422,15 +451,23 @@ def summarise(trades: list[dict], mode: str, key: str) -> dict:
     rows = [t["ex"][mode][key] for t in trades]
     n = len(rows)
     if not n:
-        return {"days": 0, "trades": 0, "wins": 0, "losses": 0, "win_rate": 0.0,
+        return {"days": 0, "trades": 0, "priced": 0, "unpriced": 0, "wins": 0,
+                "losses": 0, "win_rate": 0.0, "pnl_prem": 0.0,
                 "pnl_pts": 0.0, "pnl_rs": 0.0, "stops": 0, "slip": 0.0}
-    wins = [x for x in rows if x["points"] > 0]
+    # Wins and rupees follow the PREMIUM - that is what the account sees.
+    # pnl_pts stays the spot move, which is what R is measured on.
+    priced = [x for x in rows if x.get("prem_pts") is not None]
+    wins = [x for x in priced if x["prem_pts"] > 0]
     pts = sum(x["points"] for x in rows)
+    prem = sum(x["prem_pts"] for x in priced)
+    np_ = len(priced)
     return {
         "days": len({t["date"] for t in trades}), "trades": n,
-        "wins": len(wins), "losses": n - len(wins),
-        "win_rate": round(len(wins) / n * 100, 1),
-        "pnl_pts": round(pts, 2), "pnl_rs": round(pts * LOT_SIZE, 2),
+        "priced": np_, "unpriced": n - np_,
+        "wins": len(wins), "losses": np_ - len(wins),
+        "win_rate": round(len(wins) / np_ * 100, 1) if np_ else 0.0,
+        "pnl_prem": round(prem, 2),
+        "pnl_pts": round(pts, 2), "pnl_rs": round(prem * LOT_SIZE, 2),
         "stops": len([x for x in rows if x["reason"] == "STOP"]),
         "slip": round(sum(x["slip"] for x in rows), 2),
     }
@@ -473,6 +510,26 @@ async def run(args) -> None:
     rr_values = args.rr_values
     labels = [rr_label(r) for r in rr_values]
     stop_modes = [k for k, _ in STOP_MODES]
+
+    # ---- two passes, and the order is the whole point --------------------
+    # Pass 1 runs the rule on SPOT alone: the gap, the opening range, the
+    # breakout candle, the stop and the target are all decided there.  Only
+    # then are the ATM contracts those signals imply resolved and fetched, so
+    # the option can never move a level or change which trades exist - it only
+    # puts a rupee figure on a result the underlying already determined.
+    global PRICER
+
+    def _spot_only(d):
+        return simulate_day(
+            d, by_day[d], prev_close[d], gap_pct=args.gap, scan_from=args.scan_from,
+            scan_to=args.scan_to, square_off=args.square_off, rr_values=rr_values,
+            stop_modes=stop_modes)
+
+    needs = {(r["date"], r.get("side", "LONG"), r["entry"])
+             for r in (_spot_only(d) for d in days if d in prev_close)
+             if r.get("status") == "trade"}
+    PRICER = await ensure_cached(
+        needs, None if args.offline else _read_access_token(), args.offline)
 
     rows = []
     for d in days:
@@ -833,8 +890,9 @@ function statBlock(s) {
     [s.days, 'trade days'], [s.trades, 'total trades'],
     [s.wins, 'success'], [s.losses, 'fail'],
     [s.win_rate.toFixed(1)+'%', 'win rate'],
-    [(s.pnl_pts>0?'+':'')+s.pnl_pts.toFixed(2), 'net PnL (NIFTY pts)'],
-    [(s.pnl_rs>0?'+':'')+Math.round(s.pnl_rs).toLocaleString('en-IN'), 'net PnL (1 lot ₹)'],
+    [(s.pnl_pts>0?'+':'')+s.pnl_pts.toFixed(2), 'NIFTY move (pts)'],
+    [(s.pnl_prem>0?'+':'')+s.pnl_prem.toFixed(2), 'option premium (pts)'],
+    [(s.pnl_rs>0?'+':'')+Math.round(s.pnl_rs).toLocaleString('en-IN'), 'net PnL (1 lot ₹, premium)'],
     [s.stops, 'stopped out'], [s.slip.toFixed(2), 'slip past SL (pts)'],
   ].map(([v,l]) => `<div class="stat"><div class="v">${v}</div><div class="l">${l}</div></div>`).join('');
 }
@@ -866,7 +924,9 @@ function renderDays() {
     <th>Breakout cn</th><th class="num">cn close</th><th>Entry time</th>
     <th class="num">Entry</th><th class="num">Target</th><th class="num">Stop</th>
     <th class="num">Exit</th><th>Close type</th><th class="num">PnL (pts)</th>
-    <th class="num">R</th><th class="num">PnL (₹)</th><th>Exit time</th><th>Note</th>`;
+    <th class="num">R</th><th>Contract</th><th class="num">Prem in</th>
+    <th class="num">Prem out</th><th class="num">Prem pts</th>
+    <th class="num">PnL (₹)</th><th>Exit time</th><th>Note</th>`;
   const body = rows.map(r => {
     if (!r.met) {
       return `<tr><td>${r.date}</td><td class="dim">no</td><td colspan="3" class="dim">&mdash;</td>
@@ -882,7 +942,11 @@ function renderDays() {
       <td class="num dim">${n2(r.target)}</td><td class="num dim">${n2(r.sl)}</td>
       <td class="num">${n2(r.exit)}</td><td>${closePill(r.reason)}</td>
       <td class="num">${sgn(r.points)}</td><td class="num">${sgn(r.r_multiple,2)}</td>
-      <td class="num">${sgnRs(r.pnl_rs)}</td><td>${r.exit_time}</td>
+      <td class="dim">${r.opt_symbol || '<span class="pill no">'+(r.opt_reason||'not priced')+'</span>'}</td>
+      <td class="num dim">${n2(r.entry_px)}</td><td class="num dim">${n2(r.exit_px)}</td>
+      <td class="num">${sgn(r.prem_pts)}</td>
+      <td class="num">${r.pnl_rs===null||r.pnl_rs===undefined?'<span class="pill no">no option data</span>':sgnRs(r.pnl_rs)}</td>
+      <td>${r.exit_time}</td>
       <td class="dim">risk ${n2(r.risk)} pts &middot; levels live ${r.live_from}${r.slip > 0
         ? ` &middot; <span class="neg">filled ${n2(r.slip)} below SL</span>` : ''}</td></tr>`;
   });
