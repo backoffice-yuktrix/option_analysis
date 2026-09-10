@@ -1347,7 +1347,7 @@ def summarise(trades: list[dict], mode: str, tkey: str) -> dict:
                 "wins": 0, "losses": 0, "win_rate": 0.0, "pnl_prem": 0.0,
                 "pnl_pts": 0.0, "pnl_rs": 0.0, "stops": 0, "slip": 0.0,
                 "avg_r": 0.0, "no_target": 0, "capital": 0.0,
-                "trail_stops": 0, "sqo": 0, "targets": 0,
+                "trail_stops": 0, "sqo": 0, "targets": 0, "avg_prem_perc": 0.0,
                 "avg_win_rs": 0.0, "avg_loss_rs": 0.0, "rr_real": 0.0,
                 "worst_rs": 0.0, "roi": 0.0}
     # Money and win/loss come from the PREMIUM, because that is what the
@@ -1375,6 +1375,11 @@ def summarise(trades: list[dict], mode: str, tkey: str) -> dict:
         "pnl_prem": round(prem, 2),
         "pnl_pts": round(pts, 2), "pnl_rs": round(prem * LOT_SIZE, 2),
         "capital": round(sum(paid) * LOT_SIZE, 2),
+        # simple mean of each trade's premium return; unpriced rows excluded
+        "avg_prem_perc": (round(sum(x["prem_pts"] / x["entry_px"] * 100
+                                    for x in priced if x.get("entry_px"))
+                                / len([x for x in priced if x.get("entry_px")]), 2)
+                          if [x for x in priced if x.get("entry_px")] else 0.0),
         "avg_win_rs": round(avg_w * LOT_SIZE, 2),
         "avg_loss_rs": round(avg_l * LOT_SIZE, 2),
         "rr_real": round(abs(avg_w / avg_l), 2) if avg_l else 0.0,
@@ -1924,6 +1929,8 @@ function summarise(rows) {
   const wRows = priced.filter(r => r.prem_pts > 0);
   const lRows = priced.filter(r => r.prem_pts <= 0);
   const paid = priced.reduce((a,r) => a + (r.entry_px||0), 0);
+  const pPct = priced.filter(r => r.entry_px)
+                     .map(r => r.prem_pts / r.entry_px * 100);
   const aW = wRows.length ? wRows.reduce((a,r)=>a+r.prem_pts,0)/wRows.length : 0;
   const aL = lRows.length ? lRows.reduce((a,r)=>a+r.prem_pts,0)/lRows.length : 0;
   const pts = rows.reduce((a,r) => a + r.points, 0);
@@ -1935,6 +1942,8 @@ function summarise(rows) {
     wins, losses: np - wins, win_rate: np ? wins / np * 100 : 0,
     pnl_prem: prem, pnl_pts: pts, pnl_rs: prem * LOT,
     capital: paid * LOT, avg_win_rs: aW * LOT, avg_loss_rs: aL * LOT,
+    avg_prem_perc: pPct.length
+      ? pPct.reduce((a, v) => a + v, 0) / pPct.length : 0,
     rr_real: aL ? Math.abs(aW/aL) : 0,
     worst_rs: priced.length ? Math.min(...priced.map(r=>r.prem_pts)) * LOT : 0,
     roi: paid ? prem / paid * 100 : 0,
@@ -2056,12 +2065,14 @@ function statBlock(s) {
 function summaryTable(el, rows, label) {
   const head = `<th>${label}</th><th class="num">Trade days</th><th class="num">Trades</th>
     <th class="num">Success</th><th class="num">Fail</th><th class="num">Win %</th>
-    <th class="num">Avg R</th><th class="num">Net PnL (pts)</th><th class="num">Net PnL (₹)</th>`;
+    <th class="num">Avg R</th><th class="num">Net PnL (pts)</th><th class="num">Net PnL (₹)</th>
+    <th class="num">Avg Prem %</th>`;
   table(el, head, rows.map(r => `<tr><td>${r.key}</td><td class="num">${r.days}</td>
     <td class="num">${r.trades}</td><td class="num pos">${r.wins}</td>
     <td class="num neg">${r.losses}</td><td class="num">${r.win_rate.toFixed(1)}%</td>
     <td class="num">${sgn(r.avg_r,2)}</td>
-    <td class="num">${sgn(r.pnl_pts)}</td><td class="num">${sgnRs(r.pnl_rs)}</td></tr>`),
+    <td class="num">${sgn(r.pnl_pts)}</td><td class="num">${sgnRs(r.pnl_rs)}</td>
+    <td class="num">${sgn(r.avg_prem_perc,1)}%</td></tr>`),
     'no trades');
 }
 
@@ -2130,7 +2141,7 @@ function renderDays() {
     <th class="num">Stop</th><th class="num">Target</th><th class="num">Exit</th><th>Close type</th>
     <th class="num">NIFTY pts</th><th class="num">R</th>
     <th>Contract</th><th class="num">Prem in</th><th class="num">Prem out</th>
-    <th class="num">Prem pts</th><th class="num">PnL (₹)</th>
+    <th class="num">Prem pts</th><th class="num">Prem %</th><th class="num">PnL (₹)</th>
     <th>Exit time</th><th>Note</th>`;
   const body = [];
   daysFor().forEach(d => {
@@ -2160,6 +2171,8 @@ function renderDays() {
         <td class="dim">${r.opt_symbol || '<span class="pill no">'+(r.opt_reason||'not priced')+'</span>'}</td>
         <td class="num dim">${n2(r.entry_px)}</td><td class="num dim">${n2(r.exit_px)}</td>
         <td class="num">${sgn(r.prem_pts)}</td>
+        <td class="num">${(r.prem_pts===null||r.prem_pts===undefined||!r.entry_px)
+            ? '&ndash;' : sgn(r.prem_pts / r.entry_px * 100, 1) + '%'}</td>
         <td class="num">${r.pnl_rs===null||r.pnl_rs===undefined?'<span class="pill no">no option data</span>':sgnRs(r.pnl_rs)}</td>
         <td>${r.exit_time}</td>
         <td class="dim">${r.opt_reason ? `<span class="neg">${r.opt_reason}</span>` : 'priced'}</td></tr>`);
