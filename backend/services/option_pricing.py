@@ -79,6 +79,29 @@ def atm_strike(spot: float) -> float:
     return float(round(spot / STRIKE_STEP) * STRIKE_STEP)
 
 
+# Which expiry to buy.  The default reproduces the original behaviour exactly:
+# the nearest expiry on or after the trade date, including that date itself.
+#   none      nearest expiry, even when it expires today (0-DTE)
+#   zero-dte  nearest, EXCEPT on its own expiry day, when it rolls to the next
+#   always    always one expiry further out
+# 0-DTE is where every catastrophic percentage loss in the NES book came from:
+# an expiry-day ATM option has no time value left, so a 100-point adverse move
+# takes ~50 premium points off a ~55-point contract.  Rolling costs more
+# premium and buys a far smaller worst case.
+ROLL_MODES = [("none", "Nearest expiry, including 0-DTE"),
+              ("zero-dte", "Nearest expiry, but roll off it on expiry day"),
+              ("always", "Always the next expiry out")]
+
+
+def roll_start(expiries: list, day: date, roll: str) -> int:
+    """Index into the expiries-on-or-after-day list that `roll` selects."""
+    if roll == "always":
+        return 1
+    if roll == "zero-dte" and expiries and expiries[0] == day:
+        return 1
+    return 0
+
+
 def _load(path: str, fallback: str | None = None):
     for p in (path, fallback):
         if p and os.path.exists(p):
@@ -264,8 +287,10 @@ class OptionPricer:
         self.fetched_contracts += 1
         return dict(found, ckey=key) if found else None
 
-    async def contract_for(self, day: date, strike: float, opt: str) -> dict | None:
-        for expiry in self.expiries_for(day):
+    async def contract_for(self, day: date, strike: float, opt: str,
+                           roll: str = "none") -> dict | None:
+        after = self.expiries_for(day, limit=4)
+        for expiry in after[roll_start(after, day, roll):]:
             c = await self._resolve(expiry, strike, opt)
             if c:
                 return c
@@ -382,24 +407,29 @@ class CachedPricer:
         cal = _load(EXPIRY_CACHE, LEGACY_EXPIRY_CACHE) or []
         self.expiries = sorted(date.fromisoformat(s) for s in cal)
 
-    def _contract(self, day: date, strike: float, opt: str) -> dict | None:
-        for expiry in [e for e in self.expiries if e >= day][:3]:
+    def _contract(self, day: date, strike: float, opt: str,
+                  roll: str = "none") -> dict | None:
+        after = [e for e in self.expiries if e >= day]
+        start = roll_start(after, day, roll)
+        for expiry in after[start:start + 3]:
             key = f"{expiry.isoformat()}|{strike:.0f}|{opt}"
             c = self.contracts.get(key)
             if c:
                 return dict(c, ckey=key)
         return None
 
-    def day_prices(self, day: str, side: str, spot_entry: float) -> dict:
+    def day_prices(self, day: str, side: str, spot_entry: float,
+                   roll: str = "none") -> dict:
         """{'symbol','strike','option_type','candles'} for the contract a trade
         on this day and side would have bought.  `candles` is {'HH:MM': close}
-        for the whole session, so any exit minute can be looked up."""
+        for the whole session, so any exit minute can be looked up.
+        `roll` selects the expiry - see ROLL_MODES."""
         d = date.fromisoformat(day)
         strike = atm_strike(spot_entry)
         opt = "CE" if side == "LONG" else "PE"
         out = {"strike": strike, "option_type": opt, "symbol": None,
                "candles": {}, "reason": None}
-        c = self._contract(d, strike, opt)
+        c = self._contract(d, strike, opt, roll)
         if not c:
             out["reason"] = "no contract"
             return out
@@ -447,7 +477,8 @@ class CachedPricer:
         self.__init__()
 
 
-async def ensure_cached(needs, token: str | None, offline: bool = False) -> "CachedPricer":
+async def ensure_cached(needs, token: str | None, offline: bool = False,
+                        roll: str = "none") -> "CachedPricer":
     """Fetch whatever the requested date range needs, then hand back a pricer.
 
     `needs` is an iterable of (day, side, spot_entry) - one per SIGNAL, taken
@@ -466,7 +497,7 @@ async def ensure_cached(needs, token: str | None, offline: bool = False) -> "Cac
     pricer = CachedPricer()
     missing = []
     for day, strike, opt in sorted(want):
-        info = pricer.day_prices(day, "LONG" if opt == "CE" else "SHORT", strike)
+        info = pricer.day_prices(day, "LONG" if opt == "CE" else "SHORT", strike, roll)
         if not info["reason"]:
             continue
         missing.append((day, strike, opt))
@@ -484,7 +515,7 @@ async def ensure_cached(needs, token: str | None, offline: bool = False) -> "Cac
     got = 0
     for i, (day, strike, opt) in enumerate(missing, 1):
         d = date.fromisoformat(day)
-        contract = await op.contract_for(d, strike, opt)
+        contract = await op.contract_for(d, strike, opt, roll)
         if contract and await op.candles_for(contract, d):
             got += 1
         if i % 25 == 0:
