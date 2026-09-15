@@ -886,8 +886,8 @@
 },
 "2026-09-08|23950|CE": {
 "trading_symbol": "NIFTY 23950 CE 08 SEP 26",
-"instrument_key": "NSE_FO|42637",
-"expired": false,
+"instrument_key": "NSE_FO|42637|08-09-2026",
+"expired": true,
 "lot_size": 65
 },
 "2026-09-08|23750|CE": {
@@ -2585,6 +2585,1423 @@
 "2026-09-08|23850|PE": {
 "trading_symbol": "NIFTY 23850 PE 08 SEP 26",
 "instrument_key": "NSE_FO|42634|08-09-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-03-17|23050|CE": {
+"trading_symbol": "NIFTY 23050 CE 17 MAR 26",
+"instrument_key": "NSE_FO|57699|17-03-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-03-17|23050|PE": {
+"trading_symbol": "NIFTY 23050 PE 17 MAR 26",
+"instrument_key": "NSE_FO|57701|17-03-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-03-17|23100|CE": {
+"trading_symbol": "NIFTY 23100 CE 17 MAR 26",
+"instrument_key": "NSE_FO|57702|17-03-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-03-17|23150|CE": {
+"trading_symbol": "NIFTY 23150 CE 17 MAR 26",
+"instrument_key": "NSE_FO|57704|17-03-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-03-17|23150|PE": {
+"trading_symbol": "NIFTY 23150 PE 17 MAR 26",
+"instrument_key": "NSE_FO|57709|17-03-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-03-17|23200|CE": {
+"trading_symbol": "NIFTY 23200 CE 17 MAR 26",
+"instrument_key": "NSE_FO|57710|17-03-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-03-17|23450|PE": {
+"trading_symbol": "NIFTY 23450 PE 17 MAR 26",
+"instrument_key": "NSE_FO|57744|17-03-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-03-24|23400|PE": {
+"trading_symbol": "NIFTY 23400 PE 24 MAR 26",
+"instrument_key": "NSE_FO|62593|24-03-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-03-24|23450|CE": {
+"trading_symbol": "NIFTY 23450 CE 24 MAR 26",
+"instrument_key": "NSE_FO|62594|24-03-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-03-24|23450|PE": {
+"trading_symbol": "NIFTY 23450 PE 24 MAR 26",
+"instrument_key": "NSE_FO|62595|24-03-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-03-24|23500|CE": {
+"trading_symbol": "NIFTY 23500 CE 24 MAR 26",
+"instrument_key": "NSE_FO|62596|24-03-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-03-24|23500|PE": {
+"trading_symbol": "NIFTY 23500 PE 24 MAR 26",
+"instrument_key": "NSE_FO|62597|24-03-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-03-24|23550|CE": {
+"trading_symbol": "NIFTY 23550 CE 24 MAR 26",
+"instrument_key": "NSE_FO|62598|24-03-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-03-24|23550|PE": {
+"trading_symbol": "NIFTY 23550 PE 24 MAR 26",
+"instrument_key": "NSE_FO|62599|24-03-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-03-24|23600|PE": {
+"trading_symbol": "NIFTY 23600 PE 24 MAR 26",
+"instrument_key": "NSE_FO|62601|24-03-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-03-24|23800|CE": {
+"trading_symbol": "NIFTY 23800 CE 24 MAR 26",
+"instrument_key": "NSE_FO|62609|24-03-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-03-24|23850|PE": {
+"trading_symbol": "NIFTY 23850 PE 24 MAR 26",
+"instrument_key": "NSE_FO|62617|24-03-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-03-24|23100|CE": {
+"trading_symbol": "NIFTY 23100 CE 24 MAR 26",
+"instrument_key": "NSE_FO|62575|24-03-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-03-24|23100|PE": {
+"trading_symbol": "NIFTY 23100 PE 24 MAR 26",
+"instrument_key": "NSE_FO|62577|24-03-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-03-24|23150|CE": {
+"trading_symbol": "NIFTY 23150 CE 24 MAR 26",
+"instrument_key": "NSE_FO|62578|24-03-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-03-24|22500|PE": {
+"trading_symbol": "NIFTY 22500 PE 24 MAR 26",
+"instrument_key": "NSE_FO|62435|24-03-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-03-24|22550|PE": {
+"trading_symbol": "NIFTY 22550 PE 24 MAR 26",
+"instrument_key": "NSE_FO|62437|24-03-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-03-24|22600|CE": {
+"trading_symbol": "NIFTY 22600 CE 24 MAR 26",
+"instrument_key": "NSE_FO|62498|24-03-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-03-30|22700|CE": {
+"trading_symbol": "NIFTY 22700 CE 30 MAR 26",
+"instrument_key": "NSE_FO|54486|30-03-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-03-30|22800|PE": {
+"trading_symbol": "NIFTY 22800 PE 30 MAR 26",
+"instrument_key": "NSE_FO|54491|30-03-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-03-30|22900|CE": {
+"trading_symbol": "NIFTY 22900 CE 30 MAR 26",
+"instrument_key": "NSE_FO|54494|30-03-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-03-30|22900|PE": {
+"trading_symbol": "NIFTY 22900 PE 30 MAR 26",
+"instrument_key": "NSE_FO|54495|30-03-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-03-30|23350|CE": {
+"trading_symbol": "NIFTY 23350 CE 30 MAR 26",
+"instrument_key": "NSE_FO|54512|30-03-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-03-30|23400|CE": {
+"trading_symbol": "NIFTY 23400 CE 30 MAR 26",
+"instrument_key": "NSE_FO|54514|30-03-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-03-30|23450|CE": {
+"trading_symbol": "NIFTY 23450 CE 30 MAR 26",
+"instrument_key": "NSE_FO|54516|30-03-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-03-31|22350|CE": null,
+"2026-04-07|22350|CE": {
+"trading_symbol": "NIFTY 22350 CE 07 APR 26",
+"instrument_key": "NSE_FO|40726|07-04-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-03-31|22450|CE": null,
+"2026-04-07|22450|CE": {
+"trading_symbol": "NIFTY 22450 CE 07 APR 26",
+"instrument_key": "NSE_FO|40730|07-04-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-03-31|22450|PE": null,
+"2026-04-07|22450|PE": {
+"trading_symbol": "NIFTY 22450 PE 07 APR 26",
+"instrument_key": "NSE_FO|40731|07-04-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-03-31|22500|CE": null,
+"2026-04-07|22500|CE": {
+"trading_symbol": "NIFTY 22500 CE 07 APR 26",
+"instrument_key": "NSE_FO|40732|07-04-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-03-31|22500|PE": null,
+"2026-04-07|22500|PE": {
+"trading_symbol": "NIFTY 22500 PE 07 APR 26",
+"instrument_key": "NSE_FO|40735|07-04-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-03-31|22550|PE": null,
+"2026-04-07|22550|PE": {
+"trading_symbol": "NIFTY 22550 PE 07 APR 26",
+"instrument_key": "NSE_FO|40737|07-04-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-04-07|22700|CE": {
+"trading_symbol": "NIFTY 22700 CE 07 APR 26",
+"instrument_key": "NSE_FO|40742|07-04-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-04-07|22750|CE": {
+"trading_symbol": "NIFTY 22750 CE 07 APR 26",
+"instrument_key": "NSE_FO|40747|07-04-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-04-07|22800|CE": {
+"trading_symbol": "NIFTY 22800 CE 07 APR 26",
+"instrument_key": "NSE_FO|40752|07-04-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-04-07|22400|PE": {
+"trading_symbol": "NIFTY 22400 PE 07 APR 26",
+"instrument_key": "NSE_FO|40729|07-04-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-04-07|22650|PE": {
+"trading_symbol": "NIFTY 22650 PE 07 APR 26",
+"instrument_key": "NSE_FO|40741|07-04-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-04-07|22600|PE": {
+"trading_symbol": "NIFTY 22600 PE 07 APR 26",
+"instrument_key": "NSE_FO|40739|07-04-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-04-07|22700|PE": {
+"trading_symbol": "NIFTY 22700 PE 07 APR 26",
+"instrument_key": "NSE_FO|40745|07-04-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-04-13|22850|CE": {
+"trading_symbol": "NIFTY 22850 CE 13 APR 26",
+"instrument_key": "NSE_FO|54759|13-04-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-04-13|22900|PE": {
+"trading_symbol": "NIFTY 22900 PE 13 APR 26",
+"instrument_key": "NSE_FO|54762|13-04-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-04-13|22950|CE": {
+"trading_symbol": "NIFTY 22950 CE 13 APR 26",
+"instrument_key": "NSE_FO|54763|13-04-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-04-13|22950|PE": {
+"trading_symbol": "NIFTY 22950 PE 13 APR 26",
+"instrument_key": "NSE_FO|54764|13-04-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-04-13|23000|CE": {
+"trading_symbol": "NIFTY 23000 CE 13 APR 26",
+"instrument_key": "NSE_FO|54765|13-04-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-04-13|23000|PE": {
+"trading_symbol": "NIFTY 23000 PE 13 APR 26",
+"instrument_key": "NSE_FO|54766|13-04-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-04-13|23050|PE": {
+"trading_symbol": "NIFTY 23050 PE 13 APR 26",
+"instrument_key": "NSE_FO|54768|13-04-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-04-13|23750|CE": {
+"trading_symbol": "NIFTY 23750 CE 13 APR 26",
+"instrument_key": "NSE_FO|54802|13-04-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-04-13|23800|CE": {
+"trading_symbol": "NIFTY 23800 CE 13 APR 26",
+"instrument_key": "NSE_FO|54804|13-04-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-04-14|23750|CE": null,
+"2026-04-21|23750|CE": {
+"trading_symbol": "NIFTY 23750 CE 21 APR 26",
+"instrument_key": "NSE_FO|63406|21-04-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-04-14|23750|PE": null,
+"2026-04-21|23750|PE": {
+"trading_symbol": "NIFTY 23750 PE 21 APR 26",
+"instrument_key": "NSE_FO|63407|21-04-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-04-14|23800|CE": null,
+"2026-04-21|23800|CE": {
+"trading_symbol": "NIFTY 23800 CE 21 APR 26",
+"instrument_key": "NSE_FO|63408|21-04-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-04-14|23800|PE": null,
+"2026-04-21|23800|PE": {
+"trading_symbol": "NIFTY 23800 PE 21 APR 26",
+"instrument_key": "NSE_FO|63409|21-04-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-04-14|23850|CE": null,
+"2026-04-21|23850|CE": {
+"trading_symbol": "NIFTY 23850 CE 21 APR 26",
+"instrument_key": "NSE_FO|63410|21-04-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-04-14|23850|PE": null,
+"2026-04-21|23850|PE": {
+"trading_symbol": "NIFTY 23850 PE 21 APR 26",
+"instrument_key": "NSE_FO|63411|21-04-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-04-21|23900|PE": {
+"trading_symbol": "NIFTY 23900 PE 21 APR 26",
+"instrument_key": "NSE_FO|63413|21-04-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-04-21|24100|CE": {
+"trading_symbol": "NIFTY 24100 CE 21 APR 26",
+"instrument_key": "NSE_FO|63422|21-04-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-04-21|24150|CE": {
+"trading_symbol": "NIFTY 24150 CE 21 APR 26",
+"instrument_key": "NSE_FO|63424|21-04-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-04-21|24350|CE": {
+"trading_symbol": "NIFTY 24350 CE 21 APR 26",
+"instrument_key": "NSE_FO|63434|21-04-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-04-21|24400|CE": {
+"trading_symbol": "NIFTY 24400 CE 21 APR 26",
+"instrument_key": "NSE_FO|63436|21-04-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-04-21|24450|CE": {
+"trading_symbol": "NIFTY 24450 CE 21 APR 26",
+"instrument_key": "NSE_FO|63444|21-04-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-04-28|24500|CE": {
+"trading_symbol": "NIFTY 24500 CE 28 APR 26",
+"instrument_key": "NSE_FO|72325|28-04-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-04-28|24500|PE": {
+"trading_symbol": "NIFTY 24500 PE 28 APR 26",
+"instrument_key": "NSE_FO|72326|28-04-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-04-28|24550|CE": {
+"trading_symbol": "NIFTY 24550 CE 28 APR 26",
+"instrument_key": "NSE_FO|72327|28-04-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-04-28|24550|PE": {
+"trading_symbol": "NIFTY 24550 PE 28 APR 26",
+"instrument_key": "NSE_FO|72328|28-04-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-04-28|24600|PE": {
+"trading_symbol": "NIFTY 24600 PE 28 APR 26",
+"instrument_key": "NSE_FO|72330|28-04-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-04-28|24350|CE": {
+"trading_symbol": "NIFTY 24350 CE 28 APR 26",
+"instrument_key": "NSE_FO|72312|28-04-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-04-28|24200|PE": {
+"trading_symbol": "NIFTY 24200 PE 28 APR 26",
+"instrument_key": "NSE_FO|72272|28-04-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-04-28|24250|PE": {
+"trading_symbol": "NIFTY 24250 PE 28 APR 26",
+"instrument_key": "NSE_FO|72278|28-04-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-04-28|24300|PE": {
+"trading_symbol": "NIFTY 24300 PE 28 APR 26",
+"instrument_key": "NSE_FO|72311|28-04-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-04-28|23850|CE": {
+"trading_symbol": "NIFTY 23850 CE 28 APR 26",
+"instrument_key": "NSE_FO|72257|28-04-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-04-28|23850|PE": {
+"trading_symbol": "NIFTY 23850 PE 28 APR 26",
+"instrument_key": "NSE_FO|72258|28-04-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-04-28|23900|PE": {
+"trading_symbol": "NIFTY 23900 PE 28 APR 26",
+"instrument_key": "NSE_FO|72260|28-04-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-04-28|23950|PE": {
+"trading_symbol": "NIFTY 23950 PE 28 APR 26",
+"instrument_key": "NSE_FO|72262|28-04-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-05-05|24000|CE": {
+"trading_symbol": "NIFTY 24000 CE 05 MAY 26",
+"instrument_key": "NSE_FO|74147|05-05-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-05-05|24050|CE": {
+"trading_symbol": "NIFTY 24050 CE 05 MAY 26",
+"instrument_key": "NSE_FO|74155|05-05-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-05-05|24300|CE": {
+"trading_symbol": "NIFTY 24300 CE 05 MAY 26",
+"instrument_key": "NSE_FO|74171|05-05-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-05-05|24350|PE": {
+"trading_symbol": "NIFTY 24350 PE 05 MAY 26",
+"instrument_key": "NSE_FO|74174|05-05-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-05-12|23950|CE": {
+"trading_symbol": "NIFTY 23950 CE 12 MAY 26",
+"instrument_key": "NSE_FO|41748|12-05-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-05-12|23950|PE": {
+"trading_symbol": "NIFTY 23950 PE 12 MAY 26",
+"instrument_key": "NSE_FO|41749|12-05-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-05-12|24000|CE": {
+"trading_symbol": "NIFTY 24000 CE 12 MAY 26",
+"instrument_key": "NSE_FO|41754|12-05-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-05-12|24050|CE": {
+"trading_symbol": "NIFTY 24050 CE 12 MAY 26",
+"instrument_key": "NSE_FO|41756|12-05-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-05-12|24050|PE": {
+"trading_symbol": "NIFTY 24050 PE 12 MAY 26",
+"instrument_key": "NSE_FO|41757|12-05-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-05-12|24300|PE": {
+"trading_symbol": "NIFTY 24300 PE 12 MAY 26",
+"instrument_key": "NSE_FO|41779|12-05-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-05-12|24400|PE": {
+"trading_symbol": "NIFTY 24400 PE 12 MAY 26",
+"instrument_key": "NSE_FO|41789|12-05-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-05-12|24150|CE": {
+"trading_symbol": "NIFTY 24150 CE 12 MAY 26",
+"instrument_key": "NSE_FO|41760|12-05-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-05-12|24200|PE": {
+"trading_symbol": "NIFTY 24200 PE 12 MAY 26",
+"instrument_key": "NSE_FO|41763|12-05-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-05-12|24250|PE": {
+"trading_symbol": "NIFTY 24250 PE 12 MAY 26",
+"instrument_key": "NSE_FO|41777|12-05-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-05-12|23850|CE": {
+"trading_symbol": "NIFTY 23850 CE 12 MAY 26",
+"instrument_key": "NSE_FO|41744|12-05-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-05-19|23450|CE": {
+"trading_symbol": "NIFTY 23450 CE 19 MAY 26",
+"instrument_key": "NSE_FO|51352|19-05-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-05-19|23550|PE": {
+"trading_symbol": "NIFTY 23550 PE 19 MAY 26",
+"instrument_key": "NSE_FO|51357|19-05-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-05-19|23600|PE": {
+"trading_symbol": "NIFTY 23600 PE 19 MAY 26",
+"instrument_key": "NSE_FO|51359|19-05-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-05-19|23650|PE": {
+"trading_symbol": "NIFTY 23650 PE 19 MAY 26",
+"instrument_key": "NSE_FO|51365|19-05-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-05-19|23400|CE": {
+"trading_symbol": "NIFTY 23400 CE 19 MAY 26",
+"instrument_key": "NSE_FO|51348|19-05-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-05-19|23500|PE": {
+"trading_symbol": "NIFTY 23500 PE 19 MAY 26",
+"instrument_key": "NSE_FO|51355|19-05-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-05-19|23700|PE": {
+"trading_symbol": "NIFTY 23700 PE 19 MAY 26",
+"instrument_key": "NSE_FO|51367|19-05-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-05-19|23800|PE": {
+"trading_symbol": "NIFTY 23800 PE 19 MAY 26",
+"instrument_key": "NSE_FO|51375|19-05-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-05-26|23500|PE": {
+"trading_symbol": "NIFTY 23500 PE 26 MAY 26",
+"instrument_key": "NSE_FO|72068|26-05-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-05-26|23600|CE": {
+"trading_symbol": "NIFTY 23600 CE 26 MAY 26",
+"instrument_key": "NSE_FO|72143|26-05-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-05-26|23650|CE": {
+"trading_symbol": "NIFTY 23650 CE 26 MAY 26",
+"instrument_key": "NSE_FO|72165|26-05-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-05-26|23950|PE": {
+"trading_symbol": "NIFTY 23950 PE 26 MAY 26",
+"instrument_key": "NSE_FO|72178|26-05-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-06-02|23950|CE": {
+"trading_symbol": "NIFTY 23950 CE 02 JUN 26",
+"instrument_key": "NSE_FO|57048|02-06-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-06-02|24000|PE": {
+"trading_symbol": "NIFTY 24000 PE 02 JUN 26",
+"instrument_key": "NSE_FO|57051|02-06-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-06-02|24050|PE": {
+"trading_symbol": "NIFTY 24050 PE 02 JUN 26",
+"instrument_key": "NSE_FO|57053|02-06-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-06-02|23850|CE": {
+"trading_symbol": "NIFTY 23850 CE 02 JUN 26",
+"instrument_key": "NSE_FO|57044|02-06-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-06-02|23400|PE": {
+"trading_symbol": "NIFTY 23400 PE 02 JUN 26",
+"instrument_key": "NSE_FO|57027|02-06-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-06-09|23500|PE": {
+"trading_symbol": "NIFTY 23500 PE 09 JUN 26",
+"instrument_key": "NSE_FO|42301|09-06-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-06-09|23550|CE": {
+"trading_symbol": "NIFTY 23550 CE 09 JUN 26",
+"instrument_key": "NSE_FO|42302|09-06-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-06-09|23550|PE": {
+"trading_symbol": "NIFTY 23550 PE 09 JUN 26",
+"instrument_key": "NSE_FO|42303|09-06-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-06-16|23250|CE": {
+"trading_symbol": "NIFTY 23250 CE 16 JUN 26",
+"instrument_key": "NSE_FO|50568|16-06-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-06-23|24000|PE": {
+"trading_symbol": "NIFTY 24000 PE 23 JUN 26",
+"instrument_key": "NSE_FO|56373|23-06-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-06-30|24150|CE": {
+"trading_symbol": "NIFTY 24150 CE 30 JUN 26",
+"instrument_key": "NSE_FO|79734|30-06-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-07-07|23900|CE": {
+"trading_symbol": "NIFTY 23900 CE 07 JUL 26",
+"instrument_key": "NSE_FO|44616|07-07-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-07-07|23950|CE": {
+"trading_symbol": "NIFTY 23950 CE 07 JUL 26",
+"instrument_key": "NSE_FO|44618|07-07-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-07-07|23950|PE": {
+"trading_symbol": "NIFTY 23950 PE 07 JUL 26",
+"instrument_key": "NSE_FO|44619|07-07-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-07-07|24000|CE": {
+"trading_symbol": "NIFTY 24000 CE 07 JUL 26",
+"instrument_key": "NSE_FO|44620|07-07-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-07-07|24100|CE": {
+"trading_symbol": "NIFTY 24100 CE 07 JUL 26",
+"instrument_key": "NSE_FO|44633|07-07-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-07-07|24150|PE": {
+"trading_symbol": "NIFTY 24150 PE 07 JUL 26",
+"instrument_key": "NSE_FO|44639|07-07-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-07-07|24250|CE": {
+"trading_symbol": "NIFTY 24250 CE 07 JUL 26",
+"instrument_key": "NSE_FO|44642|07-07-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-07-07|24250|PE": {
+"trading_symbol": "NIFTY 24250 PE 07 JUL 26",
+"instrument_key": "NSE_FO|44643|07-07-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-07-07|24300|CE": {
+"trading_symbol": "NIFTY 24300 CE 07 JUL 26",
+"instrument_key": "NSE_FO|44645|07-07-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-07-07|24400|CE": {
+"trading_symbol": "NIFTY 24400 CE 07 JUL 26",
+"instrument_key": "NSE_FO|44654|07-07-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-07-14|24400|CE": {
+"trading_symbol": "NIFTY 24400 CE 14 JUL 26",
+"instrument_key": "NSE_FO|51389|14-07-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-07-14|24450|CE": {
+"trading_symbol": "NIFTY 24450 CE 14 JUL 26",
+"instrument_key": "NSE_FO|51391|14-07-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-07-14|24450|PE": {
+"trading_symbol": "NIFTY 24450 PE 14 JUL 26",
+"instrument_key": "NSE_FO|51392|14-07-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-07-14|24500|CE": {
+"trading_symbol": "NIFTY 24500 CE 14 JUL 26",
+"instrument_key": "NSE_FO|51393|14-07-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-07-14|24500|PE": {
+"trading_symbol": "NIFTY 24500 PE 14 JUL 26",
+"instrument_key": "NSE_FO|51396|14-07-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-07-14|23900|CE": {
+"trading_symbol": "NIFTY 23900 CE 14 JUL 26",
+"instrument_key": "NSE_FO|51364|14-07-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-07-14|24300|CE": {
+"trading_symbol": "NIFTY 24300 CE 14 JUL 26",
+"instrument_key": "NSE_FO|51385|14-07-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-07-14|24300|PE": {
+"trading_symbol": "NIFTY 24300 PE 14 JUL 26",
+"instrument_key": "NSE_FO|51386|14-07-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-07-21|24050|CE": {
+"trading_symbol": "NIFTY 24050 CE 21 JUL 26",
+"instrument_key": "NSE_FO|57342|21-07-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-07-21|24050|PE": {
+"trading_symbol": "NIFTY 24050 PE 21 JUL 26",
+"instrument_key": "NSE_FO|57343|21-07-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-07-21|24100|CE": {
+"trading_symbol": "NIFTY 24100 CE 21 JUL 26",
+"instrument_key": "NSE_FO|57344|21-07-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-07-21|24300|PE": {
+"trading_symbol": "NIFTY 24300 PE 21 JUL 26",
+"instrument_key": "NSE_FO|57353|21-07-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-07-21|24350|PE": {
+"trading_symbol": "NIFTY 24350 PE 21 JUL 26",
+"instrument_key": "NSE_FO|57355|21-07-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-07-28|24150|CE": {
+"trading_symbol": "NIFTY 24150 CE 28 JUL 26",
+"instrument_key": "NSE_FO|63945|28-07-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-07-28|24150|PE": {
+"trading_symbol": "NIFTY 24150 PE 28 JUL 26",
+"instrument_key": "NSE_FO|63946|28-07-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-07-28|24200|CE": {
+"trading_symbol": "NIFTY 24200 CE 28 JUL 26",
+"instrument_key": "NSE_FO|63947|28-07-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-07-28|24250|CE": {
+"trading_symbol": "NIFTY 24250 CE 28 JUL 26",
+"instrument_key": "NSE_FO|63949|28-07-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-07-28|24250|PE": {
+"trading_symbol": "NIFTY 24250 PE 28 JUL 26",
+"instrument_key": "NSE_FO|63950|28-07-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-07-28|23800|CE": {
+"trading_symbol": "NIFTY 23800 CE 28 JUL 26",
+"instrument_key": "NSE_FO|63929|28-07-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-07-28|23850|PE": {
+"trading_symbol": "NIFTY 23850 PE 28 JUL 26",
+"instrument_key": "NSE_FO|63934|28-07-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-07-28|23600|CE": {
+"trading_symbol": "NIFTY 23600 CE 28 JUL 26",
+"instrument_key": "NSE_FO|63919|28-07-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-07-28|23750|CE": {
+"trading_symbol": "NIFTY 23750 CE 28 JUL 26",
+"instrument_key": "NSE_FO|63927|28-07-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-07-28|23800|PE": {
+"trading_symbol": "NIFTY 23800 PE 28 JUL 26",
+"instrument_key": "NSE_FO|63930|28-07-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-07-28|23900|PE": {
+"trading_symbol": "NIFTY 23900 PE 28 JUL 26",
+"instrument_key": "NSE_FO|63936|28-07-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-08-04|24000|CE": {
+"trading_symbol": "NIFTY 24000 CE 04 AUG 26",
+"instrument_key": "NSE_FO|65693|04-08-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-08-04|24050|PE": {
+"trading_symbol": "NIFTY 24050 PE 04 AUG 26",
+"instrument_key": "NSE_FO|65696|04-08-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-08-04|24400|CE": {
+"trading_symbol": "NIFTY 24400 CE 04 AUG 26",
+"instrument_key": "NSE_FO|65854|04-08-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-08-18|24450|CE": {
+"trading_symbol": "NIFTY 24450 CE 18 AUG 26",
+"instrument_key": "NSE_FO|45108|18-08-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-08-18|24250|PE": {
+"trading_symbol": "NIFTY 24250 PE 18 AUG 26",
+"instrument_key": "NSE_FO|45101|18-08-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-08-25|24200|PE": {
+"trading_symbol": "NIFTY 24200 PE 25 AUG 26",
+"instrument_key": "NSE_FO|61670|25-08-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-08-25|24050|PE": {
+"trading_symbol": "NIFTY 24050 PE 25 AUG 26",
+"instrument_key": "NSE_FO|61609|25-08-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-08-25|24150|PE": {
+"trading_symbol": "NIFTY 24150 PE 25 AUG 26",
+"instrument_key": "NSE_FO|61646|25-08-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-09-01|24150|PE": {
+"trading_symbol": "NIFTY 24150 PE 01 SEP 26",
+"instrument_key": "NSE_FO|46992|01-09-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-09-01|24200|PE": {
+"trading_symbol": "NIFTY 24200 PE 01 SEP 26",
+"instrument_key": "NSE_FO|46994|01-09-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-09-01|24250|PE": {
+"trading_symbol": "NIFTY 24250 PE 01 SEP 26",
+"instrument_key": "NSE_FO|46996|01-09-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-09-01|24300|CE": {
+"trading_symbol": "NIFTY 24300 CE 01 SEP 26",
+"instrument_key": "NSE_FO|46997|01-09-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-09-01|24300|PE": {
+"trading_symbol": "NIFTY 24300 PE 01 SEP 26",
+"instrument_key": "NSE_FO|46998|01-09-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-09-01|24350|PE": {
+"trading_symbol": "NIFTY 24350 PE 01 SEP 26",
+"instrument_key": "NSE_FO|47000|01-09-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-09-01|24100|PE": {
+"trading_symbol": "NIFTY 24100 PE 01 SEP 26",
+"instrument_key": "NSE_FO|46990|01-09-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-09-01|24000|PE": {
+"trading_symbol": "NIFTY 24000 PE 01 SEP 26",
+"instrument_key": "NSE_FO|46986|01-09-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-09-01|24050|PE": {
+"trading_symbol": "NIFTY 24050 PE 01 SEP 26",
+"instrument_key": "NSE_FO|46988|01-09-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-09-08|24000|CE": {
+"trading_symbol": "NIFTY 24000 CE 08 SEP 26",
+"instrument_key": "NSE_FO|42639|08-09-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-09-08|24000|PE": {
+"trading_symbol": "NIFTY 24000 PE 08 SEP 26",
+"instrument_key": "NSE_FO|42640|08-09-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-09-08|24050|PE": {
+"trading_symbol": "NIFTY 24050 PE 08 SEP 26",
+"instrument_key": "NSE_FO|42642|08-09-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-09-08|24100|CE": {
+"trading_symbol": "NIFTY 24100 CE 08 SEP 26",
+"instrument_key": "NSE_FO|42643|08-09-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-09-08|24100|PE": {
+"trading_symbol": "NIFTY 24100 PE 08 SEP 26",
+"instrument_key": "NSE_FO|42644|08-09-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-09-08|24150|PE": {
+"trading_symbol": "NIFTY 24150 PE 08 SEP 26",
+"instrument_key": "NSE_FO|42646|08-09-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-09-08|23750|PE": {
+"trading_symbol": "NIFTY 23750 PE 08 SEP 26",
+"instrument_key": "NSE_FO|42630|08-09-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-09-08|23800|PE": {
+"trading_symbol": "NIFTY 23800 PE 08 SEP 26",
+"instrument_key": "NSE_FO|42632|08-09-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-09-15|23650|CE": {
+"trading_symbol": "NIFTY 23650 CE 15 SEP 26",
+"instrument_key": "NSE_FO|47303",
+"expired": false,
+"lot_size": 65
+},
+"2026-09-15|23650|PE": {
+"trading_symbol": "NIFTY 23650 PE 15 SEP 26",
+"instrument_key": "NSE_FO|47304",
+"expired": false,
+"lot_size": 65
+},
+"2026-09-15|23700|CE": {
+"trading_symbol": "NIFTY 23700 CE 15 SEP 26",
+"instrument_key": "NSE_FO|47305",
+"expired": false,
+"lot_size": 65
+},
+"2026-09-15|23700|PE": {
+"trading_symbol": "NIFTY 23700 PE 15 SEP 26",
+"instrument_key": "NSE_FO|47306",
+"expired": false,
+"lot_size": 65
+},
+"2026-09-15|23500|CE": {
+"trading_symbol": "NIFTY 23500 CE 15 SEP 26",
+"instrument_key": "NSE_FO|47297",
+"expired": false,
+"lot_size": 65
+},
+"2026-09-15|23500|PE": {
+"trading_symbol": "NIFTY 23500 PE 15 SEP 26",
+"instrument_key": "NSE_FO|47298",
+"expired": false,
+"lot_size": 65
+},
+"2026-09-15|23550|CE": {
+"trading_symbol": "NIFTY 23550 CE 15 SEP 26",
+"instrument_key": "NSE_FO|47299",
+"expired": false,
+"lot_size": 65
+},
+"2026-09-15|23550|PE": {
+"trading_symbol": "NIFTY 23550 PE 15 SEP 26",
+"instrument_key": "NSE_FO|47300",
+"expired": false,
+"lot_size": 65
+},
+"2026-09-15|23400|CE": {
+"trading_symbol": "NIFTY 23400 CE 15 SEP 26",
+"instrument_key": "NSE_FO|47293",
+"expired": false,
+"lot_size": 65
+},
+"2026-09-15|23400|PE": {
+"trading_symbol": "NIFTY 23400 PE 15 SEP 26",
+"instrument_key": "NSE_FO|47294",
+"expired": false,
+"lot_size": 65
+},
+"2026-09-15|23450|CE": {
+"trading_symbol": "NIFTY 23450 CE 15 SEP 26",
+"instrument_key": "NSE_FO|47295",
+"expired": false,
+"lot_size": 65
+},
+"2026-09-15|23450|PE": {
+"trading_symbol": "NIFTY 23450 PE 15 SEP 26",
+"instrument_key": "NSE_FO|47296",
+"expired": false,
+"lot_size": 65
+},
+"2026-09-15|23250|CE": {
+"trading_symbol": "NIFTY 23250 CE 15 SEP 26",
+"instrument_key": "NSE_FO|47287",
+"expired": false,
+"lot_size": 65
+},
+"2026-09-15|23250|PE": {
+"trading_symbol": "NIFTY 23250 PE 15 SEP 26",
+"instrument_key": "NSE_FO|47288",
+"expired": false,
+"lot_size": 65
+},
+"2026-09-15|23300|CE": {
+"trading_symbol": "NIFTY 23300 CE 15 SEP 26",
+"instrument_key": "NSE_FO|47289",
+"expired": false,
+"lot_size": 65
+},
+"2026-09-15|23300|PE": {
+"trading_symbol": "NIFTY 23300 PE 15 SEP 26",
+"instrument_key": "NSE_FO|47290",
+"expired": false,
+"lot_size": 65
+},
+"2026-09-15|23350|CE": {
+"trading_symbol": "NIFTY 23350 CE 15 SEP 26",
+"instrument_key": "NSE_FO|47291",
+"expired": false,
+"lot_size": 65
+},
+"2026-09-15|23350|PE": {
+"trading_symbol": "NIFTY 23350 PE 15 SEP 26",
+"instrument_key": "NSE_FO|47292",
+"expired": false,
+"lot_size": 65
+},
+"2026-03-24|23150|PE": {
+"trading_symbol": "NIFTY 23150 PE 24 MAR 26",
+"instrument_key": "NSE_FO|62579|24-03-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-03-31|22600|PE": null,
+"2026-06-02|24100|PE": {
+"trading_symbol": "NIFTY 24100 PE 02 JUN 26",
+"instrument_key": "NSE_FO|57055|02-06-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-07-21|24300|CE": {
+"trading_symbol": "NIFTY 24300 CE 21 JUL 26",
+"instrument_key": "NSE_FO|57352|21-07-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-07-28|23600|PE": {
+"trading_symbol": "NIFTY 23600 PE 28 JUL 26",
+"instrument_key": "NSE_FO|63921|28-07-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-08-25|24300|PE": {
+"trading_symbol": "NIFTY 24300 PE 25 AUG 26",
+"instrument_key": "NSE_FO|61703|25-08-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-03-17|23250|PE": {
+"trading_symbol": "NIFTY 23250 PE 17 MAR 26",
+"instrument_key": "NSE_FO|57716|17-03-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-03-24|23850|CE": {
+"trading_symbol": "NIFTY 23850 CE 24 MAR 26",
+"instrument_key": "NSE_FO|62616|24-03-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-03-30|22800|CE": {
+"trading_symbol": "NIFTY 22800 CE 30 MAR 26",
+"instrument_key": "NSE_FO|54490|30-03-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-03-30|22850|CE": {
+"trading_symbol": "NIFTY 22850 CE 30 MAR 26",
+"instrument_key": "NSE_FO|54492|30-03-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-04-07|22300|PE": {
+"trading_symbol": "NIFTY 22300 PE 07 APR 26",
+"instrument_key": "NSE_FO|40725|07-04-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-04-28|24300|CE": {
+"trading_symbol": "NIFTY 24300 CE 28 APR 26",
+"instrument_key": "NSE_FO|72279|28-04-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-06-02|23800|CE": {
+"trading_symbol": "NIFTY 23800 CE 02 JUN 26",
+"instrument_key": "NSE_FO|57042|02-06-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-06-02|23800|PE": {
+"trading_symbol": "NIFTY 23800 PE 02 JUN 26",
+"instrument_key": "NSE_FO|57043|02-06-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-03-31|22600|CE": null,
+"2026-04-21|23650|PE": {
+"trading_symbol": "NIFTY 23650 PE 21 APR 26",
+"instrument_key": "NSE_FO|63403|21-04-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-07-28|23650|CE": {
+"trading_symbol": "NIFTY 23650 CE 28 JUL 26",
+"instrument_key": "NSE_FO|63923|28-07-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-08-18|24500|CE": {
+"trading_symbol": "NIFTY 24500 CE 18 AUG 26",
+"instrument_key": "NSE_FO|45110|18-08-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-03-17|23400|PE": {
+"trading_symbol": "NIFTY 23400 PE 17 MAR 26",
+"instrument_key": "NSE_FO|57742|17-03-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-04-07|22350|PE": {
+"trading_symbol": "NIFTY 22350 PE 07 APR 26",
+"instrument_key": "NSE_FO|40727|07-04-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-04-07|22750|PE": {
+"trading_symbol": "NIFTY 22750 PE 07 APR 26",
+"instrument_key": "NSE_FO|40751|07-04-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-04-13|23100|PE": {
+"trading_symbol": "NIFTY 23100 PE 13 APR 26",
+"instrument_key": "NSE_FO|54770|13-04-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-04-13|24050|PE": {
+"trading_symbol": "NIFTY 24050 PE 13 APR 26",
+"instrument_key": "NSE_FO|54817|13-04-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-04-14|23700|PE": null,
+"2026-04-21|23700|PE": {
+"trading_symbol": "NIFTY 23700 PE 21 APR 26",
+"instrument_key": "NSE_FO|63405|21-04-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-05-12|24450|PE": {
+"trading_symbol": "NIFTY 24450 PE 12 MAY 26",
+"instrument_key": "NSE_FO|41791|12-05-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-06-16|23500|PE": {
+"trading_symbol": "NIFTY 23500 PE 16 JUN 26",
+"instrument_key": "NSE_FO|50586|16-06-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-06-16|23550|PE": {
+"trading_symbol": "NIFTY 23550 PE 16 JUN 26",
+"instrument_key": "NSE_FO|50592|16-06-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-06-16|23600|PE": {
+"trading_symbol": "NIFTY 23600 PE 16 JUN 26",
+"instrument_key": "NSE_FO|50594|16-06-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-06-23|24200|PE": {
+"trading_symbol": "NIFTY 24200 PE 23 JUN 26",
+"instrument_key": "NSE_FO|56383|23-06-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-07-07|24200|PE": {
+"trading_symbol": "NIFTY 24200 PE 07 JUL 26",
+"instrument_key": "NSE_FO|44641|07-07-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-03-24|22950|PE": {
+"trading_symbol": "NIFTY 22950 PE 24 MAR 26",
+"instrument_key": "NSE_FO|62569|24-03-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-03-24|23000|PE": {
+"trading_symbol": "NIFTY 23000 PE 24 MAR 26",
+"instrument_key": "NSE_FO|62571|24-03-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-03-24|23050|PE": {
+"trading_symbol": "NIFTY 23050 PE 24 MAR 26",
+"instrument_key": "NSE_FO|62574|24-03-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-03-30|22850|PE": {
+"trading_symbol": "NIFTY 22850 PE 30 MAR 26",
+"instrument_key": "NSE_FO|54493|30-03-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-03-31|22300|PE": null,
+"2026-03-31|22350|PE": null,
+"2026-03-31|22400|PE": null,
+"2026-03-31|22700|PE": null,
+"2026-05-12|23800|PE": {
+"trading_symbol": "NIFTY 23800 PE 12 MAY 26",
+"instrument_key": "NSE_FO|41743|12-05-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-06-16|23450|PE": {
+"trading_symbol": "NIFTY 23450 PE 16 JUN 26",
+"instrument_key": "NSE_FO|50577|16-06-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-06-16|23850|PE": {
+"trading_symbol": "NIFTY 23850 PE 16 JUN 26",
+"instrument_key": "NSE_FO|50610|16-06-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-06-23|23900|PE": {
+"trading_symbol": "NIFTY 23900 PE 23 JUN 26",
+"instrument_key": "NSE_FO|56359|23-06-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-07-14|24400|PE": {
+"trading_symbol": "NIFTY 24400 PE 14 JUL 26",
+"instrument_key": "NSE_FO|51390|14-07-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-07-14|23850|PE": {
+"trading_symbol": "NIFTY 23850 PE 14 JUL 26",
+"instrument_key": "NSE_FO|51363|14-07-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-07-14|23900|PE": {
+"trading_symbol": "NIFTY 23900 PE 14 JUL 26",
+"instrument_key": "NSE_FO|51365|14-07-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-07-14|23950|PE": {
+"trading_symbol": "NIFTY 23950 PE 14 JUL 26",
+"instrument_key": "NSE_FO|51367|14-07-2026",
+"expired": true,
+"lot_size": 65
+},
+"2026-08-04|23950|PE": {
+"trading_symbol": "NIFTY 23950 PE 04 AUG 26",
+"instrument_key": "NSE_FO|65692|04-08-2026",
 "expired": true,
 "lot_size": 65
 }
