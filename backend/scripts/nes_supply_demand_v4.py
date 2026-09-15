@@ -611,12 +611,27 @@ async def load_daily(offline: bool, from_date: date, to_date: date) -> dict[str,
                 print(f"  ! daily fetch failed ({exc})")
                 raw = None
     if not raw:
+        # Only a file that actually COVERS the window is any use here.  Taking
+        # the first name alphabetically silently loaded a December-March file
+        # for a March-September run, which left official_close blank on every
+        # row without ever erroring.
+        best = None
         for name in sorted(os.listdir(DATA_DIR)):
-            if name.startswith("nifty_1d_") and name.endswith(".json"):
-                with open(os.path.join(DATA_DIR, name)) as f:
-                    raw = json.load(f)
-                print(f"Reusing {name} for the official daily closes.")
-                break
+            if not (name.startswith("nifty_1d_") and name.endswith(".json")):
+                continue
+            try:
+                a, b = name[len("nifty_1d_"):-len(".json")].split("_")
+                c_from, c_to = date.fromisoformat(a), date.fromisoformat(b)
+            except ValueError:
+                continue
+            if c_from <= from_date and c_to >= to_date:
+                span = (c_to - c_from).days
+                if best is None or span < best[0]:
+                    best = (span, name)
+        if best is not None:
+            with open(os.path.join(DATA_DIR, best[1])) as f:
+                raw = json.load(f)
+            print(f"Reusing {best[1]} for the official daily closes.")
     if not raw:
         print("  ! no daily candles; the report will show the 15:29 print only.")
         return {}
