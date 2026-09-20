@@ -60,6 +60,11 @@ DATA_DIR = os.path.join(BACKEND_DIR, "data")
 EXPIRY_CACHE = os.path.join(DATA_DIR, "nifty_expiry_cache.json")
 CONTRACT_CACHE = os.path.join(DATA_DIR, "nifty_contract_cache.json")
 OPTION_CACHE = os.path.join(DATA_DIR, "nifty_option_cache.json")
+# Same keys as OPTION_CACHE, values {"HH:MM": [open, high, low, close]}.  Added
+# 2026-09-19 for worst-fill backtests (buy at the entry minute's high, sell at
+# the exit minute's low); the close-only cache stays as every older script's
+# input.  Filled by the same fetch, so a day fetched once serves both.
+OHLC_CACHE = os.path.join(DATA_DIR, "nifty_option_ohlc_cache.json")
 
 # Seeded from the reversal_v* runs so their fetches are not repeated.
 LEGACY_CONTRACT_CACHE = os.path.join(DATA_DIR, "reversal_contract_cache.json")
@@ -168,9 +173,9 @@ async def _expired_contracts(client, token, limiter, expiry: date) -> list[dict]
     return data.get("data", []) or []
 
 
-async def _day_candles(client, token, limiter, instrument_key: str,
-                       expired: bool, day: date) -> dict[str, float]:
-    """{"HH:MM": close} of the contract's 1-minute candles for one session."""
+async def _day_candles_ohlc(client, token, limiter, instrument_key: str,
+                            expired: bool, day: date) -> dict[str, list]:
+    """{"HH:MM": [open, high, low, close]} of the contract's 1-minute candles."""
     key_enc = quote(instrument_key, safe="")
     if expired:
         url = (f"{BASE_V2}/expired-instruments/historical-candle/{key_enc}"
@@ -180,7 +185,15 @@ async def _day_candles(client, token, limiter, instrument_key: str,
                f"/minutes/1/{day.isoformat()}/{day.isoformat()}")
     data = await api_get(client, url, token, limiter)
     raw = (data.get("data", {}) or {}).get("candles", []) or []
-    return {c[0][11:16]: float(c[4]) for c in raw if len(c) >= 5}
+    return {c[0][11:16]: [float(c[1]), float(c[2]), float(c[3]), float(c[4])]
+            for c in raw if len(c) >= 5}
+
+
+async def _day_candles(client, token, limiter, instrument_key: str,
+                       expired: bool, day: date) -> dict[str, float]:
+    """{"HH:MM": close} of the contract's 1-minute candles for one session."""
+    full = await _day_candles_ohlc(client, token, limiter, instrument_key, expired, day)
+    return {k: v[3] for k, v in full.items()}
 
 
 def _candle_keys(contract: dict, day: str) -> list[str]:
@@ -212,6 +225,7 @@ class OptionPricer:
         self.offline = offline
         self.contracts: dict = _load(CONTRACT_CACHE, LEGACY_CONTRACT_CACHE) or {}
         self.candles: dict = _load(OPTION_CACHE, LEGACY_OPTION_CACHE) or {}
+        self.ohlc: dict = _load(OHLC_CACHE) or {}
         cal = _load(EXPIRY_CACHE, LEGACY_EXPIRY_CACHE) or []
         self.expiries: list[date] = sorted(date.fromisoformat(s) for s in cal)
         self.live_by_key: dict = {}
@@ -320,14 +334,37 @@ class OptionPricer:
         if self.offline or not self.token:
             return {}
         try:
-            got = await _day_candles(self.client, self.token, self.limiter,
-                                     contract["instrument_key"], contract["expired"], day)
+            full = await _day_candles_ohlc(self.client, self.token, self.limiter,
+                                           contract["instrument_key"], contract["expired"], day)
         except RuntimeError as exc:
             print(f"  ! candles {contract['trading_symbol']} {day}: {exc}")
             return {}                    # transient - do not cache the empty result
+        got = {k: v[3] for k, v in full.items()}
         self.candles[key] = got
+        self.ohlc[key] = full
         self.fetched_days += 1
         return got
+
+    async def ohlc_for(self, contract: dict, day: date) -> dict[str, list]:
+        """{"HH:MM": [o, h, l, c]} for one contract-day, fetching if the OHLC
+        cache lacks it (a day cached close-only before 2026-09-19 is refetched)."""
+        for k in _candle_keys(contract, day.isoformat()):
+            if self.ohlc.get(k):
+                return self.ohlc[k]
+        if self.offline or not self.token:
+            return {}
+        key = _candle_keys(contract, day.isoformat())[0]
+        try:
+            full = await _day_candles_ohlc(self.client, self.token, self.limiter,
+                                           contract["instrument_key"], contract["expired"], day)
+        except RuntimeError as exc:
+            print(f"  ! candles {contract['trading_symbol']} {day}: {exc}")
+            return {}
+        if full:
+            self.ohlc[key] = full
+            self.candles[key] = {k: v[3] for k, v in full.items()}
+            self.fetched_days += 1
+        return full
 
     def save(self) -> None:
         os.makedirs(DATA_DIR, exist_ok=True)
@@ -335,6 +372,8 @@ class OptionPricer:
             json.dump(self.contracts, f, indent=0)
         with open(OPTION_CACHE, "w") as f:
             json.dump(self.candles, f)
+        with open(OHLC_CACHE, "w") as f:
+            json.dump(self.ohlc, f)
         with open(EXPIRY_CACHE, "w") as f:
             json.dump([e.isoformat() for e in self.expiries], f, indent=0)
 
@@ -404,6 +443,7 @@ class CachedPricer:
     def __init__(self) -> None:
         self.contracts: dict = _load(CONTRACT_CACHE, LEGACY_CONTRACT_CACHE) or {}
         self.candles: dict = _load(OPTION_CACHE, LEGACY_OPTION_CACHE) or {}
+        self.ohlc: dict = _load(OHLC_CACHE) or {}
         cal = _load(EXPIRY_CACHE, LEGACY_EXPIRY_CACHE) or []
         self.expiries = sorted(date.fromisoformat(s) for s in cal)
 
