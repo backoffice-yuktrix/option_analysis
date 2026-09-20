@@ -93,6 +93,10 @@ BACKEND_DIR = os.path.join(SCRIPT_DIR, "..")
 sys.path.insert(0, BACKEND_DIR)
 
 from services.upstox_client import INSTRUMENT_KEYS, get_candles  # noqa: E402
+from services.market_data import (  # noqa: E402
+    load_minutes, load_daily as _md_load_daily,
+    load_daily_ohlc as _md_load_daily_ohlc, load_fut_volume,
+    read_access_token, print_coverage)
 from services.option_pricing import CachedPricer, ensure_cached  # noqa: E402
 
 # backend/scripts holds only strategy code; the candle caches live in
@@ -146,69 +150,14 @@ def rr_label(r: float) -> str:
 # ---------------------------------------------------------------------------
 
 def _read_access_token() -> str | None:
-    try:
-        with open(CONFIG_FILE) as f:
-            lines = [l.strip() for l in f.readlines()]
-    except OSError:
-        return None
-    return lines[3] if len(lines) >= 4 and lines[3] else None
-
-
-def nifty_cache_path(from_date: date, to_date: date) -> str:
-    return os.path.join(
-        DATA_DIR, f"nifty_1m_{from_date.isoformat()}_{to_date.isoformat()}.json")
-
-
-def _slice_existing_cache(from_date: date, to_date: date) -> list[dict] | None:
-    """Reuse a wider cache file that already covers the requested window."""
-    best: tuple[int, list[dict], str] | None = None
-    for name in os.listdir(DATA_DIR):
-        if not (name.startswith("nifty_1m_") and name.endswith(".json")):
-            continue
-        stem = name[len("nifty_1m_"):-len(".json")]
-        try:
-            a, b = stem.split("_")
-            c_from, c_to = date.fromisoformat(a), date.fromisoformat(b)
-        except ValueError:
-            continue
-        if c_from > from_date or c_to < from_date:
-            continue
-        with open(os.path.join(DATA_DIR, name)) as f:
-            candles = json.load(f)
-        kept = [c for c in candles
-                if from_date.isoformat() <= c.get("timestamp", "")[:10] <= to_date.isoformat()]
-        if kept and (best is None or len(kept) > best[0]):
-            best = (len(kept), kept, name)
-    if best is None:
-        return None
-    print(f"Reusing {best[2]}: {best[0]} candles inside {from_date} -> {to_date}")
-    return best[1]
+    """The broker token (services/market_data reads the same file)."""
+    return read_access_token()
 
 
 async def load_nifty(offline: bool, from_date: date, to_date: date) -> list[dict]:
-    cache = nifty_cache_path(from_date, to_date)
-    if os.path.exists(cache):
-        with open(cache) as f:
-            candles = json.load(f)
-        print(f"Loaded {len(candles)} cached NIFTY 1m candles from {os.path.basename(cache)}")
-        return candles
-    token = None if offline else _read_access_token()
-    if token:
-        try:
-            print(f"Fetching NIFTY 1m candles {from_date} -> {to_date} ...")
-            candles = await get_candles(token, UNDERLYING_KEY, "1m", from_date, to_date)
-            if candles:
-                print(f"Fetched {len(candles)} candles.")
-                with open(cache, "w") as f:
-                    json.dump(candles, f)
-                return candles
-            print("  ! Upstox returned no candles; falling back to the local caches.")
-        except Exception as exc:                                  # noqa: BLE001
-            print(f"  ! fetch failed ({exc}); falling back to the local caches.")
-    reused = _slice_existing_cache(from_date, to_date)
-    if reused is None:
-        raise RuntimeError(f"No data for {from_date} -> {to_date} and no usable cache.")
-    return reused
+    """Index minute candles from data/nifty_1m.json (fetching only the
+    days it does not already hold)."""
+    return await load_minutes(offline, from_date, to_date)
 
 
 def daily_cache_path(from_date: date, to_date: date) -> str:
@@ -217,40 +166,8 @@ def daily_cache_path(from_date: date, to_date: date) -> str:
 
 
 async def load_daily(offline: bool, from_date: date, to_date: date) -> dict[str, float]:
-    """{'YYYY-MM-DD': official session close} from the daily candle feed.
-
-    This is the `--pdc daily` basis.  It is loaded even when --pdc is last1m,
-    because the report shows both readings side by side (pdc / pdc_alt) and
-    the difference is what decides the days sitting on the 0.30% line - see
-    KNOWN PITFALLS 1.
-    """
-    lookback = from_date - timedelta(days=15)       # enough to have a PDC for day 1
-    cache = daily_cache_path(lookback, to_date)
-    raw = None
-    if os.path.exists(cache):
-        with open(cache) as f:
-            raw = json.load(f)
-        print(f"Loaded {len(raw)} cached NIFTY daily candles from {os.path.basename(cache)}")
-    else:
-        token = None if offline else _read_access_token()
-        if token:
-            try:
-                print(f"Fetching NIFTY daily candles {lookback} -> {to_date} ...")
-                raw = await get_candles(token, UNDERLYING_KEY, "1d", lookback, to_date)
-                if raw:
-                    with open(cache, "w") as f:
-                        json.dump(raw, f)
-                    print(f"Fetched {len(raw)} daily candles.")
-                else:
-                    raw = None
-            except Exception as exc:                              # noqa: BLE001
-                print(f"  ! daily fetch failed ({exc})")
-                raw = None
-    if not raw:
-        raise RuntimeError(
-            "Daily candles are required for the previous-day close (PDC). "
-            "Run once online, or supply " + os.path.basename(cache))
-    return {c["timestamp"][:10]: float(c["close"]) for c in raw}
+    """Session date -> official daily close, from data/nifty_1d.json."""
+    return await _md_load_daily(offline, from_date, to_date)
 
 
 def index_by_day(candles: list[dict]) -> dict[str, list[dict]]:

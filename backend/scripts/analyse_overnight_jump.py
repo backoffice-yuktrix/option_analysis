@@ -46,6 +46,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from services.upstox_client import get_candles, get_option_contracts, INSTRUMENT_KEYS  # noqa: E402
 
 SCRIPT_DIR = os.path.dirname(__file__)
+from services.market_data import (  # noqa: E402
+    load_minutes, load_daily, load_daily_ohlc, load_fut_volume,
+    read_access_token, print_coverage)
 CONFIG_FILE = os.path.join(SCRIPT_DIR, "..", "upstox_config.txt")
 NIFTY_JSON = os.path.join(SCRIPT_DIR, "nifty_jan1_july31.json")
 REPORT_HTML = os.path.join(SCRIPT_DIR, "overnight_jump_report.html")
@@ -90,12 +93,9 @@ def classify(pct: float) -> int:
     return -1
 
 
-def _read_access_token() -> str:
-    with open(CONFIG_FILE) as f:
-        lines = [l.strip() for l in f.readlines()]
-    if len(lines) < 4 or not lines[3]:
-        raise RuntimeError(f"No access_token found in {CONFIG_FILE}. Connect to Upstox first.")
-    return lines[3]
+def _read_access_token() -> str | None:
+    """The broker token (services/market_data reads the same file)."""
+    return read_access_token()
 
 
 async def _get(url: str, token: str, params: dict | None = None) -> dict:

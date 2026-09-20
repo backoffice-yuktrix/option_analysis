@@ -22,6 +22,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from services.upstox_client import get_candles, INSTRUMENT_KEYS  # noqa: E402
 
 CONFIG_FILE = os.path.join(os.path.dirname(__file__), "..", "upstox_config.txt")
+from services.market_data import (  # noqa: E402
+    load_minutes, load_daily, load_daily_ohlc, load_fut_volume,
+    read_access_token, print_coverage)
 OUT_FULL = os.path.join(os.path.dirname(__file__), "nifty_jan1_july31.json")
 OUT_SAMPLE = os.path.join(os.path.dirname(__file__), "nifty_jan1_july31_sample.json")
 
@@ -30,12 +33,9 @@ RANGE_TO = date(2026, 7, 31)
 UNDERLYING = "NIFTY"
 
 
-def _read_access_token() -> str:
-    with open(CONFIG_FILE) as f:
-        lines = [l.strip() for l in f.readlines()]
-    if len(lines) < 4 or not lines[3]:
-        raise RuntimeError(f"No access_token found in {CONFIG_FILE}. Connect to Upstox first.")
-    return lines[3]
+def _read_access_token() -> str | None:
+    """The broker token (services/market_data reads the same file)."""
+    return read_access_token()
 
 
 async def main() -> None:

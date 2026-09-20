@@ -177,6 +177,10 @@ sys.path.insert(0, BACKEND_DIR)
 
 from services.upstox_client import (  # noqa: E402
     INSTRUMENT_KEYS, UPSTOX_BASE_V3, get_candles, _get, _candle_to_dict)
+from services.market_data import (  # noqa: E402
+    load_minutes, load_daily as _md_load_daily,
+    load_daily_ohlc as _md_load_daily_ohlc, load_fut_volume,
+    read_access_token, print_coverage, session_closed_now as _session_closed_now)
 from services.option_pricing import (  # noqa: E402
     CachedPricer, OptionPricer, RateLimiter, atm_strike, _candle_keys, api_get)
 from services.trade_costs import capital_required, option_round_trip  # noqa: E402
@@ -282,145 +286,19 @@ WIDE_RUN = {
 # ---------------------------------------------------------------------------
 
 def _read_access_token() -> str | None:
-    try:
-        with open(CONFIG_FILE) as f:
-            lines = [l.strip() for l in f.readlines()]
-    except OSError:
-        return None
-    return lines[3] if len(lines) >= 4 and lines[3] else None
-
-
-def nifty_cache_path(from_date: date, to_date: date) -> str:
-    return os.path.join(
-        DATA_DIR, f"nifty_1m_{from_date.isoformat()}_{to_date.isoformat()}.json")
-
-
-def _merge_existing_caches(from_date: date, to_date: date) -> list[dict]:
-    """Every cache in backend/data that overlaps the window, merged by
-    timestamp.  Merging (rather than picking one file) is what lets a
-    per-day tail file sit beside the multi-year one."""
-    merged: dict[str, dict] = {}
-    used = []
-    for name in sorted(os.listdir(DATA_DIR)):
-        if not (name.startswith("nifty_1m_") and name.endswith(".json")):
-            continue
-        stem = name[len("nifty_1m_"):-len(".json")]
-        try:
-            a, b = stem.split("_")
-            c_from, c_to = date.fromisoformat(a), date.fromisoformat(b)
-        except ValueError:
-            continue
-        if c_from > to_date or c_to < from_date:
-            continue
-        with open(os.path.join(DATA_DIR, name)) as f:
-            candles = json.load(f)
-        n = 0
-        for c in candles:
-            ts = c.get("timestamp", "")
-            if from_date.isoformat() <= ts[:10] <= to_date.isoformat() and ts not in merged:
-                merged[ts] = c
-                n += 1
-        if n:
-            used.append(f"{name} (+{n})")
-    if merged:
-        print(f"Reusing {', '.join(used)}: {len(merged)} candles inside {from_date} -> {to_date}")
-    return [merged[k] for k in sorted(merged)]
-
-
-def _session_closed_now() -> bool:
-    """True once today's regular session (and its closing auction) is over, so
-    a fetched 'today' can be cached as a complete day."""
-    return datetime.now(IST).time() >= dt_time(15, 45)
-
-
-async def _intraday_index_candles(token: str) -> list[dict]:
-    """Today's one-minute candles.  The historical endpoint returns nothing for
-    the current day; the intraday endpoint returns all of it."""
-    url = (f"{UPSTOX_BASE_V3}/historical-candle/intraday/"
-           f"{quote(UNDERLYING_KEY, safe='')}/minutes/1")
-    data = await _get(url, token)
-    raw = (data.get("data", {}) or {}).get("candles", []) or []
-    return [_candle_to_dict(c) for c in raw if c]
-
-
-async def fetch_tail(token: str, from_date: date, to_date: date) -> list[dict]:
-    """The candles the caches do not have yet: past days from the historical
-    endpoint, today from the intraday one.  Saved as its own small cache file
-    once the day is complete, so the next run needs no network."""
-    today = datetime.now(IST).date()
-    out: list[dict] = []
-    hist_to = min(to_date, today - timedelta(days=1))
-    if from_date <= hist_to:
-        print(f"Fetching NIFTY 1m candles {from_date} -> {hist_to} from the broker ...")
-        try:
-            out += await get_candles(token, UNDERLYING_KEY, "1m", from_date, hist_to)
-        except Exception as exc:                                  # noqa: BLE001
-            print(f"  ! historical fetch failed ({exc})")
-    if from_date <= today <= to_date:
-        try:
-            got = await _intraday_index_candles(token)
-            print(f"Fetched {len(got)} intraday candles for {today} from the broker")
-            out += got
-        except Exception as exc:                                  # noqa: BLE001
-            print(f"  ! intraday fetch failed ({exc})")
-    out.sort(key=lambda c: c.get("timestamp", ""))
-    if out:
-        days = sorted({c["timestamp"][:10] for c in out})
-        if days[-1] < today.isoformat() or _session_closed_now():
-            path = nifty_cache_path(date.fromisoformat(days[0]), date.fromisoformat(days[-1]))
-            with open(path, "w") as f:
-                json.dump(out, f)
-            print(f"  saved {len(out)} candles -> {os.path.basename(path)}")
-        else:
-            print("  today's session is still open: its candles are used, not cached")
-    return out
+    """The broker token (services/market_data reads the same file)."""
+    return read_access_token()
 
 
 async def load_nifty(offline: bool, from_date: date, to_date: date) -> list[dict]:
-    candles = _merge_existing_caches(from_date, to_date)
-    have_to = max((c["timestamp"][:10] for c in candles), default=None)
-    need_from = from_date if have_to is None else date.fromisoformat(have_to) + timedelta(days=1)
-    token = None if offline else _read_access_token()
-    if need_from <= to_date:
-        if token:
-            tail = await fetch_tail(token, need_from, to_date)
-            have = {c["timestamp"] for c in candles}
-            candles += [c for c in tail if c["timestamp"] not in have]
-            candles.sort(key=lambda c: c["timestamp"])
-        else:
-            print(f"  ! caches end {have_to}; {need_from} -> {to_date} not fetched "
-                  f"(offline={offline}, token={'yes' if token else 'no'})")
-    if not candles:
-        raise RuntimeError(f"No data for {from_date} -> {to_date} and no usable cache.")
-    return candles
+    """Index minute candles from data/nifty_1m.json (fetching only the
+    days it does not already hold)."""
+    return await load_minutes(offline, from_date, to_date)
 
 
-def load_daily_ohlc(from_date: date, to_date: date) -> dict[str, dict]:
-    """Session date -> official daily OHLC, from the widest cached daily file
-    that covers the window.  Used only to cross-check the derived bars and to
-    log the official close; no rule reads it."""
-    best = None
-    for name in sorted(os.listdir(DATA_DIR)):
-        if not (name.startswith("nifty_1d_") and name.endswith(".json")):
-            continue
-        try:
-            a, b = name[len("nifty_1d_"):-len(".json")].split("_")
-            c_from, c_to = date.fromisoformat(a), date.fromisoformat(b)
-        except ValueError:
-            continue
-        if c_from <= from_date and c_to >= min(to_date, date.today() - timedelta(days=1)):
-            span = (c_to - c_from).days
-            if best is None or span > best[0]:
-                best = (span, name)
-    if best is None:
-        print("  ! no daily cache covers the window; official closes not logged")
-        return {}
-    with open(os.path.join(DATA_DIR, best[1])) as f:
-        raw = json.load(f)
-    print(f"Loaded {len(raw)} NIFTY daily candles from {best[1]} (reference only)")
-    return {c["timestamp"][:10]: {"o": float(c["open"]), "h": float(c["high"]),
-                                  "l": float(c["low"]), "c": float(c["close"])}
-            for c in raw}
+async def load_daily_ohlc(offline: bool, from_date: date, to_date: date) -> dict[str, dict]:
+    """Session date -> official daily OHLC, from data/nifty_1d.json."""
+    return await _md_load_daily_ohlc(offline, from_date, to_date)
 
 
 def to_rows(candles: list[dict]) -> tuple[list[dict], int]:
@@ -1887,6 +1765,7 @@ async def run(args) -> None:
     rows, bad_ts = to_rows(candles)
     if bad_ts:
         print(f"  ! {bad_ts} candle(s) with an unreadable timestamp dropped")
+    print_coverage(args.from_date, args.to_date)
     sessions, all_days = build_sessions(rows)
     series = daily_series(sessions, all_days, args.partial)
     print(f"  {len(all_days)} sessions loaded ({len(series)} with a daily bar), "
@@ -1898,7 +1777,7 @@ async def run(args) -> None:
     if not signals:
         raise RuntimeError(f"no session inside {from_iso} -> {to_iso}")
 
-    official = load_daily_ohlc(args.from_date, args.to_date)
+    official = await load_daily_ohlc(args.offline, args.from_date, args.to_date)
     checked = [x for x in signals if x["day_open"] is not None and x["day"] in official]
     open_match = sum(1 for x in checked
                      if abs(x["day_open"] - official[x["day"]]["o"]) < 0.005)

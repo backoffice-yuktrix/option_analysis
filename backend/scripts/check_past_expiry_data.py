@@ -16,6 +16,9 @@ from services.upstox_client import get_candles, get_option_contracts, INSTRUMENT
 CONFIG_FILE = os.path.join(os.path.dirname(__file__), "..", "upstox_config.txt")
 
 BASE_V2 = "https://api.upstox.com/v2"
+from services.market_data import (  # noqa: E402
+    load_minutes, load_daily, load_daily_ohlc, load_fut_volume,
+    read_access_token, print_coverage)
 BASE_V3 = "https://api.upstox.com/v3"
 UNDERLYING = "NIFTY"
 UNDERLYING_KEY = INSTRUMENT_KEYS[UNDERLYING]
@@ -59,12 +62,9 @@ FALLBACK_EXPIRIES: list[date] = [
 ]
 
 
-def _read_access_token() -> str:
-    with open(CONFIG_FILE) as f:
-        lines = [l.strip() for l in f.readlines()]
-    if len(lines) < 4 or not lines[3]:
-        raise RuntimeError(f"No access_token found in {CONFIG_FILE}. Connect to Upstox first.")
-    return lines[3]
+def _read_access_token() -> str | None:
+    """The broker token (services/market_data reads the same file)."""
+    return read_access_token()
 
 
 async def _get(client: httpx.AsyncClient, url: str, token: str, params: dict | None = None) -> dict:

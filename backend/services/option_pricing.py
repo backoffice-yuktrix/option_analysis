@@ -57,25 +57,18 @@ SERVICES_DIR = os.path.dirname(os.path.abspath(__file__))
 BACKEND_DIR = os.path.join(SERVICES_DIR, "..")
 DATA_DIR = os.path.join(BACKEND_DIR, "data")
 
-EXPIRY_CACHE = os.path.join(DATA_DIR, "nifty_expiry_cache.json")
-CONTRACT_CACHE = os.path.join(DATA_DIR, "nifty_contract_cache.json")
-OPTION_CACHE = os.path.join(DATA_DIR, "nifty_option_cache.json")
-# Same keys as OPTION_CACHE, values {"HH:MM": [open, high, low, close]}.  Added
-# 2026-09-19 for worst-fill backtests (buy at the entry minute's high, sell at
-# the exit minute's low); the close-only cache stays as every older script's
-# input.  Filled by the same fetch, so a day fetched once serves both.
-OHLC_CACHE = os.path.join(DATA_DIR, "nifty_option_ohlc_cache.json")
-
-# Seeded from the reversal_v* runs so their fetches are not repeated.
-LEGACY_CONTRACT_CACHE = os.path.join(DATA_DIR, "reversal_contract_cache.json")
-LEGACY_OPTION_CACHE = os.path.join(DATA_DIR, "reversal_option_cache.json")
-LEGACY_EXPIRY_CACHE = os.path.join(DATA_DIR, "reversal_expiry_cache.json")
+# Expiries, contracts and candles all live in ONE file now
+# (data/nifty_options.json, services/market_data.OptionFile).  Minute
+# open/high/low/close is kept beside the close for worst-fill backtests, and a
+# contract-day that was fetched and came back empty is remembered so it is
+# never requested again.
 
 BASE_V2 = "https://api.upstox.com/v2"
 STRIKE_STEP = 50
 
 from services.upstox_client import (  # noqa: E402
     INSTRUMENT_KEYS, get_option_contracts)
+from services.market_data import option_file  # noqa: E402
 
 UNDERLYING_KEY = INSTRUMENT_KEYS["NIFTY"]
 
@@ -223,11 +216,11 @@ class OptionPricer:
     def __init__(self, client, token, limiter, offline: bool) -> None:
         self.client, self.token, self.limiter = client, token, limiter
         self.offline = offline
-        self.contracts: dict = _load(CONTRACT_CACHE, LEGACY_CONTRACT_CACHE) or {}
-        self.candles: dict = _load(OPTION_CACHE, LEGACY_OPTION_CACHE) or {}
-        self.ohlc: dict = _load(OHLC_CACHE) or {}
-        cal = _load(EXPIRY_CACHE, LEGACY_EXPIRY_CACHE) or []
-        self.expiries: list[date] = sorted(date.fromisoformat(s) for s in cal)
+        self.store = option_file()
+        self.contracts: dict = self.store.contracts
+        self.candles = self.store.closes_view()
+        self.ohlc = self.store.ohlc_view()
+        self.expiries: list[date] = sorted(date.fromisoformat(s) for s in self.store.expiries)
         self.live_by_key: dict = {}
         self.live_expiries: set[date] = set()
         self._expired_by_expiry: dict[str, list[dict]] = {}
@@ -316,6 +309,8 @@ class OptionPricer:
             if self.candles.get(k):
                 return self.candles[k]
         key = _candle_keys(contract, day.isoformat())[0]
+        if self.store.has(key):
+            return {}                    # fetched before and genuinely empty
         if (not contract.get("expired") and contract.get("ckey")
                 and date.fromisoformat(contract["ckey"].split("|")[0]) < date.today()
                 and not self.offline and self.token):
@@ -351,9 +346,11 @@ class OptionPricer:
         for k in _candle_keys(contract, day.isoformat()):
             if self.ohlc.get(k):
                 return self.ohlc[k]
+        key = _candle_keys(contract, day.isoformat())[0]
+        if self.store.has(key) and key not in self.store.close_only:
+            return {}                    # fetched before and genuinely empty
         if self.offline or not self.token:
             return {}
-        key = _candle_keys(contract, day.isoformat())[0]
         try:
             full = await _day_candles_ohlc(self.client, self.token, self.limiter,
                                            contract["instrument_key"], contract["expired"], day)
@@ -367,15 +364,8 @@ class OptionPricer:
         return full
 
     def save(self) -> None:
-        os.makedirs(DATA_DIR, exist_ok=True)
-        with open(CONTRACT_CACHE, "w") as f:
-            json.dump(self.contracts, f, indent=0)
-        with open(OPTION_CACHE, "w") as f:
-            json.dump(self.candles, f)
-        with open(OHLC_CACHE, "w") as f:
-            json.dump(self.ohlc, f)
-        with open(EXPIRY_CACHE, "w") as f:
-            json.dump([e.isoformat() for e in self.expiries], f, indent=0)
+        self.store.expiries = [e.isoformat() for e in self.expiries]
+        self.store.save()
 
     # -- the thing callers actually want ---------------------------------
     async def price(self, day: str, side: str, spot_entry: float,
@@ -441,11 +431,13 @@ class CachedPricer:
     """
 
     def __init__(self) -> None:
-        self.contracts: dict = _load(CONTRACT_CACHE, LEGACY_CONTRACT_CACHE) or {}
-        self.candles: dict = _load(OPTION_CACHE, LEGACY_OPTION_CACHE) or {}
-        self.ohlc: dict = _load(OHLC_CACHE) or {}
-        cal = _load(EXPIRY_CACHE, LEGACY_EXPIRY_CACHE) or []
-        self.expiries = sorted(date.fromisoformat(s) for s in cal)
+        # the store is a process-wide singleton, so a pricer built after a fetch
+        # already sees the new candles - nothing is re-read from disk
+        self.store = option_file()
+        self.contracts: dict = self.store.contracts
+        self.candles = self.store.closes_view()
+        self.ohlc = self.store.ohlc_view()
+        self.expiries = sorted(date.fromisoformat(s) for s in self.store.expiries)
 
     def _contract(self, day: date, strike: float, opt: str,
                   roll: str = "none") -> dict | None:
@@ -513,7 +505,7 @@ class CachedPricer:
 
 
     def reload(self) -> None:
-        """Re-read the caches after a fetch pass has topped them up."""
+        """Re-read the store after a fetch pass has topped it up."""
         self.__init__()
 
 

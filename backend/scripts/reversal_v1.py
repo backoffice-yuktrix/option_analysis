@@ -60,6 +60,9 @@ REPORTS_DIR = os.path.join(BACKEND_DIR, "reports")
 
 from services.upstox_client import (  # noqa: E402
     INSTRUMENT_KEYS, get_candles, get_option_contracts)
+from services.market_data import (  # noqa: E402
+    load_minutes, load_daily, load_daily_ohlc, load_fut_volume,
+    read_access_token, print_coverage)
 from services.option_pricing import (  # noqa: E402
     RateLimiter, api_get, ContractResolver, OptionCandleStore,
     get_expired_expiries, get_expired_option_contracts,
@@ -122,12 +125,6 @@ REPORT_HTML = os.path.join(REPORTS_DIR, "reversal_v1_report.html")
 DEFAULT_RR = [2.0, 3.0, 3.5, 4.0, 4.5, 5.0]
 
 
-def nifty_cache_path(from_date: date, to_date: date) -> str:
-    """One cache file per date range, so widening the range never reuses stale data."""
-    return os.path.join(
-        DATA_DIR, f"nifty_1m_{from_date.isoformat()}_{to_date.isoformat()}.json")
-
-
 def rr_label(r: float) -> str:
     return f"1:{r:g}"
 
@@ -136,38 +133,16 @@ def rr_label(r: float) -> str:
 # Auth / HTTP helpers
 # ---------------------------------------------------------------------------
 
-def _read_access_token() -> str:
-    with open(CONFIG_FILE) as f:
-        lines = [l.strip() for l in f.readlines()]
-    if len(lines) < 4 or not lines[3]:
-        raise RuntimeError(f"No access_token found in {CONFIG_FILE}. Connect to Upstox first.")
-    return lines[3]
+def _read_access_token() -> str | None:
+    """The broker token (services/market_data reads the same file)."""
+    return read_access_token()
 
-
-# ---------------------------------------------------------------------------
-# Upstox endpoints (expired-instruments variants)
-# ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
-# NIFTY spot data
-# ---------------------------------------------------------------------------
 
 async def load_nifty(token: str | None, offline: bool,
                      from_date: date, to_date: date) -> list[dict]:
-    cache = nifty_cache_path(from_date, to_date)
-    if os.path.exists(cache):
-        with open(cache) as f:
-            candles = json.load(f)
-        print(f"Loaded {len(candles)} cached NIFTY 1m candles from {os.path.basename(cache)}")
-        return candles
-    if offline or not token:
-        raise RuntimeError(f"{cache} missing and --offline was requested.")
-    print(f"Fetching NIFTY 1m candles {from_date} -> {to_date} ...")
-    candles = await get_candles(token, UNDERLYING_KEY, "1m", from_date, to_date)
-    print(f"Fetched {len(candles)} candles.")
-    with open(cache, "w") as f:
-        json.dump(candles, f)
-    return candles
+    """Index minute candles from data/nifty_1m.json (fetching only the
+    days it does not already hold)."""
+    return await load_minutes(offline, from_date, to_date, token)
 
 
 def index_by_day(candles: list[dict]) -> dict[str, dict[str, dict]]:

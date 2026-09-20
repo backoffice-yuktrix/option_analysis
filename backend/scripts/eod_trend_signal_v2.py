@@ -92,6 +92,9 @@ sys.path.insert(0, SCRIPT_DIR)
 import httpx  # noqa: E402
 from services.option_pricing import (  # noqa: E402
     CachedPricer, OptionPricer, RateLimiter, atm_strike, _candle_keys)
+from services.market_data import (  # noqa: E402
+    load_minutes, load_daily, load_daily_ohlc, load_fut_volume,
+    read_access_token, print_coverage)
 from services.trade_costs import (  # noqa: E402
     capital_required, option_round_trip, live_margin)
 from eod_trend_signal_v1 import (  # noqa: E402
@@ -105,6 +108,8 @@ SIGNALS_CSV = os.path.join(RESULTS_DIR, "eod_trend_signal_v2_signals.csv")
 TRADES_CSV = os.path.join(RESULTS_DIR, "eod_trend_signal_v2_trades.csv")
 
 EXIT_HHMM = "09:15"
+# The option panel carries the whole exit day and this much of the entry day.
+CHART_OPT_ENTRY_FROM = "14:00"
 # Since 2026-09-19 the option is bought in the 15:20 minute, not the last one (the 15:29 minute has the widest
 # afternoon range, and the worst-fill entry is that minute's HIGH).  Shadows the
 # constant imported from v1; the spot reference entry moves to the same minute.
@@ -396,7 +401,18 @@ def _legs_for(t: dict, kind: str, off: int, c, ec, xc, eo=None, xo=None) -> dict
         leg = {"exit_px": None, "exit_minute": None, "prem_pts": None, "prem_pct": None,
                "pnl_rs": None, "costs_rs": None, "net_rs": None, "reason": None,
                "exit_px_w": None, "exit_minute_w": None, "prem_pts_w": None, "prem_pct_w": None,
-               "pnl_rs_w": None, "costs_rs_w": None, "net_rs_w": None}
+               "pnl_rs_w": None, "costs_rs_w": None, "net_rs_w": None,
+               "line": None, "line_w": None}
+        # The price the rule is actually watching for, under each fill.  The
+        # chart draws it, so what you see is the number the exit compares to.
+        if thr is not None:
+            need_c = (option_round_trip(kind, e_px, e_px, LOT_SIZE)["total"] / LOT_SIZE
+                      if thr == "costs" else thr * e_px)
+            leg["line"] = round(e_px + sgn * need_c, 2)
+            if e_w:
+                need_w = (option_round_trip(kind, e_w, e_w, LOT_SIZE)["total"] / LOT_SIZE
+                          if thr == "costs" else thr * e_w)
+                leg["line_w"] = round(e_w + sgn * need_w, 2)
         if not t["exit_day"]:
             leg["reason"] = "open - no exit yet"
         else:
@@ -429,7 +445,8 @@ def _legs_for(t: dict, kind: str, off: int, c, ec, xc, eo=None, xo=None) -> dict
     return {"info": base, "exits": exits}
 
 
-async def price_trades(trades: list[dict], offline: bool, token: str | None) -> tuple[int, int]:
+async def price_trades(trades: list[dict], offline: bool, token: str | None,
+                       chart_from: str | None = None) -> tuple[int, int, dict]:
     priceable = [t for t in trades if t["entry_spot"] is not None
                  and (t["status"] == "closed" or t["status"].startswith("open"))]
     if not priceable:
@@ -459,10 +476,20 @@ async def price_trades(trades: list[dict], offline: bool, token: str | None) -> 
     elif need:
         print(f"  ! {len(need)} legs without option data and no token (offline={offline})")
     priced = 0
+    option_chart: dict[str, dict] = {}
     for t in priceable:
         for key, kind, off, _ in INSTRUMENTS:
             opt, strike = contract_spec(t, kind, off)
-            t["legs"][key] = _legs_for(t, kind, off, *_cached(pricer, t, opt, strike))
+            got = _cached(pricer, t, opt, strike)
+            t["legs"][key] = _legs_for(t, kind, off, *got)
+            # the contract's own candles, for the option panel of the chart
+            if chart_from and t["day"] >= chart_from:
+                _c, _ec, _xc, eo, xo = got
+                if eo or xo:
+                    option_chart.setdefault(t["day"], {})[key] = {
+                        "e": {m: [round(x, 2) for x in v] for m, v in (eo or {}).items()
+                              if m >= CHART_OPT_ENTRY_FROM},
+                        "x": {m: [round(x, 2) for x in v] for m, v in (xo or {}).items()}}
         h = t["legs"][DEFAULT_INSTRUMENT]["exits"][DEFAULT_EXIT]
         priced += h.get("prem_pct") is not None
     # The capital figure for the CURRENT signal comes from the broker itself.
@@ -477,7 +504,7 @@ async def price_trades(trades: list[dict], offline: bool, token: str | None) -> 
                         if m is not None:
                             info["capital_rs"], info["capital_source"] = m, "broker"
         print(f"  live margin fetched for {len(open_now)} open signal(s)")
-    return priced, sum(1 for t in trades if t["status"] == "closed")
+    return priced, sum(1 for t in trades if t["status"] == "closed"), option_chart
 
 
 # ---------------------------------------------------------------------------
@@ -664,12 +691,23 @@ HTML_TEMPLATE = r"""<!doctype html>
     <select id="daySel"></select>
     <label><input type="checkbox" id="showRules" checked> day open &rarr; 15:14 close</label>
     <label><input type="checkbox" id="showTrade" checked> entry / exit</label>
+    <label><input type="checkbox" id="showQual" checked> mark every qualifying minute</label>
     <button id="zoomFocus">14:30 &rarr; 10:00</button><button id="zoomIn">+</button><button id="zoomOut">&minus;</button><button id="zoomReset">both sessions</button>
     <span class="tag" id="dayTag"></span>
   </div>
   <div id="setupBanner" class="setup dim"></div>
-  <svg id="chart" viewBox="0 0 1200 520" preserveAspectRatio="xMidYMid meet"></svg>
+  <svg id="chart" viewBox="0 0 1200 330" preserveAspectRatio="xMidYMid meet"></svg>
+  <div id="optHead" class="setup dim" style="margin:10px 0 4px"></div>
+  <svg id="ochart" viewBox="0 0 1200 400" preserveAspectRatio="xMidYMid meet"></svg>
   <div id="tip"></div>
+
+  <h3 style="margin:18px 0 4px">Cross-check &mdash; the exit day minute by minute</h3>
+  <div class="sub" id="verifySub"></div>
+  <div class="chartbar">
+    <label><input type="checkbox" id="verifyAll"> every minute of the exit day (otherwise the scan window up to the exit)</label>
+    <span class="tag" id="verifyTag"></span>
+  </div>
+  <div class="scroll" style="max-height:420px"><table id="tblVerify"></table></div>
 
   <h2>By side</h2><div class="scroll"><table id="tblSide"></table></div>
   <h2>Monthly</h2><div class="scroll"><table id="tblMonth"></table></div>
@@ -760,7 +798,7 @@ if (M.worst_coverage && M.worst_coverage[0] < M.worst_coverage[1]) {
   M.fills.forEach(f => { if (f.key === 'worst') f.label += ' (high/low data on ' + M.worst_coverage[0] + ' of ' + M.worst_coverage[1] + ' nights)'; });
   fill($('fillSel'), M.fills.map(f => ({k: f.key, v: f.label})), curFill);
 }
-const W = ['entry_px', 'exit_px', 'exit_minute', 'prem_pts', 'prem_pct', 'pnl_rs', 'costs_rs', 'net_rs', 'capital_rs'];
+const W = ['entry_px', 'exit_px', 'exit_minute', 'prem_pts', 'prem_pct', 'pnl_rs', 'costs_rs', 'net_rs', 'capital_rs', 'line'];
 function withFill(l) {
   if (!l || curFill === 'close') return l;
   const o = Object.assign({}, l);
@@ -1055,8 +1093,14 @@ function renderLog() {
 $('onlyFired').onchange = renderLog;
 
 /* ---------- chart ---------- */
-const CW = 1200, CH = 520, PADL = 66, PADR = 16, PADT = 18, PADB = 30;
-const csvg = $('chart'), ctip = $('tip');
+/* Two panels over ONE timeline: the index above, the option contract below.
+   The timeline is the union of index minutes and option minutes across the
+   signal day and the exit day, so the post-auction 15:30-15:39 option minutes
+   (the index prints nothing there) still line up.  Both panels share the same
+   zoom, pan and tooltip. */
+const CW = 1200, CH = 330, PADL = 66, PADR = 16, PADT = 18, PADB = 26;
+const OCH = 400, OPADT = 18, OPADB = 26;
+const csvg = $('chart'), osvg = $('ochart'), ctip = $('tip');
 let chartState = null;
 function txt(x, y, t, col, size, anchor) { return '<text x="' + x + '" y="' + y + '" fill="' + (col || 'var(--muted)') + '" font-size="' + (size || 10) + '"' + (anchor ? ' text-anchor="' + anchor + '"' : '') + '>' + t + '</text>'; }
 function fillDays() {
@@ -1065,14 +1109,35 @@ function fillDays() {
   if (days.includes(keep)) sel.value = keep; else { const tr = VT().filter(t => t.status === 'closed'); sel.value = tr.length ? tr[tr.length - 1].day : days[days.length - 1]; }
   renderChart();
 }
+function curExitMeta() { return M.exits.find(e => e.key === curExit); }
 function renderChart() {
   const day = $('daySel').value, sig = DATA.signals.find(x => x.day === day) || null, trade = DATA.trades.find(t => t.day === day) || null;
   banner(sig, trade);
-  const c1 = DATA.chart_days[day];
-  if (!c1) { chartState = null; $('dayTag').textContent = day; csvg.innerHTML = txt(CW / 2, CH / 2, 'Candles are carried only from ' + M.chart_full_from + ' on, and for trade days before that.', null, 12, 'middle'); return; }
-  const nd = DATA.next_of[day], c2 = nd ? (DATA.chart_days[nd] || []) : [];
-  const all = c1.map(x => x.concat([day])).concat(c2.map(x => x.concat([nd])));
-  chartState = {day, nd, c: all, split: c1.length, sig, trade, i0: 0, i1: all.length};
+  const nd = DATA.next_of[day] || null;
+  const c1 = DATA.chart_days[day] || [], c2 = nd ? (DATA.chart_days[nd] || []) : [];
+  const oc = ((DATA.option_chart || {})[day] || {})[curInst] || null;
+  if (!c1.length && !oc) {
+    chartState = null; $('dayTag').textContent = day;
+    csvg.innerHTML = txt(CW / 2, CH / 2, 'Candles are carried only from ' + M.chart_full_from + ' on, and for trade days before that.', null, 12, 'middle');
+    osvg.innerHTML = ''; $('optHead').innerHTML = ''; $('tblVerify').innerHTML = ''; $('verifySub').textContent = ''; $('verifyTag').textContent = '';
+    return;
+  }
+  /* one timeline for both panels */
+  const keys = new Set();
+  c1.forEach(r => keys.add(day + ' ' + r[0]));
+  c2.forEach(r => keys.add(nd + ' ' + r[0]));
+  if (oc) { Object.keys(oc.e || {}).forEach(m => keys.add(day + ' ' + m)); if (nd) Object.keys(oc.x || {}).forEach(m => keys.add(nd + ' ' + m)); }
+  const tl = Array.from(keys).sort().map(s => ({d: s.slice(0, 10), t: s.slice(11)}));
+  const pos = {}; tl.forEach((p, i) => pos[p.d + ' ' + p.t] = i);
+  const ix = new Array(tl.length).fill(null), op = new Array(tl.length).fill(null);
+  c1.forEach(r => { ix[pos[day + ' ' + r[0]]] = [r[1], r[2], r[3], r[4]]; });
+  c2.forEach(r => { ix[pos[nd + ' ' + r[0]]] = [r[1], r[2], r[3], r[4]]; });
+  if (oc) {
+    Object.entries(oc.e || {}).forEach(([m, v]) => { const i = pos[day + ' ' + m]; if (i !== undefined) op[i] = v; });
+    if (nd) Object.entries(oc.x || {}).forEach(([m, v]) => { const i = pos[nd + ' ' + m]; if (i !== undefined) op[i] = v; });
+  }
+  let split = tl.findIndex(p => p.d === nd); if (split < 0) split = tl.length;
+  chartState = {day, nd, tl, pos, ix, op, split, sig, trade, oc, i0: 0, i1: tl.length};
   $('dayTag').textContent = day + (nd ? '  →  ' + nd : '  (no next session yet)');
   focusZoom();
 }
@@ -1096,64 +1161,202 @@ function banner(sig, trade) {
   b.innerHTML = lines.join('<br>');
 }
 function clampWindow(n, a, b) { let i0 = Math.max(0, Math.floor(a)), i1 = Math.min(n, Math.ceil(b)); if (i1 - i0 < 8) { const m = (i0 + i1) / 2; i0 = Math.max(0, Math.floor(m - 4)); i1 = Math.min(n, i0 + 8); } return [i0, i1]; }
-function focusZoom() { const st = chartState; if (!st) return; const a = st.c.findIndex(x => x[5] === st.day && x[0] >= '14:30'); let b = st.c.findIndex(x => x[5] === st.nd && x[0] > '10:00'); if (b < 0) b = st.c.length; const w = clampWindow(st.c.length, a < 0 ? 0 : a, b); st.i0 = w[0]; st.i1 = w[1]; drawChart(); }
-function resetZoom() { if (!chartState) return; chartState.i0 = 0; chartState.i1 = chartState.c.length; drawChart(); }
-function zoomAt(f, anchor) { const st = chartState; if (!st) return; const a = anchor === undefined ? (st.i0 + st.i1) / 2 : anchor; const w = clampWindow(st.c.length, a - (a - st.i0) * f, a + (st.i1 - a) * f); st.i0 = w[0]; st.i1 = w[1]; drawChart(); }
+function drawAll() { drawChart(); drawOption(); renderVerify(); }
+function focusZoom() {
+  const st = chartState; if (!st) return;
+  const a = st.tl.findIndex(p => p.d === st.day && p.t >= '14:30');
+  let b = st.tl.findIndex(p => p.d === st.nd && p.t > '10:00'); if (b < 0) b = st.tl.length;
+  const w = clampWindow(st.tl.length, a < 0 ? 0 : a, b); st.i0 = w[0]; st.i1 = w[1]; drawAll();
+}
+function resetZoom() { if (!chartState) return; chartState.i0 = 0; chartState.i1 = chartState.tl.length; drawAll(); }
+function zoomAt(f, anchor) { const st = chartState; if (!st) return; const a = anchor === undefined ? (st.i0 + st.i1) / 2 : anchor; const w = clampWindow(st.tl.length, a - (a - st.i0) * f, a + (st.i1 - a) * f); st.i0 = w[0]; st.i1 = w[1]; drawAll(); }
 function idxAt(cx, box) { const px = (cx - box.left) / box.width * CW; return chartState.i0 + (px - PADL) / (CW - PADL - PADR) * (chartState.i1 - chartState.i0); }
+/* shared X helpers */
+function xOf(i) { const st = chartState, n = st.i1 - st.i0; return PADL + (i - st.i0 + 0.5) / n * (CW - PADL - PADR); }
+function halfW() { const st = chartState; return (CW - PADL - PADR) / (st.i1 - st.i0) / 2; }
+function seriesRange(arr) {
+  const st = chartState; let lo = Infinity, hi = -Infinity;
+  for (let i = st.i0; i < st.i1; i++) { const k = arr[i]; if (!k) continue; lo = Math.min(lo, k[2]); hi = Math.max(hi, k[1]); }
+  return [lo, hi];
+}
+function candles(arr, Y, i0, i1) {
+  let g = '', bw = Math.max(1, halfW() * 1.4);
+  for (let i = i0; i < i1; i++) {
+    const k = arr[i]; if (!k) continue;
+    const up = k[3] >= k[0], col = up ? 'var(--up)' : 'var(--down)', x = xOf(i), y1 = Y(Math.max(k[0], k[3])), y2 = Y(Math.min(k[0], k[3]));
+    g += '<line x1="' + x + '" y1="' + Y(k[1]) + '" x2="' + x + '" y2="' + Y(k[2]) + '" stroke="' + col + '" stroke-width="1"/><rect x="' + (x - bw / 2) + '" y="' + y1 + '" width="' + bw + '" height="' + Math.max(1, y2 - y1) + '" fill="' + col + '"/>';
+  }
+  return g;
+}
 function drawChart() {
   const st = chartState; if (!st) return;
-  const {c, i0, i1, sig, trade, split, day, nd} = st, view = c.slice(i0, i1); if (!view.length) return;
+  const {ix, i0, i1, sig, trade, split, day, nd} = st;
   const showRules = $('showRules').checked && sig && sig.data_ok, showTr = $('showTrade').checked && trade && trade.entry_spot !== null;
-  let lo = Math.min(...view.map(x => x[3])), hi = Math.max(...view.map(x => x[2]));
+  let [lo, hi] = seriesRange(ix);
+  if (!isFinite(lo)) { csvg.innerHTML = txt(CW / 2, CH / 2, 'no index candles in this window', null, 12, 'middle'); return; }
   if (showTr && trade.exit_spot !== null) { lo = Math.min(lo, trade.entry_spot, trade.exit_spot); hi = Math.max(hi, trade.entry_spot, trade.exit_spot); }
   const pad = (hi - lo) * 0.07 || 1; lo -= pad; hi += pad;
-  const n = i1 - i0, X = i => PADL + (i - i0 + 0.5) / n * (CW - PADL - PADR), Y = v => PADT + (hi - v) / (hi - lo) * (CH - PADT - PADB);
-  const at = (d, t) => c.findIndex(x => x[5] === d && x[0] === t), half = (CW - PADL - PADR) / n / 2, bw = Math.max(1, half * 1.4), vis = i => i >= i0 && i < i1;
+  const Y = v => PADT + (hi - v) / (hi - lo) * (CH - PADT - PADB);
+  const at = (d, t) => { const i = st.pos[d + ' ' + t]; return i === undefined ? -1 : i; };
+  const half = halfW(), vis = i => i >= i0 && i < i1;
   let g = '';
-  for (let k = 0; k <= 5; k++) { const v = lo + (hi - lo) * k / 5; g += '<line x1="' + PADL + '" y1="' + Y(v) + '" x2="' + (CW - PADR) + '" y2="' + Y(v) + '" stroke="var(--grid)"/>' + txt(PADL - 6, Y(v) + 3, fmt(v, 0), null, 10, 'end'); }
-  const step = Math.max(1, Math.round(n / 12));
-  for (let i = i0; i < i1; i += step) g += txt(X(i), CH - 10, c[i][0], null, 10, 'middle');
-  if (split > i0 && split < i1) { const xs = X(split) - half; g += '<line x1="' + xs + '" y1="' + PADT + '" x2="' + xs + '" y2="' + (CH - PADB) + '" stroke="var(--ink2)" stroke-width="1.2" stroke-dasharray="6 4"/>' + txt(xs - 6, PADT + 10, day, 'var(--ink2)', 11, 'end') + txt(xs + 6, PADT + 10, nd + ' (next session)', 'var(--ink2)', 11); }
+  for (let k = 0; k <= 4; k++) { const v = lo + (hi - lo) * k / 4; g += '<line x1="' + PADL + '" y1="' + Y(v) + '" x2="' + (CW - PADR) + '" y2="' + Y(v) + '" stroke="var(--grid)"/>' + txt(PADL - 6, Y(v) + 3, fmt(v, 0), null, 10, 'end'); }
+  const step = Math.max(1, Math.round((i1 - i0) / 12));
+  for (let i = i0; i < i1; i += step) g += txt(xOf(i), CH - 8, st.tl[i].t, null, 10, 'middle');
+  g += txt(PADL, 12, 'NIFTY index', 'var(--ink2)', 11);
+  if (split > i0 && split < i1) { const xs = xOf(split) - half; g += '<line x1="' + xs + '" y1="' + PADT + '" x2="' + xs + '" y2="' + (CH - PADB) + '" stroke="var(--ink2)" stroke-width="1.2" stroke-dasharray="6 4"/>' + txt(xs - 6, PADT + 10, day, 'var(--ink2)', 11, 'end') + txt(xs + 6, PADT + 10, nd + ' (next session)', 'var(--ink2)', 11); }
   else if (i0 < split) g += txt(PADL + 6, PADT + 10, day, 'var(--ink2)', 11); else g += txt(PADL + 6, PADT + 10, nd + ' (next session)', 'var(--ink2)', 11);
   if (showRules) {
     const io = at(day, '09:15'), ic = at(day, '15:14'), icut = at(day, '15:15'), iend = at(day, '15:29');
-    if (icut >= 0 && iend >= 0 && (vis(icut) || vis(iend))) { const x0 = Math.max(PADL, X(icut) - half), x1 = Math.min(CW - PADR, X(iend) + half);
+    if (icut >= 0 && iend >= 0 && (vis(icut) || vis(iend))) { const x0 = Math.max(PADL, xOf(icut) - half), x1 = Math.min(CW - PADR, xOf(iend) + half);
       g += '<rect x="' + x0 + '" y="' + PADT + '" width="' + Math.max(0, x1 - x0) + '" height="' + (CH - PADT - PADB) + '" fill="var(--muted)" opacity="0.10"/>' + txt((x0 + x1) / 2, CH - PADB - 6, 'not read (15:15+)', null, 10, 'middle'); }
-    if (ic >= 0 && vis(ic)) { const x = X(ic) + half; g += '<line x1="' + x + '" y1="' + PADT + '" x2="' + x + '" y2="' + (CH - PADB) + '" stroke="var(--warn)" stroke-width="1.4"/>' + txt(x - 4, PADT + 24, 'decision at 15:14 close ' + fmt(sig.close, 2), 'var(--warn)', 10.5, 'end'); }
+    if (ic >= 0 && vis(ic)) { const x = xOf(ic) + half; g += '<line x1="' + x + '" y1="' + PADT + '" x2="' + x + '" y2="' + (CH - PADB) + '" stroke="var(--warn)" stroke-width="1.4"/>' + txt(x - 4, PADT + 24, 'decision at 15:14 close ' + fmt(sig.close, 2), 'var(--warn)', 10.5, 'end'); }
     const col = sig.move_pct >= 0 ? 'var(--up)' : 'var(--down)';
-    const xo = io >= 0 ? X(Math.max(io, i0)) : PADL, yo = Y(sig.day_open);
-    if (ic >= 0 && (vis(ic) || vis(io))) { g += '<line x1="' + xo + '" y1="' + yo + '" x2="' + X(ic) + '" y2="' + Y(sig.close) + '" stroke="' + col + '" stroke-width="1.6" stroke-dasharray="4 3"/>' +
-      '<line x1="' + PADL + '" y1="' + yo + '" x2="' + (X(Math.min(split, i1) - 1) + half) + '" y2="' + yo + '" stroke="' + col + '" stroke-width="0.8" stroke-dasharray="2 4"/>' +
+    const xo = io >= 0 ? xOf(Math.max(io, i0)) : PADL, yo = Y(sig.day_open);
+    if (ic >= 0 && (vis(ic) || vis(io))) { g += '<line x1="' + xo + '" y1="' + yo + '" x2="' + xOf(ic) + '" y2="' + Y(sig.close) + '" stroke="' + col + '" stroke-width="1.6" stroke-dasharray="4 3"/>' +
+      '<line x1="' + PADL + '" y1="' + yo + '" x2="' + (xOf(Math.min(split, i1) - 1) + half) + '" y2="' + yo + '" stroke="' + col + '" stroke-width="0.8" stroke-dasharray="2 4"/>' +
       txt(PADL + 4, yo - 4, '09:15 open ' + fmt(sig.day_open, 2) + '  ·  day ' + (sig.move_pct >= 0 ? '+' : '') + fmt(sig.move_pct, 3) + '% → ' + sig.decision, col, 10.5); }
-    if (nd && i1 > split) { const a = at(nd, '09:15'), b2 = at(nd, '09:45'); if (a >= 0 && b2 >= 0) { const x0 = Math.max(PADL, X(a) - half), x1 = Math.min(CW - PADR, X(b2) + half);
-      g += '<rect x="' + x0 + '" y="' + PADT + '" width="' + Math.max(0, x1 - x0) + '" height="' + (CH - PADT - PADB) + '" fill="var(--accent)" opacity="0.07"/>' + txt((x0 + x1) / 2, CH - PADB - 18, 'exit window 09:15–09:45', 'var(--accent)', 10, 'middle'); } }
   }
-  for (let i = i0; i < i1; i++) { const k = c[i], up = k[4] >= k[1], col = up ? 'var(--up)' : 'var(--down)', x = X(i), y1 = Y(Math.max(k[1], k[4])), y2 = Y(Math.min(k[1], k[4]));
-    g += '<line x1="' + x + '" y1="' + Y(k[2]) + '" x2="' + x + '" y2="' + Y(k[3]) + '" stroke="' + col + '" stroke-width="1"/><rect x="' + (x - bw / 2) + '" y="' + y1 + '" width="' + bw + '" height="' + Math.max(1, y2 - y1) + '" fill="' + col + '"/>'; }
+  g += candles(ix, Y, i0, i1);
   if (showTr) {
     const l = leg(trade) || {}, ie = at(day, M.entry_hhmm), col = trade.status === 'closed' ? ((l.pnl_rs !== null && l.pnl_rs !== undefined ? l.pnl_rs : trade.spot_pts) >= 0 ? 'var(--up)' : 'var(--down)') : 'var(--accent)';
-    if (ie >= 0 && vis(ie)) g += '<circle cx="' + X(ie) + '" cy="' + Y(trade.entry_spot) + '" r="4.5" fill="' + col + '" stroke="var(--surface)" stroke-width="1.5"/>' + txt(X(ie) - 8, Y(trade.entry_spot) + 4, trade.decision + ' ' + M.entry_hhmm + ' ' + fmt(trade.entry_spot, 2) + (l.symbol ? ' · ' + l.symbol + ' @ ' + fmt(l.entry_px, 2) : ''), col, 11, 'end');
-    if (trade.status === 'closed') { const xm = l.exit_minute || trade.exit_time, ix = at(nd, xm); const spotAt = ix >= 0 ? c[ix][4] : trade.exit_spot;
-      if (ix >= 0 && ie >= 0 && (vis(ix) || vis(ie))) g += '<line x1="' + X(ie) + '" y1="' + Y(trade.entry_spot) + '" x2="' + X(ix) + '" y2="' + Y(spotAt) + '" stroke="' + col + '" stroke-width="1.8" stroke-dasharray="5 3"/><circle cx="' + X(ix) + '" cy="' + Y(spotAt) + '" r="4.5" fill="' + col + '" stroke="var(--surface)" stroke-width="1.5"/>' +
-        txt(X(ix) + 8, Y(spotAt) + 4, 'exit ' + xm + (l.exit_px !== null && l.exit_px !== undefined ? ' · ' + fmt(l.exit_px, 2) + ' = ₹' + fmt(l.pnl_rs, 0) : '') + '  ·  spot ' + (trade.spot_pts >= 0 ? '+' : '') + fmt(trade.spot_pts, 2), col, 11); }
-    else if (ie >= 0 && vis(ie)) g += txt(X(ie) + 8, Y(trade.entry_spot) + 4, 'open', col, 11);
+    if (ie >= 0 && vis(ie)) g += '<circle cx="' + xOf(ie) + '" cy="' + Y(trade.entry_spot) + '" r="4.5" fill="' + col + '" stroke="var(--surface)" stroke-width="1.5"/>' + txt(xOf(ie) - 8, Y(trade.entry_spot) + 4, trade.decision + ' ' + M.entry_hhmm + ' ' + fmt(trade.entry_spot, 2), col, 11, 'end');
+    if (trade.status === 'closed') { const xm = l.exit_minute || trade.exit_time, ixm = at(nd, xm); const sAt = ixm >= 0 && ix[ixm] ? ix[ixm][3] : trade.exit_spot;
+      if (ixm >= 0 && ie >= 0 && (vis(ixm) || vis(ie))) g += '<line x1="' + xOf(ie) + '" y1="' + Y(trade.entry_spot) + '" x2="' + xOf(ixm) + '" y2="' + Y(sAt) + '" stroke="' + col + '" stroke-width="1.8" stroke-dasharray="5 3"/><circle cx="' + xOf(ixm) + '" cy="' + Y(sAt) + '" r="4.5" fill="' + col + '" stroke="var(--surface)" stroke-width="1.5"/>' +
+        txt(xOf(ixm) + 8, Y(sAt) + 4, 'exit ' + xm + '  ·  spot ' + (trade.spot_pts >= 0 ? '+' : '') + fmt(trade.spot_pts, 2), col, 11); }
   }
   csvg.innerHTML = g;
 }
+/* the option panel: the contract you actually bought */
+function drawOption() {
+  const st = chartState; if (!st) return;
+  const {op, i0, i1, trade, split, day, nd} = st;
+  const head = $('optHead');
+  if (!st.oc) {
+    osvg.innerHTML = txt(CW / 2, OCH / 2, 'No option candles carried for this night and strike.', null, 12, 'middle');
+    head.className = 'setup dim'; head.innerHTML = 'Option candles are carried for the last ' + M.chart_opt_days + ' days of the run.';
+    return;
+  }
+  const l = (trade ? leg(trade) : null) || {}, ex = curExitMeta();
+  const line = (l.line !== null && l.line !== undefined) ? l.line : null;
+  let [lo, hi] = seriesRange(op);
+  if (!isFinite(lo)) { osvg.innerHTML = txt(CW / 2, OCH / 2, 'no option candles in this window', null, 12, 'middle'); head.innerHTML = ''; return; }
+  if (l.entry_px) { lo = Math.min(lo, l.entry_px); hi = Math.max(hi, l.entry_px); }
+  if (line) { lo = Math.min(lo, line); hi = Math.max(hi, line); }
+  if (l.exit_px) { lo = Math.min(lo, l.exit_px); hi = Math.max(hi, l.exit_px); }
+  const pad = (hi - lo) * 0.08 || 1; lo -= pad; hi += pad;
+  const Y = v => OPADT + (hi - v) / (hi - lo) * (OCH - OPADT - OPADB);
+  const at = (d, t) => { const i = st.pos[d + ' ' + t]; return i === undefined ? -1 : i; };
+  const half = halfW(), vis = i => i >= i0 && i < i1;
+  let g = '';
+  for (let k = 0; k <= 4; k++) { const v = lo + (hi - lo) * k / 4; g += '<line x1="' + PADL + '" y1="' + Y(v) + '" x2="' + (CW - PADR) + '" y2="' + Y(v) + '" stroke="var(--grid)"/>' + txt(PADL - 6, Y(v) + 3, fmt(v, 1), null, 10, 'end'); }
+  const step = Math.max(1, Math.round((i1 - i0) / 12));
+  for (let i = i0; i < i1; i += step) g += txt(xOf(i), OCH - 8, st.tl[i].t, null, 10, 'middle');
+  g += txt(PADL, 12, (l.symbol || 'option') + '  ·  premium per share', 'var(--ink2)', 11);
+  if (split > i0 && split < i1) { const xs = xOf(split) - half; g += '<line x1="' + xs + '" y1="' + OPADT + '" x2="' + xs + '" y2="' + (OCH - OPADB) + '" stroke="var(--ink2)" stroke-width="1.2" stroke-dasharray="6 4"/>'; }
+  /* the scan window: nothing may fire before it */
+  if (nd && ex) {
+    const a = at(nd, ex.start); let b = at(nd, ex.limit);
+    if (b < 0) b = i1 - 1;
+    if (a >= 0 && (vis(a) || vis(b))) { const x0 = Math.max(PADL, xOf(a) - half), x1 = Math.min(CW - PADR, xOf(b) + half);
+      g += '<rect x="' + x0 + '" y="' + OPADT + '" width="' + Math.max(0, x1 - x0) + '" height="' + (OCH - OPADT - OPADB) + '" fill="var(--accent)" opacity="0.06"/>' +
+        txt((x0 + x1) / 2, OCH - OPADB - 6, 'the rule may sell only here: ' + ex.start + ' → ' + ex.limit, 'var(--accent)', 10, 'middle'); }
+  }
+  /* the line the rule watches */
+  if (line) {
+    g += '<line x1="' + PADL + '" y1="' + Y(line) + '" x2="' + (CW - PADR) + '" y2="' + Y(line) + '" stroke="var(--warn)" stroke-width="1.3" stroke-dasharray="7 4"/>' +
+      txt(CW - PADR - 4, Y(line) - 5, 'line to clear ' + fmt(line, 2) + (ex && ex.thr === 'costs' ? '  =  entry + costs' : ''), 'var(--warn)', 10.5, 'end');
+  }
+  /* every minute whose LOW cleared the line */
+  if ($('showQual').checked && line && nd && ex && ex.trigger === 'low') {
+    for (let i = Math.max(i0, split); i < i1; i++) {
+      const k = op[i]; if (!k || st.tl[i].t < ex.start || st.tl[i].t > ex.limit) continue;
+      if (k[2] > line) g += '<rect x="' + (xOf(i) - half) + '" y="' + OPADT + '" width="' + Math.max(1, half * 2) + '" height="' + (OCH - OPADT - OPADB) + '" fill="var(--up)" opacity="0.13"/>';
+    }
+  }
+  g += candles(op, Y, i0, i1);
+  /* entry and exit, at the prices actually filled */
+  const ie = at(day, l.entry_minute || M.entry_hhmm);
+  const col = (l.net_rs !== null && l.net_rs !== undefined) ? (l.net_rs >= 0 ? 'var(--up)' : 'var(--down)') : 'var(--accent)';
+  if (ie >= 0 && vis(ie) && l.entry_px) {
+    g += '<circle cx="' + xOf(ie) + '" cy="' + Y(l.entry_px) + '" r="5" fill="var(--accent)" stroke="var(--surface)" stroke-width="1.5"/>' +
+      txt(xOf(ie) - 9, Y(l.entry_px) + 4, 'BOUGHT ' + (l.entry_minute || M.entry_hhmm) + ' @ ' + fmt(l.entry_px, 2) + (curFill === 'worst' ? ' (minute high)' : ' (close)'), 'var(--accent)', 11, 'end');
+  }
+  if (l.exit_minute && l.exit_px !== null && l.exit_px !== undefined && nd) {
+    const ixm = at(nd, l.exit_minute);
+    if (ixm >= 0 && vis(ixm)) {
+      const xb = (st.oc.x || {})[l.exit_minute];
+      const fallback = !!(line && xb && xb[2] <= line);
+      g += '<circle cx="' + xOf(ixm) + '" cy="' + Y(l.exit_px) + '" r="5" fill="' + col + '" stroke="var(--surface)" stroke-width="1.5"/>' +
+        (ie >= 0 ? '<line x1="' + xOf(ie) + '" y1="' + Y(l.entry_px) + '" x2="' + xOf(ixm) + '" y2="' + Y(l.exit_px) + '" stroke="' + col + '" stroke-width="1.6" stroke-dasharray="5 3"/>' : '') +
+        txt(xOf(ixm) + 9, Y(l.exit_px) + 4, (fallback ? 'FALLBACK SOLD ' : 'SOLD ') + l.exit_minute + ' @ ' + fmt(l.exit_px, 2) + (curFill === 'worst' ? ' (minute low)' : '') +
+          '  =  ' + (l.prem_pts >= 0 ? '+' : '') + fmt(l.prem_pts, 2) + ' pts, net ₹' + fmt(l.net_rs, 0), col, 11);
+    }
+  }
+  osvg.innerHTML = g;
+  /* the header: which strike, and the arithmetic behind the line */
+  const parts = [];
+  if (l.symbol) parts.push('<span class="r">Contract</span> <b>' + l.symbol + '</b> <span class="dimc">(' + l.rel_strike + ', strike ' + fmt(l.strike, 0) + ' ' + l.option_type + ', expiry ' + l.expiry + ', ' + l.dte + ' days from the signal day)</span>');
+  if (l.entry_px) parts.push('<span class="r">Line</span> entry <b>' + fmt(l.entry_px, 2) + '</b>' + (curFill === 'worst' ? ' (the 15:20 minute&rsquo;s HIGH, the worst you could have paid)' : ' (the 15:20 close)') +
+    (line ? ' + costs <b>' + fmt(line - l.entry_px, 2) + '</b> = <b>' + fmt(line, 2) + '</b> &mdash; a minute qualifies only when its LOW is above this' : ''));
+  head.className = 'setup ' + (l.net_rs >= 0 ? 'pos' : (l.net_rs < 0 ? 'neg' : 'dim'));
+  head.innerHTML = parts.join('<br>') || 'No contract priced for this night and strike.';
+}
+/* the cross-check table: every minute, the numbers the rule compared */
+function renderVerify() {
+  const st = chartState, tb = $('tblVerify');
+  if (!st || !st.oc || !st.nd) { tb.innerHTML = ''; $('verifySub').textContent = 'No option candles for this night and strike.'; $('verifyTag').textContent = ''; return; }
+  const trade = st.trade, l = (trade ? leg(trade) : null) || {}, ex = curExitMeta();
+  const line = (l.line !== null && l.line !== undefined) ? l.line : null;
+  const x = st.oc.x || {}, mins = Object.keys(x).sort();
+  const all = $('verifyAll').checked;
+  const rows = mins.filter(m => all || ((!ex || m >= ex.start) && (!l.exit_minute || m <= l.exit_minute) && (!ex || m <= ex.limit)));
+  $('verifySub').innerHTML = 'Exit day <b>' + st.nd + '</b>, contract <b>' + (l.symbol || '-') + '</b>, fills <b>' + curFill + '</b>. ' +
+    (line ? 'A minute qualifies when its LOW is above <b>' + fmt(line, 2) + '</b>. ' : '') +
+    'These are the raw one-minute candles the backtest read; the marked row is the minute it sold in.';
+  $('verifyTag').textContent = rows.length + ' of ' + mins.length + ' minutes shown';
+  tb.innerHTML = '<thead><tr><th class="l">minute</th><th>open</th><th>high</th><th>low</th><th>close</th>' +
+    (line ? '<th>low &minus; line</th><th class="l">qualifies?</th>' : '') + '<th class="l">what the rule did</th></tr></thead><tbody>' +
+    rows.map(m => {
+      const k = x[m], q = line !== null && k[2] > line, isExit = l.exit_minute === m;
+      const before = ex && m < ex.start;
+      const after = l.exit_minute && m > l.exit_minute;
+      let note = '';
+      if (isExit) note = '<b class="' + sign(l.net_rs) + '">' + (q ? 'SOLD here' : 'NOTHING QUALIFIED &mdash; sold at the ' + ex.limit + ' fallback') +
+        ' at ' + fmt(l.exit_px, 2) + ' &rarr; net &#8377;' + fmt(l.net_rs, 0) + '</b>';
+      else if (before) note = '<span class="dimc">before ' + ex.start + ', the rule is not looking yet</span>';
+      else if (after) note = '<span class="dimc">after the sale &mdash; the position was already closed</span>';
+      else if (q) note = '<span class="pos">first qualifying minute</span>';
+      else note = '<span class="dimc">low is not above the line &rarr; wait</span>';
+      return '<tr' + (isExit ? ' style="font-weight:600;background:var(--grid)"' : '') + '><td class="l">' + m + '</td>' +
+        plain(k[0], 2) + plain(k[1], 2) + plain(k[2], 2) + plain(k[3], 2) +
+        (line ? cell(k[2] - line, 2) + '<td class="l">' + (before ? '<span class="dimc">n/a</span>' : (q ? '<span class="pos">yes</span>' : '<span class="neg">no</span>')) + '</td>' : '') +
+        '<td class="l">' + note + '</td></tr>';
+    }).join('') + '</tbody>';
+}
 csvg.addEventListener('wheel', e => { if (!chartState) return; e.preventDefault(); zoomAt(e.deltaY < 0 ? 0.82 : 1.22, idxAt(e.clientX, csvg.getBoundingClientRect())); }, {passive: false});
+osvg.addEventListener('wheel', e => { if (!chartState) return; e.preventDefault(); zoomAt(e.deltaY < 0 ? 0.82 : 1.22, idxAt(e.clientX, osvg.getBoundingClientRect())); }, {passive: false});
 let drag = null;
-csvg.addEventListener('pointerdown', e => { if (!chartState) return; drag = {x: e.clientX, i0: chartState.i0, i1: chartState.i1}; csvg.classList.add('drag'); try { csvg.setPointerCapture(e.pointerId); } catch (_) {} });
-csvg.addEventListener('pointerup', e => { drag = null; csvg.classList.remove('drag'); try { csvg.releasePointerCapture(e.pointerId); } catch (_) {} });
-csvg.addEventListener('dblclick', resetZoom);
-csvg.addEventListener('pointermove', e => {
-  if (!chartState) return; const box = csvg.getBoundingClientRect();
-  if (drag) { const dx = (e.clientX - drag.x) / box.width * CW, perPx = (drag.i1 - drag.i0) / (CW - PADL - PADR); const w = clampWindow(chartState.c.length, drag.i0 - dx * perPx, drag.i1 - dx * perPx); chartState.i0 = w[0]; chartState.i1 = w[1]; drawChart(); ctip.style.display = 'none'; return; }
-  const i = Math.round(idxAt(e.clientX, box) - 0.5), c = chartState.c; if (i < 0 || i >= c.length) { ctip.style.display = 'none'; return; }
-  ctip.innerHTML = '<b>' + c[i][0] + '</b> <span style="opacity:.65">' + c[i][5] + '</span><br>O ' + c[i][1].toFixed(2) + '<br>H ' + c[i][2].toFixed(2) + '<br>L ' + c[i][3].toFixed(2) + '<br>C ' + c[i][4].toFixed(2);
-  ctip.style.display = 'block'; ctip.style.left = Math.min(e.clientX + 14, window.innerWidth - 120) + 'px'; ctip.style.top = Math.max(4, e.clientY - 60) + 'px';
+function startDrag(el, e) { if (!chartState) return; drag = {x: e.clientX, i0: chartState.i0, i1: chartState.i1}; el.classList.add('drag'); try { el.setPointerCapture(e.pointerId); } catch (_) {} }
+function moveDrag(el, e) {
+  if (!chartState) return; const box = el.getBoundingClientRect();
+  if (drag) { const dx = (e.clientX - drag.x) / box.width * CW, perPx = (drag.i1 - drag.i0) / (CW - PADL - PADR); const w = clampWindow(chartState.tl.length, drag.i0 - dx * perPx, drag.i1 - dx * perPx); chartState.i0 = w[0]; chartState.i1 = w[1]; drawAll(); ctip.style.display = 'none'; return; }
+  const i = Math.round(idxAt(e.clientX, box) - 0.5); if (i < 0 || i >= chartState.tl.length) { ctip.style.display = 'none'; return; }
+  const p = chartState.tl[i], a = chartState.ix[i], b = chartState.op[i];
+  ctip.innerHTML = '<b>' + p.t + '</b> <span style="opacity:.65">' + p.d + '</span>' +
+    (a ? '<br><span style="opacity:.65">index</span> O ' + a[0].toFixed(2) + ' H ' + a[1].toFixed(2) + ' L ' + a[2].toFixed(2) + ' C ' + a[3].toFixed(2) : '') +
+    (b ? '<br><span style="opacity:.65">option</span> O ' + b[0].toFixed(2) + ' H ' + b[1].toFixed(2) + ' L ' + b[2].toFixed(2) + ' C ' + b[3].toFixed(2) : '');
+  ctip.style.display = 'block'; ctip.style.left = Math.min(e.clientX + 14, window.innerWidth - 220) + 'px'; ctip.style.top = Math.max(4, e.clientY - 60) + 'px';
+}
+function endDrag(el, e) { drag = null; el.classList.remove('drag'); try { el.releasePointerCapture(e.pointerId); } catch (_) {} }
+[csvg, osvg].forEach(el => {
+  el.addEventListener('pointerdown', e => startDrag(el, e));
+  el.addEventListener('pointermove', e => moveDrag(el, e));
+  el.addEventListener('pointerup', e => endDrag(el, e));
+  el.addEventListener('pointerleave', () => { ctip.style.display = 'none'; });
 });
-csvg.addEventListener('pointerleave', () => { ctip.style.display = 'none'; });
-$('daySel').onchange = renderChart; $('showRules').onchange = drawChart; $('showTrade').onchange = drawChart;
+$('daySel').onchange = renderChart; $('showRules').onchange = drawChart; $('showTrade').onchange = drawAll;
+$('showQual').onchange = drawOption; $('verifyAll').onchange = renderVerify;
 $('zoomFocus').onclick = focusZoom; $('zoomIn').onclick = () => zoomAt(0.7); $('zoomOut').onclick = () => zoomAt(1.4); $('zoomReset').onclick = resetZoom;
 
 /* ---------- notes ---------- */
@@ -1234,6 +1437,7 @@ WIDE_SIGNAL = ("1,127 sessions, 54.5% win, mean +0.069% a night, t +4.40; by yea
 async def run(args) -> None:
     candles = await load_nifty(args.offline, args.from_date, args.to_date)
     rows, bad_ts = to_rows(candles)
+    print_coverage(args.from_date, args.to_date)
     sessions, all_days = build_sessions(rows)
     # the spot reference entry is the same minute the option is bought in
     by_day_rows = defaultdict(list)
@@ -1249,12 +1453,14 @@ async def run(args) -> None:
         raise RuntimeError(f"no session inside {from_iso} -> {to_iso}")
     add_context(series, signals)
     print(f"  {len(signals)} sessions in the window, {sum(1 for x in signals if not x['data_ok'])} invalid")
-    official = load_daily_ohlc(args.from_date, args.to_date)
+    official = await load_daily_ohlc(args.offline, args.from_date, args.to_date)
     checked = [x for x in signals if x["day_open"] is not None and x["day"] in official]
     open_match = sum(1 for x in checked if abs(x["day_open"] - official[x["day"]]["o"]) < 0.005)
 
     trades = build_trades(signals, sessions, all_days)
-    priced, closed = await price_trades(trades, args.offline, None if args.offline else _read_access_token())
+    chart_full_from = (args.to_date - timedelta(days=CHART_FULL_DAYS)).isoformat()
+    priced, closed, option_chart = await price_trades(
+        trades, args.offline, None if args.offline else _read_access_token(), chart_full_from)
     liquidity = liquidity_table(trades)
     print(f"  {len(trades)} signals, {closed} closed nights, {priced} priced ({DEFAULT_INSTRUMENT}, {DEFAULT_EXIT})")
 
@@ -1283,7 +1489,6 @@ async def run(args) -> None:
                       "verdict": verdict_text(tr_w, sig_w, label, fill)}
 
     chart_rows: dict[str, list] = defaultdict(list)
-    chart_full_from = (args.to_date - timedelta(days=CHART_FULL_DAYS)).isoformat()
     trade_days = {t["day"] for t in trades} | {t["exit_day"] for t in trades if t["exit_day"]}
     for r in rows:
         d = r["day"]
@@ -1294,16 +1499,20 @@ async def run(args) -> None:
         chart_rows[d].append([r["t"], round(r["o"], 2), round(r["h"], 2), round(r["l"], 2), round(r["c"], 2)])
     meta = {"from": from_iso, "to": to_iso, "generated": datetime.now(IST).strftime("%Y-%m-%d %H:%M IST"),
             "lot_size": LOT_SIZE, "cas_date": CAS_DATE, "chart_full_from": chart_full_from,
+            "chart_opt_days": CHART_FULL_DAYS,
             "default_instrument": DEFAULT_INSTRUMENT, "default_exit": DEFAULT_EXIT,
             "default_fill": fill, "worst_coverage": [have_w, len(closed_all)],
             "entry_hhmm": ENTRY_HHMM, "liquidity": liquidity,
             "fills": [{"key": k, "label": lab} for k, lab in FILLS],
             "instruments": [{"key": k, "label": lab} for k, _, _, lab in INSTRUMENTS],
-            "exits": [{"key": k, "label": lab, "trigger": trig, "start": start} for k, lab, _l, _t, trig, start in EXITS],
+            "exits": [{"key": k, "label": lab, "trigger": trig, "start": start, "limit": _l,
+                         "thr": (_t if isinstance(_t, (str, float, int)) else None)}
+                        for k, lab, _l, _t, trig, start in EXITS],
             "open_checked": len(checked), "open_match": open_match, "wide_signal": WIDE_SIGNAL}
     payload = {"meta": meta, "views": views, "signals": signals, "trades": trades,
                "default_view": "cas" if views["cas"]["sessions"] else "6m",
                "chart_days": {d: sorted(v) for d, v in chart_rows.items()},
+               "option_chart": option_chart,
                "next_of": {d: all_days[k + 1] for k, d in enumerate(all_days) if k + 1 < len(all_days)}}
     for key in ("cas", "6m", "all"):
         if key in views:
