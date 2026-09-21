@@ -117,16 +117,10 @@ app/
 │   ├── order.py
 │   └── strategy_state.py
 │
-├── frontend/
-│   ├── index.html
-│   ├── app.js
-│   └── styles.css
-│
-└── tests/
-    ├── test_candle_builder.py
-    ├── test_strategy_buy.py
-    ├── test_strategy_sell.py
-    └── test_execution_state.py
+└── frontend/
+    ├── index.html
+    ├── app.js
+    └── styles.css
 ```
 
 ---
@@ -1046,75 +1040,7 @@ must be validated.
 
 ---
 
-## 29. Testing Strategy
-
-### Candle Builder Tests
-
-Test:
-
-```text
-first tick
-multiple ticks
-same-price ticks
-new minute
-missing tick
-out-of-order tick
-duplicate tick
-```
-
-### Reconciliation Tests
-
-Test:
-
-```text
-local == official
-local != official
-missing local tick
-delayed official candle
-API failure
-```
-
-### Strategy Tests
-
-Buy:
-
-```text
-Close(Cn-1) > Close(Cn-2)
-Close(Cn-1) == Close(Cn-2)
-Close(Cn-1) < Close(Cn-2)
-```
-
-Sell:
-
-```text
-Close(Cn-1) < Close(Cn-2)
-Close(Cn-1) == Close(Cn-2)
-Close(Cn-1) > Close(Cn-2)
-```
-
-Also test target/SL calculations.
-
-### Executor Tests
-
-Test:
-
-```text
-entry
-duplicate entry prevention
-entry pending
-entry rejection
-entry fill
-same-candle exit suppression
-next-candle exit
-exit pending
-exit rejection
-exit fill
-restart recovery
-```
-
----
-
-## 30. Live Validation
+## 29. Live Validation
 
 `MyStrategy_Buy` and `MyStrategy_Sell` should initially be treated as system-validation strategies.
 
@@ -1138,7 +1064,7 @@ The purpose is to validate the execution infrastructure independently of strateg
 
 ---
 
-## 31. Metrics Dashboard
+## 30. Metrics Dashboard
 
 Show:
 
@@ -1165,7 +1091,7 @@ WebSocket status
 
 ---
 
-## 32. Concurrency Model
+## 31. Concurrency Model
 
 Recommended conceptual separation:
 
@@ -1198,7 +1124,7 @@ Frontend broadcasting must not block trading logic.
 
 ---
 
-## 33. One Source of Truth Per Concern
+## 32. One Source of Truth Per Concern
 
 ```text
 Tick stream
@@ -1230,7 +1156,7 @@ The frontend must never participate in trading decisions.
 
 ---
 
-## 34. Complete Execution Flow
+## 33. Complete Execution Flow
 
 ```text
 START
@@ -1304,7 +1230,7 @@ candle           official candle
 
 ---
 
-## 35. Implementation Order
+## 34. Implementation Order
 
 ### Phase 1 — Data layer
 
@@ -1320,51 +1246,49 @@ candle           official candle
 7. Base strategy interface
 8. `MyStrategy_Buy`
 9. `MyStrategy_Sell`
-10. Strategy calculation tests
-11. Entry/exit decision tests
 
 ### Phase 3 — Execution layer
 
-12. `StrategyExecutor`
-13. Position state machine
-14. Order manager
-15. Entry/exit order handling
-16. Duplicate-order protection
-17. Same-candle exit suppression
-18. Recovery/reconciliation
+10. `StrategyExecutor`
+11. Position state machine
+12. Order manager
+13. Entry/exit order handling
+14. Duplicate-order protection
+15. Same-candle exit suppression
+16. Recovery/reconciliation
 
 ### Phase 4 — Monitoring
 
-19. FastAPI
-20. WebSocket manager
-21. HTML/JS candle chart
-22. Live candle updates
-23. Official candle replacement/reconciliation visualization
-24. Order/event feed
+17. FastAPI
+18. WebSocket manager
+19. HTML/JS candle chart
+20. Live candle updates
+21. Official candle replacement/reconciliation visualization
+22. Order/event feed
 
 ### Phase 5 — Reliability
 
-25. Structured logging
-26. Reconnection
-27. API failure handling
-28. Restart recovery
-29. Persistence
-30. Metrics/diagnostics
+23. Structured logging
+24. Reconnection
+25. API failure handling
+26. Restart recovery
+27. Persistence
+28. Metrics/diagnostics
 
 ### Phase 6 — Validation
 
-31. Run Buy strategy
-32. Run Sell strategy
-33. Compare local vs official candles
-34. Verify order lifecycle
-35. Verify frontend live state
-36. Stress-test delayed strategy processing
-37. Stress-test WebSocket reconnects
-38. Validate recovery after application restart
+29. Run Buy strategy
+30. Run Sell strategy
+31. Compare local vs official candles
+32. Verify order lifecycle
+33. Verify frontend live state
+34. Stress-test delayed strategy processing
+35. Stress-test WebSocket reconnects
+36. Validate recovery after application restart
 
 ---
 
-## 36. Final Architecture
+## 35. Final Architecture
 
 ```text
                   +---------------------+
