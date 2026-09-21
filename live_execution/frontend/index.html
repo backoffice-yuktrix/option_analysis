@@ -60,23 +60,19 @@ function buildPanel(s) {
     <div class="head"><h2>${s.name}</h2><span class="pill" id="${s.strategy_id}-status"></span>
       <span class="pill" id="${s.strategy_id}-pos"></span><span id="${s.strategy_id}-mode" class="pill"></span></div>
     <div class="err" id="${s.strategy_id}-err"></div>
-    <div class="grid">
-      <div class="chartbox"><h3>NIFTY 50 (signal) - 1 minute</h3><div class="chart" id="${s.strategy_id}-signal"></div></div>
-      <div class="chartbox"><h3 id="${s.strategy_id}-optname">Option (traded) - 1 minute</h3><div class="chart" id="${s.strategy_id}-option"></div></div>
-    </div>
+    <div class="chartbox"><h3 id="${s.strategy_id}-optname">NIFTY 50 - 1 minute (signal, stop loss and target are NIFTY levels)</h3><div class="chart" id="${s.strategy_id}-signal"></div></div>
     <div class="info" id="${s.strategy_id}-info"></div>
     <div class="events" id="${s.strategy_id}-events"></div>`;
   $("panels").appendChild(div);
   panels[s.strategy_id] = {
     signal: makeChart($(`${s.strategy_id}-signal`)),
-    option: makeChart($(`${s.strategy_id}-option`)),
-    lastBar: { signal: 0, option: 0 },
+    lastBar: { signal: 0 },
     reloadTimer: null,
   };
 }
 
 async function loadCandles(id) {
-  for (const series of ["signal", "option"]) {
+  for (const series of ["signal"]) {
     const d = await api(`/api/strategies/${id}/candles?series=${series}&limit=150`);
     panels[id][series].setData(d.candles.map(bar));
     panels[id].lastBar[series] = d.candles.length ? d.candles[d.candles.length - 1].time : 0;
@@ -90,14 +86,14 @@ function renderSnapshot(s) {
   $(`${id}-pos`).textContent = s.position_state;
   $(`${id}-mode`).textContent = s.mode.toUpperCase();
   $(`${id}-err`).textContent = s.error || "";
-  $(`${id}-optname`).textContent = `${s.instrument || "Option"} (traded) - 1 minute`;
   const p = s.position, m = s.metrics, sig = s.prices.signal, opt = s.prices.option;
   const rows = [
     ["Feed", s.feed_connected ? "CONNECTED" : "DISCONNECTED"],
     ["NIFTY", sig ? `${sig.price} (${sig.age_seconds}s ago)` : "-"],
-    ["Option", opt ? `${opt.price} (${opt.age_seconds}s ago)` : "-"],
-    ["Position", p ? `${p.side} ${p.quantity} @ ${p.entry_price}` : "none"],
-    ["SL / Target", p ? `${p.stop_loss} / ${p.target}` : "-"],
+    [`Option ${s.instrument || ""}`, opt ? `${opt.price} (${opt.age_seconds}s ago)` : "-"],
+    ["Position", p ? `${p.side} ${p.quantity} @ option ${p.entry_price}` : "none"],
+    ["NIFTY entry", p ? p.nifty_entry : "-"],
+    ["NIFTY SL / Target", p ? `${p.stop_loss} / ${p.target}` : "-"],
     ["Entries today / P&L", `${s.day.entries} / ${s.day.pnl}`],
     ["Ticks", m.ticks_received],
     ["Reconciled / corrected", `${m.candles_reconciled} / ${m.candle_mismatches}`],

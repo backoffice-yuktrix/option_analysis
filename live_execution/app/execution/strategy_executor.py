@@ -60,9 +60,7 @@ class StrategyExecutor:
         self.option_key = ""
         self.quantity = 0
         self.signal_builder = CandleBuilder(SIGNAL_KEY)
-        self.option_builder: CandleBuilder | None = None
         self.signal_store = CandleStore(settings.max_candles)
-        self.option_store = CandleStore(settings.max_candles)
 
         self.run_status = RunStatus.STARTING
         self.pos_state = PosState.NO_POSITION
@@ -143,6 +141,10 @@ class StrategyExecutor:
     def keys(self) -> list[str]:
         return [SIGNAL_KEY, self.option_key]
 
+    def _option_ltp(self) -> float:
+        latest = self.last_price.get(self.option_key)
+        return latest[0] if latest else 0.0
+
     def _current_minute(self) -> datetime | None:
         live = self.signal_builder.live
         return live["timestamp"] if live else None
@@ -154,7 +156,6 @@ class StrategyExecutor:
             )
             self.option_key = self.contract["instrument_key"]
             self.quantity = int(self.contract["lot_size"]) * self.spec.lots
-            self.option_builder = CandleBuilder(self.option_key)
             self._load_persisted()
             await self._verify_against_broker()
         except Exception as exc:
@@ -178,6 +179,11 @@ class StrategyExecutor:
             self._daily_pnl = float(saved.get("daily_pnl", 0.0))
         if saved.get("position"):
             position = Position.from_dict(saved["position"])
+            if position.nifty_entry is None:
+                raise RuntimeError(
+                    "Saved position was created by an older version with option-based levels. "
+                    "Close it manually at the broker and clear the strategy_state row before starting."
+                )
             if self.settings.live or position.opened_at[:10] == self._day:
                 self.position = position
                 self.pos_state = PosState.POSITION_OPEN
@@ -204,15 +210,10 @@ class StrategyExecutor:
             self._min_ts = start
             self._pending_from = start - 3 * MINUTE
             self._emit("historical_fetch_start")
-            for key, store in ((SIGNAL_KEY, self.signal_store), (self.option_key, self.option_store)):
-                for c in await self.client.recent_candles(key, self.settings.history_days):
-                    if c["timestamp"] < start:
-                        store.upsert(c, "official")
-            self._emit(
-                "historical_fetch_complete",
-                signal_candles=len(self.signal_store.tail(10_000)),
-                option_candles=len(self.option_store.tail(10_000)),
-            )
+            for c in await self.client.recent_candles(SIGNAL_KEY, self.settings.history_days):
+                if c["timestamp"] < start:
+                    self.signal_store.upsert(c, "official")
+            self._emit("historical_fetch_complete", signal_candles=len(self.signal_store.tail(10_000)))
         except Exception as exc:
             self._fail(f"history load failed: {type(exc).__name__}: {exc}")
 
@@ -259,54 +260,32 @@ class StrategyExecutor:
         self.last_price[tick.key] = (tick.price, time.monotonic())
         if self.run_status == RunStatus.SUBSCRIBING:
             self._set_status(RunStatus.WARMING_UP)
-        if self._min_ts is not None and tick.ts >= self._min_ts:
-            builder = self.signal_builder if is_signal else self.option_builder
-            for c in builder.on_tick(tick):
-                if is_signal:
-                    self._on_signal_minute_end(c, builder.live["timestamp"])
-                else:
-                    self.option_store.upsert(c, "local")
-                    self._emit("candle_finalized", series="option", candle=candle_json(c))
+        if is_signal and self._min_ts is not None and tick.ts >= self._min_ts:
+            for c in self.signal_builder.on_tick(tick):
+                self._on_signal_minute_end(c, self.signal_builder.live["timestamp"])
         self._dirty.set()
 
     def _on_signal_minute_end(self, finalized: dict, new_minute: datetime) -> None:
         self.signal_store.upsert(finalized, "local")
         self._emit("minute_transition", minute=new_minute.isoformat())
         self._emit("candle_finalized", series="signal", candle=candle_json(finalized))
-        if self.option_builder is not None:
-            for c in self.option_builder.roll_to(new_minute):
-                self.option_store.upsert(c, "local")
-                self._emit("candle_finalized", series="option", candle=candle_json(c))
         start = finalized["timestamp"]
         if self._pending_from is not None and self._pending_from < start:
             start = self._pending_from
         self._spawn(self._reconcile(start, new_minute))
 
     async def _reconcile(self, start: datetime, end: datetime) -> None:
+        self._emit("official_candle_request", start=start.isoformat(), end=end.isoformat())
         try:
-            self._emit("official_candle_request", start=start.isoformat(), end=end.isoformat())
-            results = await asyncio.gather(
-                self.reconciler.reconcile(
-                    strategy_id=self.spec.strategy_id, key=SIGNAL_KEY, store=self.signal_store, start=start,
-                    end=end, series="signal", require_all=True, emit=self._emit,
-                ),
-                self.reconciler.reconcile(
-                    strategy_id=self.spec.strategy_id, key=self.option_key, store=self.option_store, start=start,
-                    end=end, series="option", require_all=False, emit=self._emit,
-                ),
-                return_exceptions=True,
+            signal_result = await self.reconciler.reconcile(
+                strategy_id=self.spec.strategy_id, key=SIGNAL_KEY, store=self.signal_store, start=start,
+                end=end, series="signal", require_all=True, emit=self._emit,
             )
         except asyncio.CancelledError:
             raise
-        signal_result, option_result = results
-        if isinstance(signal_result, Exception):
-            self._emit("error", message=f"signal reconcile failed: {type(signal_result).__name__}: {signal_result}")
+        except Exception as exc:
+            self._emit("error", message=f"signal reconcile failed: {type(exc).__name__}: {exc}")
             return
-        if isinstance(option_result, Exception):
-            self._emit("error", message=f"option reconcile failed: {type(option_result).__name__}: {option_result}")
-        else:
-            self.metrics["candles_reconciled"] += len(option_result.reconciled)
-            self.metrics["candle_mismatches"] += option_result.corrected
         self.metrics["candles_reconciled"] += len(signal_result.reconciled)
         self.metrics["candle_mismatches"] += signal_result.corrected
         if signal_result.missing:
@@ -367,19 +346,19 @@ class StrategyExecutor:
         if mono - self._last_live_publish < LIVE_PUBLISH_INTERVAL:
             return
         self._last_live_publish = mono
-        for series, builder in (("signal", self.signal_builder), ("option", self.option_builder)):
-            if builder is not None and builder.live:
-                self.publish(
-                    {
-                        "type": "live_candle",
-                        "strategy_id": self.spec.strategy_id,
-                        "series": series,
-                        "candle": candle_json(builder.live),
-                        "last_tick_price": builder.live["last_tick_price"],
-                        "last_tick_timestamp": builder.live["last_tick_timestamp"],
-                        "market_version": builder.live["market_version"],
-                    }
-                )
+        live = self.signal_builder.live
+        if live:
+            self.publish(
+                {
+                    "type": "live_candle",
+                    "strategy_id": self.spec.strategy_id,
+                    "series": "signal",
+                    "candle": candle_json(live),
+                    "last_tick_price": live["last_tick_price"],
+                    "last_tick_timestamp": live["last_tick_timestamp"],
+                    "market_version": live["market_version"],
+                }
+            )
 
     def _data_health(self) -> str | None:
         if not self.feed_connected:
@@ -387,9 +366,6 @@ class StrategyExecutor:
         sig = self.last_price.get(SIGNAL_KEY)
         if sig is None or time.monotonic() - sig[1] > self.settings.max_signal_tick_age:
             return "NIFTY ticks are stale"
-        opt = self.last_price.get(self.option_key)
-        if opt is None or time.monotonic() - opt[1] > self.settings.max_option_tick_age:
-            return "option price is stale or missing"
         return None
 
     def _entry_block_reason(self, now: datetime) -> str | None:
@@ -415,12 +391,10 @@ class StrategyExecutor:
             return
         self._last_block_reason = None
 
-        option_price = self.last_price[self.option_key][0]
         decision = self.strategy.evaluate_entry(
             self.signal_store.frame().pipe(self.strategy.calculate),
             self.signal_builder.live,
-            self.option_store.frame().pipe(self.strategy.calculate),
-            option_price,
+            self.last_price[SIGNAL_KEY][0],
         )
         self._entry_attempt_minute = minute
         if decision is None:
@@ -443,7 +417,7 @@ class StrategyExecutor:
             result = await self.orders.place_market(
                 strategy_id=self.spec.strategy_id, instrument_key=self.option_key,
                 instrument_name=self.contract.get("trading_symbol", self.option_key), side=side,
-                quantity=self.quantity, reason="ENTRY", ref_price=decision["reference_price"],
+                quantity=self.quantity, reason="ENTRY", ref_price=self._option_ltp(),
                 stop_loss=decision["stop_loss"], target=decision["target"], emit=self._emit,
             )
         except OrderError as exc:
@@ -458,27 +432,25 @@ class StrategyExecutor:
             return
 
         self.metrics["orders_filled"] += 1
-        entry_price = float(result.average_price or decision["reference_price"])
-        target = self.strategy.levels(entry_price, decision["stop_loss"])
+        entry_price = float(result.average_price or self._option_ltp())
         self.position = Position(
             side=self.strategy.side, quantity=result.filled_quantity, entry_price=entry_price,
-            stop_loss=decision["stop_loss"], target=target, entry_minute=minute.isoformat(),
+            stop_loss=decision["stop_loss"], target=decision["target"], entry_minute=minute.isoformat(),
             entry_order_id=result.order_id, opened_at=datetime.now(IST).isoformat(),
+            nifty_entry=decision["reference_price"],
         )
         self._exit_failures = 0
-        if target is None:
-            self._forced_exit_reason = "INVALID_LEVELS_AFTER_FILL"
-            self._emit("entry_invalid_after_fill", entry_price=entry_price, stop_loss=decision["stop_loss"])
         self._set_pos(PosState.POSITION_OPEN)
         self._set_status(RunStatus.RUNNING)
         self._emit(
-            "position_opened", side=self.strategy.side, entry_price=entry_price, stop_loss=decision["stop_loss"],
-            target=target, skip_exit_for_current_candle=True,
+            "position_opened", side=self.strategy.side, option_entry_price=entry_price,
+            nifty_entry=decision["reference_price"], nifty_stop_loss=decision["stop_loss"],
+            nifty_target=decision["target"], skip_exit_for_current_candle=True,
         )
 
     async def _process_exit(self, now: datetime) -> None:
         pos = self.position
-        latest = self.last_price.get(self.option_key)
+        latest = self.last_price.get(SIGNAL_KEY)
         if pos is None or latest is None or time.monotonic() < self._next_exit_retry:
             return
         price = latest[0]
@@ -511,7 +483,7 @@ class StrategyExecutor:
             result = await self.orders.place_market(
                 strategy_id=self.spec.strategy_id, instrument_key=self.option_key,
                 instrument_name=self.contract.get("trading_symbol", self.option_key), side=side,
-                quantity=pos.quantity, reason=reason, ref_price=ref_price, stop_loss=pos.stop_loss,
+                quantity=pos.quantity, reason=reason, ref_price=self._option_ltp(), stop_loss=pos.stop_loss,
                 target=pos.target, emit=self._emit,
             )
         except OrderError as exc:
@@ -531,7 +503,7 @@ class StrategyExecutor:
             self._fail(f"exit order failed {self._exit_failures} times; position is still open, act manually")
 
     def _close_trade(self, pos: Position, result: OrderResult, reason: str) -> None:
-        exit_price = float(result.average_price or self.last_price[self.option_key][0])
+        exit_price = float(result.average_price or self._option_ltp())
         closed = min(result.filled_quantity, pos.quantity)
         sign = 1 if pos.side == "LONG" else -1
         pnl = round((exit_price - pos.entry_price) * closed * sign, 2)
@@ -585,7 +557,8 @@ class StrategyExecutor:
         }
 
     def candles(self, series: str, limit: int) -> dict:
-        store = self.signal_store if series == "signal" else self.option_store
-        builder = self.signal_builder if series == "signal" else self.option_builder
-        live = candle_json(builder.live) if builder is not None and builder.live else None
-        return {"candles": [candle_json(c) for c in store.tail(limit)], "live": live}
+        live = self.signal_builder.live
+        return {
+            "candles": [candle_json(c) for c in self.signal_store.tail(limit)],
+            "live": candle_json(live) if live else None,
+        }

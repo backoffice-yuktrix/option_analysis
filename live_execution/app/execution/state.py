@@ -36,6 +36,7 @@ class Position:
     entry_minute: str
     entry_order_id: str
     opened_at: str
+    nifty_entry: float | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)

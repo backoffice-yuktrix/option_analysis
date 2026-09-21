@@ -39,7 +39,6 @@ class Settings:
     reconcile_retries: int = 8
     reconcile_retry_delay: float = 1.5
     max_signal_tick_age: float = 5.0
-    max_option_tick_age: float = 60.0
     entry_start: time = time(9, 20)
     entry_end: time = time(15, 10)
     squareoff: time = time(15, 10)

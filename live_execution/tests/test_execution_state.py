@@ -6,7 +6,6 @@ from app.config import IST, SIGNAL_KEY, STRATEGY_SPECS, Settings
 from app.execution.order_manager import OrderResult
 from app.execution.state import PosState, RunStatus
 from app.execution.strategy_executor import StrategyExecutor
-from app.market_data.candle_builder import CandleBuilder
 from app.strategies.my_strategy_buy import MyStrategyBuy
 
 OPTION_KEY = "NSE_FO|1"
@@ -46,23 +45,27 @@ def make_executor(orders=None, settings=None):
     ex.option_key = OPTION_KEY
     ex.quantity = 65
     ex.contract = {"trading_symbol": "NIFTY TEST"}
-    ex.option_builder = CandleBuilder(OPTION_KEY)
     ex.run_status = RunStatus.RUNNING
     ex.feed_connected = True
-    for m, close in ((15, 100.0), (16, 101.0)):
-        ex.signal_store.upsert(
-            {"timestamp": t(10, m), "open": close, "high": close, "low": close, "close": close, "volume": 0},
-            "official",
-        )
-    ex.option_store.upsert(
-        {"timestamp": t(10, 15), "open": 9, "high": 11, "low": 8.0, "close": 10, "volume": 5}, "official"
+    ex.signal_store.upsert(
+        {"timestamp": t(10, 15), "open": 23400, "high": 23410, "low": 23390.0, "close": 23400.0, "volume": 0},
+        "official",
     )
-    ex.signal_builder.live = {"timestamp": t(10, 17), "last_tick_price": 101.0, "open": 101, "high": 101,
-                              "low": 101, "close": 101, "volume": 0, "last_tick_timestamp": "", "market_version": 1}
+    ex.signal_store.upsert(
+        {"timestamp": t(10, 16), "open": 23400, "high": 23420, "low": 23395, "close": 23410.0, "volume": 0},
+        "official",
+    )
+    ex.signal_builder.live = {"timestamp": t(10, 17), "last_tick_price": 23415.0, "open": 23410, "high": 23415,
+                              "low": 23410, "close": 23415, "volume": 0, "last_tick_timestamp": "",
+                              "market_version": 1}
     ex._ready_minute = t(10, 17)
     mono = time.monotonic()
-    ex.last_price = {SIGNAL_KEY: (101.0, mono), OPTION_KEY: (10.0, mono)}
+    ex.last_price = {SIGNAL_KEY: (23415.0, mono), OPTION_KEY: (10.0, mono)}
     return ex
+
+
+def set_nifty(ex, price):
+    ex.last_price[SIGNAL_KEY] = (price, time.monotonic())
 
 
 def run(coro):
@@ -81,7 +84,8 @@ def test_entry_places_one_order_and_opens_position():
     assert len(orders.calls) == 1
     assert orders.calls[0]["side"] == "BUY" and orders.calls[0]["quantity"] == 65
     assert ex.pos_state == PosState.POSITION_OPEN
-    assert ex.position.stop_loss == 8.0 and ex.position.target == 14.0
+    assert ex.position.stop_loss == 23390.0 and ex.position.target == 23415.0 + 2 * 25.0
+    assert ex.position.nifty_entry == 23415.0 and ex.position.entry_price == 10.0
 
 
 def test_entry_rejection_returns_to_no_position():
@@ -121,7 +125,7 @@ def test_same_candle_exit_suppressed_then_exit_next_candle():
         orders = FakeOrders()
         ex = make_executor(orders)
         await ex._process_entry(t(10, 17, 5))
-        ex.last_price[OPTION_KEY] = (7.0, time.monotonic())
+        set_nifty(ex, 23380.0)
         await ex._process_exit(t(10, 17, 20))
         same_candle_calls = len(orders.calls)
         ex.signal_builder.live["timestamp"] = t(10, 18)
@@ -132,7 +136,7 @@ def test_same_candle_exit_suppressed_then_exit_next_candle():
     assert same_candle_calls == 1
     assert len(orders.calls) == 2 and orders.calls[1]["side"] == "SELL"
     assert ex.pos_state == PosState.NO_POSITION
-    assert ex.db.trades[0]["exit_reason"] == "STOP_LOSS" and ex.db.trades[0]["pnl"] < 0
+    assert ex.db.trades[0]["exit_reason"] == "STOP_LOSS"
 
 
 def test_no_immediate_reentry_after_exit():
@@ -141,7 +145,7 @@ def test_no_immediate_reentry_after_exit():
         ex = make_executor(orders)
         await ex._process_entry(t(10, 17, 5))
         ex.signal_builder.live["timestamp"] = t(10, 18)
-        ex.last_price[OPTION_KEY] = (14.5, time.monotonic())
+        set_nifty(ex, 23470.0)
         await ex._process_exit(t(10, 18, 2))
         ex._ready_minute = t(10, 18)
         await ex._process_entry(t(10, 18, 3))
