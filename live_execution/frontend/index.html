@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Live Execution</title>
+<script src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
+<style>
+  :root { --bg:#0f1218; --card:#181d27; --line:#2a3242; --text:#e6e9ef; --dim:#8b95a8; --up:#26a69a; --down:#ef5350; --warn:#f5a524; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:14px/1.4 system-ui, sans-serif; padding:16px; }
+  h1 { font-size:18px; margin:0 0 12px; }
+  #bar { color:var(--dim); margin-bottom:16px; }
+  .panel { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:14px; margin-bottom:20px; }
+  .head { display:flex; flex-wrap:wrap; gap:16px; align-items:baseline; margin-bottom:8px; }
+  .head h2 { margin:0; font-size:16px; }
+  .pill { padding:2px 8px; border-radius:10px; background:#2a3242; font-size:12px; }
+  .pill.RUNNING { background:#1c5c4f; } .pill.ERROR { background:#7a2b2b; }
+  .pill.RECONNECTING, .pill.RECONCILING, .pill.ORDER_PENDING, .pill.WARMING_UP { background:#7a5a1c; }
+  .grid { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+  .chartbox h3 { margin:4px 0; font-size:12px; color:var(--dim); font-weight:500; }
+  .chart { height:230px; }
+  .info { display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); gap:4px 16px; margin:10px 0; color:var(--dim); }
+  .info b { color:var(--text); font-weight:500; }
+  .events { height:190px; overflow:auto; background:#11151d; border:1px solid var(--line); border-radius:6px; padding:6px 8px; font:12px/1.5 ui-monospace, Consolas, monospace; }
+  .ev { white-space:pre-wrap; } .ev.error, .ev.order_rejected, .ev.entry_rejected { color:var(--down); }
+  .ev.order_filled, .ev.position_opened, .ev.trade_closed { color:var(--up); }
+  .ev.candle_corrected { color:var(--warn); }
+  .err { color:var(--down); margin:6px 0; }
+  @media (max-width:800px) { .grid { grid-template-columns:1fr; } }
+</style>
+</head>
+<body>
+<h1>Live Execution</h1>
+<div id="bar">connecting...</div>
+<div id="panels"></div>
+<script>
+const OFFSET = 19800;
+const panels = {};
+const $ = (id) => document.getElementById(id);
+
+async function api(path) { const r = await fetch(path); return r.json(); }
+const bar = (c) => ({ time: c.time + OFFSET, open: c.open, high: c.high, low: c.low, close: c.close });
+const hhmmss = (iso) => iso ? iso.slice(11, 19) : "";
+
+function makeChart(el) {
+  const chart = LightweightCharts.createChart(el, {
+    layout: { background: { color: "#181d27" }, textColor: "#8b95a8" },
+    grid: { vertLines: { color: "#232a38" }, horzLines: { color: "#232a38" } },
+    timeScale: { timeVisible: true, secondsVisible: false },
+    autoSize: true,
+  });
+  return chart.addCandlestickSeries({ upColor: "#26a69a", downColor: "#ef5350", wickUpColor: "#26a69a", wickDownColor: "#ef5350", borderVisible: false });
+}
+
+function buildPanel(s) {
+  const div = document.createElement("div");
+  div.className = "panel";
+  div.innerHTML = `
+    <div class="head"><h2>${s.name}</h2><span class="pill" id="${s.strategy_id}-status"></span>
+      <span class="pill" id="${s.strategy_id}-pos"></span><span id="${s.strategy_id}-mode" class="pill"></span></div>
+    <div class="err" id="${s.strategy_id}-err"></div>
+    <div class="grid">
+      <div class="chartbox"><h3>NIFTY 50 (signal) - 1 minute</h3><div class="chart" id="${s.strategy_id}-signal"></div></div>
+      <div class="chartbox"><h3 id="${s.strategy_id}-optname">Option (traded) - 1 minute</h3><div class="chart" id="${s.strategy_id}-option"></div></div>
+    </div>
+    <div class="info" id="${s.strategy_id}-info"></div>
+    <div class="events" id="${s.strategy_id}-events"></div>`;
+  $("panels").appendChild(div);
+  panels[s.strategy_id] = {
+    signal: makeChart($(`${s.strategy_id}-signal`)),
+    option: makeChart($(`${s.strategy_id}-option`)),
+    lastBar: { signal: 0, option: 0 },
+    reloadTimer: null,
+  };
+}
+
+async function loadCandles(id) {
+  for (const series of ["signal", "option"]) {
+    const d = await api(`/api/strategies/${id}/candles?series=${series}&limit=150`);
+    panels[id][series].setData(d.candles.map(bar));
+    panels[id].lastBar[series] = d.candles.length ? d.candles[d.candles.length - 1].time : 0;
+    if (d.live && d.live.time > panels[id].lastBar[series]) panels[id][series].update(bar(d.live));
+  }
+}
+
+function renderSnapshot(s) {
+  const id = s.strategy_id;
+  $(`${id}-status`).textContent = s.status; $(`${id}-status`).className = "pill " + s.status;
+  $(`${id}-pos`).textContent = s.position_state;
+  $(`${id}-mode`).textContent = s.mode.toUpperCase();
+  $(`${id}-err`).textContent = s.error || "";
+  $(`${id}-optname`).textContent = `${s.instrument || "Option"} (traded) - 1 minute`;
+  const p = s.position, m = s.metrics, sig = s.prices.signal, opt = s.prices.option;
+  const rows = [
+    ["Feed", s.feed_connected ? "CONNECTED" : "DISCONNECTED"],
+    ["NIFTY", sig ? `${sig.price} (${sig.age_seconds}s ago)` : "-"],
+    ["Option", opt ? `${opt.price} (${opt.age_seconds}s ago)` : "-"],
+    ["Position", p ? `${p.side} ${p.quantity} @ ${p.entry_price}` : "none"],
+    ["SL / Target", p ? `${p.stop_loss} / ${p.target}` : "-"],
+    ["Entries today / P&L", `${s.day.entries} / ${s.day.pnl}`],
+    ["Ticks", m.ticks_received],
+    ["Reconciled / corrected", `${m.candles_reconciled} / ${m.candle_mismatches}`],
+    ["Signals (entry/exit)", `${m.entry_signals} / ${m.exit_signals}`],
+    ["Orders (sent/filled/rejected)", `${m.orders_submitted} / ${m.orders_filled} / ${m.orders_rejected}`],
+    ["Processing / order latency", `${m.last_processing_ms} ms / ${m.last_order_ms} ms`],
+    ["Official candle ready for", hhmmss(s.ready_minute)],
+  ];
+  $(`${id}-info`).innerHTML = rows.map(([k, v]) => `<div>${k}: <b>${v}</b></div>`).join("");
+}
+
+function addEvent(e) {
+  const box = $(`${e.strategy_id}-events`);
+  if (!box) return;
+  const { type, strategy_id, timestamp, ...rest } = e;
+  let label = type;
+  if (type === "candle_reconciled" && rest.corrected) label = "candle_corrected";
+  const detail = ["candle_finalized", "candle_reconciled"].includes(type)
+    ? `${rest.series} ${hhmmss(rest.minute || (rest.candle && rest.candle.timestamp))} ${rest.corrected ? JSON.stringify(rest.difference) : ""}`
+    : JSON.stringify(rest);
+  const line = document.createElement("div");
+  line.className = "ev " + label;
+  line.textContent = `${hhmmss(timestamp)}  ${label.toUpperCase()}  ${detail}`;
+  box.appendChild(line);
+  while (box.childNodes.length > 300) box.removeChild(box.firstChild);
+  box.scrollTop = box.scrollHeight;
+}
+
+function onMessage(e) {
+  if (e.type === "connection_status") { $("bar").textContent = `mode: ${e.health.mode} | feed: ${e.health.feed_connected ? "connected" : "disconnected"}` + (e.health.startup_error ? ` | ${e.health.startup_error}` : ""); return; }
+  const p = panels[e.strategy_id];
+  if (!p) return;
+  if (e.type === "live_candle") {
+    if (e.candle.time >= p.lastBar[e.series]) { p[e.series].update(bar(e.candle)); p.lastBar[e.series] = e.candle.time; }
+    return;
+  }
+  addEvent(e);
+  if (e.type === "candle_reconciled") {
+    clearTimeout(p.reloadTimer);
+    p.reloadTimer = setTimeout(() => loadCandles(e.strategy_id), 500);
+  }
+}
+
+function connect() {
+  const ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws`);
+  ws.onmessage = (m) => onMessage(JSON.parse(m.data));
+  ws.onclose = () => { $("bar").textContent = "disconnected, retrying..."; setTimeout(connect, 2000); };
+}
+
+async function init() {
+  const list = await api("/api/strategies");
+  if (!list.length) { $("bar").textContent = "no strategies running: " + JSON.stringify(await api("/api/health")); }
+  for (const s of list) {
+    buildPanel(s); renderSnapshot(s);
+    const state = await api(`/api/strategies/${s.strategy_id}/state`);
+    state.recent_events.forEach(addEvent);
+    loadCandles(s.strategy_id);
+  }
+  connect();
+  setInterval(async () => { for (const s of await api("/api/strategies")) renderSnapshot(s); }, 2000);
+}
+init();
+</script>
+</body>
+</html>
