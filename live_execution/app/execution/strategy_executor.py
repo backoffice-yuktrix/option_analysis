@@ -196,7 +196,8 @@ class StrategyExecutor:
         net = sum(int(p.get("quantity") or 0) for p in positions if p.get("instrument_token") == self.option_key)
         expected = 0
         if self.position is not None:
-            expected = self.position.quantity if self.position.side == "LONG" else -self.position.quantity
+            held = self.position.quantity
+            expected = held if self.strategy.entry_order_side == "BUY" else -held
         if net != expected:
             raise RuntimeError(
                 f"Broker holds net {net} of {self.contract.get('trading_symbol')} but local state expects {expected}. "
@@ -408,7 +409,7 @@ class StrategyExecutor:
 
     async def _place_entry(self, decision: dict, minute: datetime) -> None:
         self._set_pos(PosState.ENTRY_TRIGGERED)
-        side = "BUY" if self.strategy.side == "LONG" else "SELL"
+        side = self.strategy.entry_order_side
         self._set_pos(PosState.ENTRY_ORDER_PENDING)
         self._set_status(RunStatus.ORDER_PENDING)
         self._entries_today += 1
@@ -477,7 +478,7 @@ class StrategyExecutor:
         self._set_pos(PosState.EXIT_TRIGGERED)
         self._set_pos(PosState.EXIT_ORDER_PENDING)
         self._set_status(RunStatus.ORDER_PENDING)
-        side = "SELL" if pos.side == "LONG" else "BUY"
+        side = "SELL" if self.strategy.entry_order_side == "BUY" else "BUY"
         self.metrics["orders_submitted"] += 1
         try:
             result = await self.orders.place_market(
@@ -505,7 +506,7 @@ class StrategyExecutor:
     def _close_trade(self, pos: Position, result: OrderResult, reason: str) -> None:
         exit_price = float(result.average_price or self._option_ltp())
         closed = min(result.filled_quantity, pos.quantity)
-        sign = 1 if pos.side == "LONG" else -1
+        sign = 1 if self.strategy.entry_order_side == "BUY" else -1
         pnl = round((exit_price - pos.entry_price) * closed * sign, 2)
         self._daily_pnl += pnl
         self.db.insert_trade(

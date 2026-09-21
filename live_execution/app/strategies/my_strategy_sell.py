@@ -6,6 +6,7 @@ from app.strategies.base_strategy import BaseStrategy
 class MyStrategySell(BaseStrategy):
     name = "MyStrategy_Sell"
     side = "SHORT"
+    stop_field = "high"
 
     @classmethod
     def signal(cls, close_prev: float, close_prev2: float) -> bool:
@@ -16,5 +17,4 @@ class MyStrategySell(BaseStrategy):
         risk = stop_loss - entry_price
         if risk <= 0:
             return None
-        target = round(entry_price - 2 * risk, 2)
-        return target if target > 0 else None
+        return round(entry_price - 2 * risk, 2)

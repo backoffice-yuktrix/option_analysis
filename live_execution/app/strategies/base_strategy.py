@@ -17,6 +17,8 @@ class BaseStrategy:
 
     name = ""
     side = ""
+    entry_order_side = "BUY"
+    stop_field = "low"
 
     @staticmethod
     def calculate(candle_df: pd.DataFrame) -> pd.DataFrame:
@@ -42,7 +44,7 @@ class BaseStrategy:
         if not cls.signal(float(c1["close"]), float(c2["close"])):
             return None
 
-        stop = float(c2["low"])
+        stop = float(c2[cls.stop_field])
         decision = {
             "confirmed": False,
             "side": cls.side,
