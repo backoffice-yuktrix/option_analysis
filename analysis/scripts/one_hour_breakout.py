@@ -21,7 +21,7 @@ STRATEGY PROMPT (verbatim summary of steps)
 
 RUN.md STEP 1 CHECKLIST
   1 Underlying         clear    NIFTY 50 index (spot signals)
-  2 Window             assumed  prompt gives none -> last 6 months ending yesterday (--from/--to)
+  2 Window             assumed  prompt gives none -> 2026-01-01 through current IST date (--from/--to)
   3 Signal timeframe   clear    1m, 3m, 5m, 15m (each a standalone strategy; built from 1m, anchored 09:15)
   4 Signal rule        clear    numbers/definitions given (first hour 09:15-10:14, close beyond hi/lo, 10:15-14:00)
   5 Decision time      clear    the trigger candle's completion; act in the next 1m bar (rule 2)
@@ -40,7 +40,7 @@ RUN.md STEP 1 CHECKLIST
   17 Script name       one_hour_breakout
 
 ASSUMED (also in meta["limits"])
-  A1  Window: last 6 months ending yesterday.
+  A1  Window: 2026-01-01 through the current IST date.
   A2  Strike = ATM (nearest strike step, step read from the live Upstox chain) at the TRIGGER candle's close.
   A3  Expiry = nearest at least 1 day after the trade day (rule 10); lots = 1; qty from the contract lot size.
   A4  "Stop scanning at 14:00": the trigger candle must be COMPLETE by 14:00 (its entry bar is then <= 14:00).
@@ -325,7 +325,7 @@ async def run(frm: date, to: date) -> None:
             "One trade per day per variant (timeframe x R x stop reading); each timeframe is a standalone strategy.",
         ],
         "limits": [
-            "ASSUMED: window = last 6 months ending yesterday.",
+            "ASSUMED: window = 2026-01-01 through the current IST date.",
             "ASSUMED: strike = ATM at the trigger candle's close (strike step from the live Upstox chain); expiry >= 1 day after the trade day; 1 lot.",
             "ASSUMED: 'stop scanning at 14:00' = trigger candle complete by 14:00.",
             "ASSUMED: stop/target/first-hour levels are SPOT levels; the option is always bought (LONG); they are not option prices.",
@@ -357,8 +357,8 @@ async def run(frm: date, to: date) -> None:
 def main() -> None:
     d_from, d_to = default_window()
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--from", dest="frm", default=d_from.isoformat(), help="YYYY-MM-DD (default: 6 months ago)")
-    ap.add_argument("--to", dest="to", default=d_to.isoformat(), help="YYYY-MM-DD (default: yesterday)")
+    ap.add_argument("--from", dest="frm", default=START_DATE.isoformat(), help="YYYY-MM-DD (default: 2026-01-01)")
+    ap.add_argument("--to", dest="to", default=END_DATE.isoformat(), help="YYYY-MM-DD (default: current IST date)")
     a = ap.parse_args()
     asyncio.run(run(date.fromisoformat(a.frm), date.fromisoformat(a.to)))
 

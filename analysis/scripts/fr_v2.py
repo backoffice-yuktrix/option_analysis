@@ -23,7 +23,7 @@ STRATEGY PROMPT (verbatim summary of 13_fr_v2.txt)
 
 CHECKLIST (RUN.md Step 1)
     1 Underlying ........ ASSUMED  NIFTY 50 index (prompt says "points", never names it).
-    2 Window ............ ASSUMED  default = last 6 months ending yesterday (--from / --to override).
+    2 Window ............ ASSUMED  default = 2026-01-01 through the current IST date (--from / --to override).
     3 Signal timeframe .. clear    1m, 3m, 5m built from 1m (variant tf). 15m/60m/1d are not run: prompt says
                                    they give a handful / no legs.
     4 Signal rule ....... clear    steps 1-14 above; every number given (7, 0.618, 0.786, 5 pts, 1 pt, 15:15).
@@ -75,6 +75,44 @@ RRS = [2, 3, 4]
 MODES = ["retest", "touch"]
 SESSION_ROWS = 375
 
+# The axes the source (fib_retracement_v1) compares and this script fixed at one point.
+# All four re-read bars already fetched.
+ENTRY_EDGES = [("near", "the 0.618 level - the near edge, reached first"),
+               ("far", "the 0.786 level - the far edge of the zone")]
+LEG_MODES = [("all", "every leg stays live until it is entered or the session ends"),
+             ("newest", "only the newest confirmed leg is live; a newer one supersedes it")]
+TRADE_MODES = [("flow", "one position at a time, re-entering whenever a leg arms"),
+               ("session", "the first placeable entry of the day, then the day is done")]
+EOD_MODES = [("close", "square off at the session close time"),
+             ("hold", "run to stop or target, give up at the last candle")]
+RULE = {"edge": "near", "leg_mode": "all", "trade_mode": "flow", "eod": "close"}
+
+# What a DEFAULT run ships.  Every axis stays present, two of them are trimmed: the full
+# cartesian is 288 combinations, and on this rule that is ~62k trades for v1 and ~189k for v2,
+# which is a 119 MB report and an 11-hour run.  1-minute alone is 68% of all rows, so it is the
+# one worth leaving out by default.  The full set is always one flag away.
+DEFAULT_TF = "3m,5m"          # full: --tf 1m,3m,5m
+DEFAULT_RR = "1:2,1:3"        # full: --rr 1:2,1:3,1:4
+NEVER = "99:99"            # a force-exit key later than any bar: "hold" runs to the end
+
+SETTINGS = [
+    setting("tf", "Signal timeframe", kind="other", values=[f"{t}m" for t in TFS], default="3m"),
+    setting("entry", "Entry confirmation", kind="entry", values=MODES, default="retest"),
+    setting("rr", "Reward:risk", kind="exit", values=[f"1:{r}" for r in RRS], default="1:2"),
+    setting("edge", "Entry edge", kind="entry", default=RULE["edge"],
+            options=[{"value": k, "label": v, "raw": k} for k, v in ENTRY_EDGES]),
+    setting("leg_mode", "Live legs", kind="entry", default=RULE["leg_mode"],
+            options=[{"value": k, "label": v, "raw": k} for k, v in LEG_MODES]),
+    setting("trade_mode", "Position rule", kind="sizing", default=RULE["trade_mode"],
+            options=[{"value": k, "label": v, "raw": k} for k, v in TRADE_MODES]),
+    setting("eod", "End of day", kind="exit", default=RULE["eod"],
+            options=[{"value": k, "label": v, "raw": k} for k, v in EOD_MODES]),
+]
+
+
+def _vals(key):
+    return [o["raw"] for o in next(x for x in SETTINGS if x["key"] == key)["options"]]
+
 
 # ---------------------------------------------------------------------------
 # signal (pure, completed candles only)
@@ -92,7 +130,7 @@ def pivots(c: list[list], n: int = PIVOT) -> list[tuple[int, str]]:
     return out
 
 
-def make_legs(c: list[list], n: int = PIVOT) -> dict[int, list[dict]]:
+def make_legs(c: list[list], n: int = PIVOT, edge: str = "near") -> dict[int, list[dict]]:
     """{candle index i at which a leg becomes drawable (= j+n, the confirming candle's close): [leg, ...]}."""
     piv = pivots(c, n)
     hi, lo = [x[2] for x in c], [x[3] for x in c]
@@ -109,7 +147,8 @@ def make_legs(c: list[list], n: int = PIVOT) -> dict[int, list[dict]]:
                 continue
             near, far = top - NEAR * leg, top - FAR * leg
             stop = far - STOP_PAD
-            risk = near - stop
+            entry_level = near if edge == "near" else far
+            risk = entry_level - stop
             dead = any(c[m][4] < far for m in range(j + 1, j + n + 1))
             d = "LONG"
         else:                                 # down leg: swing high -> swing low, SHORT on the bounce
@@ -123,14 +162,16 @@ def make_legs(c: list[list], n: int = PIVOT) -> dict[int, list[dict]]:
                 continue
             near, far = bot + NEAR * leg, bot + FAR * leg
             stop = far + STOP_PAD
-            risk = stop - near
+            entry_level = near if edge == "near" else far
+            risk = stop - entry_level
             dead = any(c[m][4] > far for m in range(j + 1, j + n + 1))
             d = "SHORT"
         if dead or risk < MIN_RISK:
             continue
         i = j + n
         legs.setdefault(i, []).append({
-            "dir": d, "near": near, "far": far, "stop": stop, "risk": risk, "top": top, "bot": bot,
+            "dir": d, "near": near, "far": far, "entry_level": entry_level, "stop": stop,
+            "risk": risk, "top": top, "bot": bot,
             "created": i, "state": "waiting", "from_t": c[min(j, k)][0], "leg": leg})
     return legs
 
@@ -139,8 +180,9 @@ def step_leg(lg: dict, cd: list, mode: str) -> str | None:
     """Advance one leg over one COMPLETED candle. Returns 'enter', 'dead' or None."""
     _, o, h, l, cl = cd
     long = lg["dir"] == "LONG"
-    reach = l <= lg["near"] if long else h >= lg["near"]
-    back = cl > lg["near"] if long else cl < lg["near"]
+    lvl = lg.get("entry_level", lg["near"])
+    reach = l <= lvl if long else h >= lvl
+    back = cl > lvl if long else cl < lvl
     dead = cl < lg["far"] if long else cl > lg["far"]
     st = lg["state"]
     if mode == "touch" or st == "rejected":
@@ -159,11 +201,12 @@ def step_leg(lg: dict, cd: list, mode: str) -> str | None:
 # simulate (bars -> trades); option data arrives through the injected async get_opt
 # ---------------------------------------------------------------------------
 async def simulate_day(day: str, rows1: list[list], tf: int, mode: str, rr: int,
-                       get_opt, skips: list[str]) -> list[dict]:
+                       get_opt, skips: list[str], edge: str = "near", leg_mode: str = "all",
+                       trade_mode: str = "flow", eod: str = "close") -> list[dict]:
     """One book (one position at a time) for one day, one (tf, mode, rr).
     get_opt(day, direction, spot) -> (contract, option_rows_1m) or a reason string."""
     c = resample(rows1, tf)
-    legs_by_i = make_legs(c)
+    legs_by_i = make_legs(c, PIVOT, edge)
     live: list[dict] = []
     trades: list[dict] = []
     last_exit = ""
@@ -200,7 +243,8 @@ async def simulate_day(day: str, rows1: list[list], tf: int, mode: str, rr: int,
             continue
         long = lg["dir"] == "LONG"
         target = lg["near"] + rr * lg["risk"] if long else lg["near"] - rr * lg["risk"]
-        ex = scan_exit(rows1, lg["dir"], entry_key, stop=lg["stop"], target=target, force_key=FORCE)
+        ex = scan_exit(rows1, lg["dir"], entry_key, stop=lg["stop"], target=target,
+                       force_key=FORCE if eod == "close" else NEVER)
         if ex["bar"] is None:
             skips.append(f"{tag}: no exit bar found ({ex['reason']}) - no trade")
             continue
@@ -226,7 +270,8 @@ async def simulate_day(day: str, rows1: list[list], tf: int, mode: str, rr: int,
             exit_time=xkey, exit_px=exit_px, qty=qty, exit_reason=ex["reason"], kind="option",
             capital=entry_px * qty, mfe=mfe, mae=mae, expiry=contract["expiry"],
             option_type=contract["option_type"],
-            variant={"tf": f"{tf}m", "rr": f"1:{rr}", "entry": mode},
+            variant={"tf": f"{tf}m", "rr": f"1:{rr}", "entry": mode, "edge": edge,
+                     "leg_mode": leg_mode, "trade_mode": trade_mode, "eod": eod},
             tags={"direction": "up leg (buy CE)" if long else "down leg (buy PE)"},
             levels=lv,
             note=f"{lg['dir']} leg {lg['bot']:.1f}-{lg['top']:.1f}; index risk {lg['risk']:.1f} pts"))
@@ -314,10 +359,16 @@ async def run(frm: date, to: date) -> None:
 
         for n, (day, rows) in enumerate(good.items(), 1):
             before = len(trades)
-            for tf in TFS:
-                for mode in MODES:
-                    for rr in RRS:
-                        trades += await simulate_day(day, rows, tf, mode, rr, get_opt, skips)
+            for tf in [int(v[:-1]) for v in _vals("tf")]:
+                for mode in _vals("entry"):
+                    for rr in [int(v.split(":")[1]) for v in _vals("rr")]:
+                        for edge in _vals("edge"):
+                            for lm in _vals("leg_mode"):
+                                for tm in _vals("trade_mode"):
+                                    for eod in _vals("eod"):
+                                        trades += await simulate_day(
+                                            day, rows, tf, mode, rr, get_opt, skips,
+                                            edge, lm, tm, eod)
             print(f"[{n}/{len(good)}] {day}: {len(trades) - before} trades across all variants")
 
     for s in skips:
@@ -364,7 +415,8 @@ async def run(frm: date, to: date) -> None:
         ],
         "coverage": cov,
     }
-    payload = build_payload(meta, trades, good, opt_sessions, [])
+    payload = build_payload(meta, trades, good, opt_sessions, [],
+                            settings=SETTINGS, chart="default")
     path = write_report(payload, "fr_v2")
     print(console_summary(trades))
     print(path)
@@ -373,11 +425,21 @@ async def run(frm: date, to: date) -> None:
 def main() -> None:
     today = datetime.now(IST).date()
     ap = argparse.ArgumentParser(description="Fib Retracement v2 backtest")
-    ap.add_argument("--from", dest="frm", type=date.fromisoformat, default=None)
-    ap.add_argument("--to", dest="to", type=date.fromisoformat, default=None)
+    ap.add_argument("--from", dest="frm", type=date.fromisoformat, default=START_DATE)
+    ap.add_argument("--to", dest="to", type=date.fromisoformat, default=END_DATE)
+    settings_cli(ap, SETTINGS)
     a = ap.parse_args()
+    if a.set_tf is None:
+        a.set_tf = DEFAULT_TF
+    if a.set_rr is None:
+        a.set_rr = DEFAULT_RR
+        print(f"shipping the default subset: --tf {DEFAULT_TF} --rr {DEFAULT_RR}; "
+              f"the full set is --tf 1m,3m,5m --rr 1:2,1:3,1:4")
+    SETTINGS[:] = narrow(SETTINGS, a)
     to = a.to or today - timedelta(days=1)
     frm = a.frm or months_back(to, 6)
+    check_window(frm, to)
+    print(f"axes: {len(combos(SETTINGS))} simulated combinations")
     asyncio.run(run(frm, to))
 
 

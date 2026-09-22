@@ -31,7 +31,7 @@ Step 13 - Run the whole thing separately at 11:00, 11:10, 11:15, 11:20, 11:40, 1
 
 RUN.md STEP 1 CHECKLIST (no user available; gaps filled with defaults / simplest reading = ASSUMED)
   1 Underlying         clear    NIFTY 50 index, 1-minute candles.
-  2 Window             ASSUMED  last 6 months ending yesterday (--from / --to override).
+  2 Window             ASSUMED  2026-01-01 through the current IST date (--from / --to override).
   3 Signal timeframe   clear    1m.
   4 Signal rule        clear*   ASSUMED details: "every candle stayed at or below the range high" is tested on
                                 candle HIGHS, "at or above the range low" on candle LOWS. Trend line = ordinary
@@ -265,8 +265,8 @@ def main() -> None:
     today = datetime.now(IST)
     yesterday = today.date() - timedelta(days=1)
     ap = argparse.ArgumentParser(description="Opening Range Reversal v4")
-    ap.add_argument("--from", dest="frm", type=date.fromisoformat, default=None)
-    ap.add_argument("--to", dest="to", type=date.fromisoformat, default=None)
+    ap.add_argument("--from", dest="frm", type=date.fromisoformat, default=START_DATE)
+    ap.add_argument("--to", dest="to", type=date.fromisoformat, default=END_DATE)
     a = ap.parse_args()
     to = a.to or yesterday
     if to >= today.date() and (today.hour, today.minute) < (15, 45):      # rule 7: today only when over
@@ -301,7 +301,7 @@ def main() -> None:
             "Time exit: 15:00 (13:30 on an expiry day), filled in that bar at its low. One trade per day per decision time, no re-entry.",
         ],
         "limits": [
-            "ASSUMED: window = last 6 months ending yesterday (no window in the prompt).",
+            "ASSUMED: window = 2026-01-01 through the current IST date (no window in the prompt).",
             "ASSUMED: strike = ATM at the decision-candle close; 1 lot; expiry = nearest at least 1 day after the trade day; on an expiry day the next expiry is held (rule 10).",
             "ASSUMED: range tests use candle highs/lows; trend line = OLS on closes; ATR = simple mean of 14 true ranges ending at the decision candle; 'paid' = the entry fill price (bar high); disaster level measured from the decision-candle close.",
             "ASSUMED: stop/trail checks begin with the entry bar's own completed candle; the trail's first running high is the arming candle's close.",

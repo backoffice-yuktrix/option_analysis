@@ -22,7 +22,7 @@ FLOW OF A SCRIPT
     write_report(payload, "my_strategy")                             # -> analysis/report/my_strategy.html
 
 Sections: 1 paths  2 Upstox client (3 instruments and options, 4 candles inside it)
-          5 pure helpers  6 costs  6b rules and indicators  7 trades  8 report
+          5 pure helpers  6 costs  6b rules and indicators  7 trades  7b settings  7c session log  8 report
 """
 from __future__ import annotations
 
@@ -71,10 +71,152 @@ def read_access_token() -> str:
 
 
 # ---------------------------------------------------------------------------
+# 1b  the candle cache - CLOSED SESSIONS ONLY, and never a guess
+# ---------------------------------------------------------------------------
+# The window starts at a fixed date and grows through the current IST date.  Bars from sessions
+# that have already closed can never change, so caching them turns a re-run from an hour into
+# seconds.
+#
+# Everything here exists to make the cache impossible to trust wrongly:
+#
+#   * ONLY past sessions.  Nothing for today or later is ever written or read - a session
+#     still forming is partial, and a partial bar is not the day's bar (rule 7).
+#   * NEVER an empty result.  "No bars" can mean the contract did not trade, or it can mean a
+#     transient failure; the two are indistinguishable from outside, so an empty answer is
+#     re-fetched every time rather than remembered as fact.
+#   * EVERY read is validated: timestamps unique and ascending, OHLC consistent, all positive.
+#     A row that fails is not repaired - the whole entry is dropped and re-fetched.
+#   * Only what the API returned is stored.  Nothing is interpolated, filled forward, or
+#     reconstructed.  A gap in the data stays a gap.
+#
+# `CACHE_OFF = True` (or --no-cache on a script) bypasses it entirely, and
+# `verify_cache(up, n)` re-fetches a random sample and compares, so the claim is testable.
+
+CACHE_DIR = os.path.join(ANALYSIS_DIR, "cache")
+CACHE_VERSION = 1
+CACHE_OFF = os.environ.get("PYFUNCS_NO_CACHE") == "1"
+_CACHE_STATS = {"hit": 0, "miss": 0, "write": 0, "rejected": 0}
+
+
+def _cache_path(kind: str, day: str) -> str:
+    return os.path.join(CACHE_DIR, f"v{CACHE_VERSION}", kind, f"{day}.json")
+
+
+def _cache_is_past(day: str) -> bool:
+    """Only sessions strictly before today may be cached."""
+    return day < datetime.now(IST).date().isoformat()
+
+
+def _rows_ok(rows) -> bool:
+    """A cached session must look exactly like what the API gives, or it is not used."""
+    if not isinstance(rows, list) or not rows:
+        return False
+    last = ""
+    for r in rows:
+        if not isinstance(r, list) or len(r) != 5:
+            return False
+        t, o, h, l, c = r
+        if not isinstance(t, str) or len(t) != 5 or t[2] != ":" or t <= last:
+            return False                                  # unique and ascending
+        last = t
+        try:
+            o, h, l, c = float(o), float(h), float(l), float(c)
+        except (TypeError, ValueError):
+            return False
+        if min(o, h, l, c) <= 0 or l > min(o, c) or h < max(o, c) or l > h:
+            return False                                  # OHLC must be consistent
+    return True
+
+
+def _cache_read(kind: str, day: str, key: str):
+    if CACHE_OFF or not _cache_is_past(day):
+        return None
+    path = _cache_path(kind, day)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            blob = json.load(f)
+    except (OSError, ValueError):
+        return None
+    rows = blob.get(key)
+    if rows is None:
+        return None
+    if not _rows_ok(rows):
+        _CACHE_STATS["rejected"] += 1
+        return None
+    _CACHE_STATS["hit"] += 1
+    return [[r[0], float(r[1]), float(r[2]), float(r[3]), float(r[4])] for r in rows]
+
+
+def _cache_write(kind: str, day: str, key: str, rows: list) -> None:
+    if CACHE_OFF or not _cache_is_past(day) or not rows or not _rows_ok(rows):
+        return                                            # never cache empty, never cache today
+    path = _cache_path(kind, day)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    blob = {}
+    if os.path.exists(path):
+        try:
+            with open(path, encoding="utf-8") as f:
+                blob = json.load(f)
+        except (OSError, ValueError):
+            blob = {}
+    blob[key] = rows
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(blob, f, separators=(",", ":"))
+    os.replace(tmp, path)                                 # atomic: no half-written file
+    _CACHE_STATS["write"] += 1
+
+
+def cache_stats() -> str:
+    t = _CACHE_STATS
+    return (f"cache: {t['hit']} hits, {t['miss']} misses, {t['write']} written"
+            + (f", {t['rejected']} REJECTED as invalid" if t["rejected"] else ""))
+
+
+async def verify_cache(up: "Upstox", sample: int = 12) -> str:
+    """Re-fetch a random sample of cached sessions and compare, bar for bar.  The cache is only
+    worth having if this passes, so run it whenever the cache is doubted."""
+    import random
+    root = os.path.join(CACHE_DIR, f"v{CACHE_VERSION}", "opt1m")
+    if not os.path.isdir(root):
+        return "no cache to verify"
+    files = [f for f in os.listdir(root) if f.endswith(".json")]
+    random.shuffle(files)
+    checked = bad = 0
+    for fn in files:
+        if checked >= sample:
+            break
+        day = fn[:-5]
+        with open(os.path.join(root, fn), encoding="utf-8") as f:
+            blob = json.load(f)
+        for ikey, rows in list(blob.items())[:2]:
+            if checked >= sample:
+                break
+            live = await up.option_candles({"instrument_key": ikey, "expired": True},
+                                           date.fromisoformat(day))
+            checked += 1
+            if live != rows:
+                bad += 1
+                print(f"  MISMATCH {day} {ikey}: cached {len(rows)} rows, live {len(live)} rows")
+    return f"verified {checked} cached sessions against a live fetch: {checked - bad} identical, {bad} MISMATCHED"
+
+
+# ---------------------------------------------------------------------------
 # 2  Upstox client
 # ---------------------------------------------------------------------------
 class Upstox:
     """One httpx client, a rate limit and retry.  Use as `async with Upstox() as up:`."""
+
+    # Upstox meters per second, per minute AND per half hour, and a breach of the long window
+    # puts the whole account in a penalty box for minutes - no amount of retrying gets through.
+    # A ladder is thousands of calls, so the client PACES ITSELF to stay inside every window
+    # rather than sprinting and then failing.  Set a little under the published caps.
+    RATE_LIMITS = ((1.0, 20), (60.0, 220), (1800.0, 880))      # (window seconds, max calls)
+    MAX_INTERVAL = 4.0          # the slowest the adaptive gap will go
+    COOLDOWN = 75.0             # a 429 means a window is spent; wait it out, do not hammer
+    MAX_COOLDOWN = 240.0        # ... but never trust a server-supplied Retry-After blindly
 
     def __init__(self, token: str | None = None, min_interval: float = 0.25) -> None:
         self.token = token or read_access_token()
@@ -84,6 +226,12 @@ class Upstox:
         self._client: httpx.AsyncClient | None = None
         self._instruments: dict[str, list[dict]] = {}          # exchange -> rows (this run only)
         self._expired_contracts: dict[tuple[str, str], list[dict]] = {}
+        self._bars: dict[tuple[str, str, int], list[list]] = {}   # (key, day, interval) -> rows
+        self._times: list[float] = []      # when recent calls went out, for the rolling windows
+        self._said_pacing = False
+        self.calls = 0
+        self.throttled = 0
+        self.paced = 0.0                   # seconds spent waiting for a window to clear
 
     async def __aenter__(self) -> "Upstox":
         self._client = httpx.AsyncClient(timeout=60.0)
@@ -93,17 +241,19 @@ class Upstox:
         if self._client:
             await self._client.aclose()
 
-    async def get(self, url: str, params: dict | None = None, *, retries: int = 4) -> dict:
-        """GET with the bearer token; retries 429 and 5xx with backoff."""
+    async def get(self, url: str, params: dict | None = None, *, retries: int = 8) -> dict:
+        """GET with the bearer token; retries 429 and 5xx with backoff.
+
+Pacing happens in `_slot` before the
+        call goes out; this handles the case where it was not enough.  A 429 means a whole
+        window is spent, so the run waits `Retry-After` (or COOLDOWN) rather than retrying into
+        the same wall, and permanently widens its own gap.  A ladder of a few thousand calls
+        used to die on `UDAPI10005 Too Many Request Sent`; the point of a backtest is to finish
+        slowly, not to fail fast."""
         assert self._client, "use `async with Upstox() as up:`"
         delay = 2.0
         for attempt in range(retries + 1):
-            async with self._lock:                              # >= min_interval between calls
-                loop = asyncio.get_running_loop()
-                wait = self._next_at - loop.time()
-                if wait > 0:
-                    await asyncio.sleep(wait)
-                self._next_at = loop.time() + self._min_interval
+            await self._slot()
             try:
                 r = await self._client.get(url, params=params, headers={
                     "Accept": "application/json", "Authorization": f"Bearer {self.token}"})
@@ -112,15 +262,51 @@ class Upstox:
                     raise RuntimeError(f"network error for {url}: {exc}") from exc
                 await asyncio.sleep(delay); delay *= 2
                 continue
+            self.calls += 1
             if r.status_code == 200:
                 return r.json()
             if r.status_code in (401, 403):
                 raise PermissionError("Upstox token expired or unauthorised. Run analysis/connect_upstox.py.")
-            if r.status_code in (429, 500, 502, 503, 504) and attempt < retries:
-                await asyncio.sleep(delay); delay *= 2
+            if r.status_code == 429:
+                self.throttled += 1
+                self._min_interval = min(self.MAX_INTERVAL, self._min_interval * 1.5)
+                after = r.headers.get("Retry-After")
+                pause = float(after) if (after or "").replace(".", "", 1).isdigit() else self.COOLDOWN
+                pause = min(pause, self.MAX_COOLDOWN)
+                if attempt < retries:
+                    print(f"  rate limited ({self.throttled}), try {attempt + 1}/{retries} - cooling down "
+                          f"{pause:.0f}s, then {self._min_interval:.2f}s between calls", flush=True)
+                    self._times = []            # the window is spent; start counting again after the wait
+                    await asyncio.sleep(pause)
+                    continue
+            if r.status_code in (500, 502, 503, 504) and attempt < retries:
+                await asyncio.sleep(delay); delay = min(delay * 2, 60.0)
                 continue
             raise RuntimeError(f"Upstox HTTP {r.status_code} for {url}: {r.text[:200]}")
         raise RuntimeError(f"exhausted retries for {url}")
+
+    async def _slot(self) -> None:
+        """Block until a call may go out under every rolling window, then book the slot."""
+        async with self._lock:
+            loop = asyncio.get_running_loop()
+            longest = self.RATE_LIMITS[-1][0]
+            while True:
+                now = loop.time()
+                self._times = [t for t in self._times if now - t <= longest]
+                wait = self._next_at - now
+                for win, cap in self.RATE_LIMITS:
+                    inwin = [t for t in self._times if now - t <= win]
+                    if len(inwin) >= cap:
+                        wait = max(wait, inwin[-cap] + win - now)
+                if wait <= 0:
+                    self._times.append(now)
+                    self._next_at = now + self._min_interval
+                    return
+                if wait > 20 and not self._said_pacing:
+                    self._said_pacing = True
+                    print(f"  pacing: waiting {wait:.0f}s for a rate-limit window to clear", flush=True)
+                self.paced += min(wait, 10.0)
+                await asyncio.sleep(min(wait, 10.0))
 
     # -----------------------------------------------------------------------
     # 3  instruments and options
@@ -251,9 +437,24 @@ class Upstox:
 
     async def option_candles(self, contract: dict, day: date, interval_minutes: int = 1) -> list[list]:
         """One session of an option contract as [[HH:MM, o, h, l, c], ...] ([] if it did not trade).
-        `contract` is what `resolve_option` returned."""
+        `contract` is what `resolve_option` returned.
+
+        Memoised for THIS RUN only (nothing on disk, so rule 15 holds): a strike ladder asks for
+        the same contract-day over and over, because one night's exit day is the next night's
+        entry day and neighbouring nights often land on the same strike.  The same URL returns
+        the same bytes, so the memo cannot go stale the way a disk cache could - and it roughly
+        halves the number of calls, which is what keeps the run under the rate limit."""
         key = quote(contract["instrument_key"], safe="")
         d_ = day.isoformat()
+        memo = (contract["instrument_key"], d_, interval_minutes)
+        if memo in self._bars and day != datetime.now(IST).date():
+            return self._bars[memo]
+        if interval_minutes == 1:
+            hit = _cache_read("opt1m", d_, contract["instrument_key"])
+            if hit is not None:
+                self._bars[memo] = hit
+                return hit
+            _CACHE_STATS["miss"] += 1
         if contract["expired"]:
             url = f"{BASE_V2}/expired-instruments/historical-candle/{key}/{interval_minutes}minute/{d_}/{d_}"
         else:
@@ -262,8 +463,12 @@ class Upstox:
                 url = f"{BASE_V3}/historical-candle/intraday/{key}/minutes/{interval_minutes}"
         d = await self.get(url)
         raw = (d.get("data") or {}).get("candles") or []
-        return sorted([c[0][11:16], float(c[1]), float(c[2]), float(c[3]), float(c[4])]
+        rows = sorted([c[0][11:16], float(c[1]), float(c[2]), float(c[3]), float(c[4])]
                       for c in raw if len(c) >= 5)
+        self._bars[memo] = rows
+        if interval_minutes == 1:
+            _cache_write("opt1m", d_, contract["instrument_key"], rows)
+        return rows
 
 
 def _interval_unit(interval: str) -> tuple[str, int]:
@@ -375,6 +580,43 @@ def excursion(rows: list[list], side: str, entry_px: float, t0: str, t1: str) ->
     if side == "LONG":
         return max(hi - entry_px, 0.0), min(lo - entry_px, 0.0)
     return max(entry_px - lo, 0.0), min(entry_px - hi, 0.0)
+
+
+# ---------------------------------------------------------------------------
+# THE WINDOW.  Defined in one place for every strategy.
+# The start is fixed; the end is the current date in exchange time (IST), evaluated whenever a
+# report script starts.  No individual strategy script should define its own defaults.
+# Existing HTML reports are snapshots and must be re-run to include newly available sessions.
+START_DATE = date(2026, 1, 1)
+END_DATE = datetime.now(IST).date()
+
+# Keep the historical one-year guard, but never reject the shared growing default window once
+# it becomes older than a year.
+MAX_WINDOW_DAYS = max(366, (END_DATE - START_DATE).days)
+
+
+def fetch_estimate(calls: int, limits=None) -> str:
+    """How long `calls` requests will take under the rolling windows - printed before a ladder
+    starts, so a run that is going to take an hour says so at the top instead of at the end."""
+    limits = limits or Upstox.RATE_LIMITS
+    secs = max(calls * win / cap for win, cap in limits)
+    return (f"{calls} requests, about {secs / 60:.0f} min at the rate limit"
+            if secs >= 90 else f"{calls} requests, under two minutes")
+
+
+def check_window(frm: date, to: date, max_days: int = MAX_WINDOW_DAYS) -> None:
+    """Refuse a window longer than the shared default/cap.  Fetching is the expensive part of a run - a strike
+    ladder over two years is thousands of option-candle calls and gigabytes held in memory for
+    charts nobody opens.  A wider run is a deliberate act: pass max_days= to allow it and say
+    in meta["limits"] why."""
+    if to < frm:
+        raise SystemExit(f"--to {to} is before --from {frm}")
+    span = (to - frm).days
+    if span > max_days:
+        raise SystemExit(
+            f"window {frm} .. {to} is {span} days; the cap is {max_days} days. "
+            f"Narrow it, or pass max_days= to check_window() and say in meta['limits'] why "
+            f"this run needs more.")
 
 
 def coverage(sessions: dict[str, list], frm: date, to: date, rows_per_session: int | None = None) -> dict:
@@ -625,14 +867,268 @@ def make_trade(*, day: str, side: str, symbol: str, entry_time: str, entry_px: f
 
 
 # ---------------------------------------------------------------------------
+# 7b  settings - the strategy's own knobs, rendered as the report's control panel
+# ---------------------------------------------------------------------------
+# A strategy declares what a reader is allowed to change.  The template renders the
+# declaration as a panel of dropdowns grouped by KIND, and the browser recomputes every
+# number for the chosen combination, so "what if six strikes ITM became four" is a click
+# instead of an edit and a re-run.
+#
+# Two MODES, because there are two different kinds of knob:
+#
+#   mode="sweep"   changing it changes the SIMULATION, so each value needs its own trades.
+#                  The script loops `combos(SETTINGS)` and stamps every trade with
+#                  `variant=combo`.  Costs one simulation (and sometimes one fetch) per value.
+#                  Use for: strike depth, stop distance, the first candle an exit may fire.
+#
+#   mode="filter"  changing it only SELECTS among trades that already exist, by a tag.
+#                  The script simulates once, tags every trade, and the browser subsets.
+#                  Costs nothing.  Use for: an entry condition to switch on and off, a regime,
+#                  a threshold that only ever removes trades.
+#
+# A filter that is "on" in the rule must still be simulated OFF: the script has to trade every
+# candidate night and tag it, otherwise the only trades that exist are the ones the filter
+# admits and turning it off changes nothing.
+#
+# The date range is built into the template - never declare it as a setting.
+#
+# An axis a source declares is not automatically one this rule HAS.  Check the rule, not the
+# list: a family of scripts often shares one set of choices and some of them name things a
+# given rule never produces.  Refuse those in meta["rejected"] with the reason - never fake
+# one, never drop one in silence.
+
+KINDS = ("entry", "exit", "strike", "sizing", "other")
+KIND_LABELS = {"entry": "Entry filters", "exit": "Exit settings", "strike": "Strike / moneyness",
+               "sizing": "Sizing", "other": "Other settings"}
+MAX_COMBOS = 400                # sweep combinations one run may simulate.  Raised from 240 on
+                                # 2026-09-21: with the candle cache a sweep of re-simulations
+                                # costs compute, not fetching, and a faithful strategy needs
+                                # every axis its source compares (confirm x tf x rr x stop x
+                                # end-of-day x position rule x reading is already 288).
+PYTHON_HINT = "analysis/.venv/Scripts/python.exe"
+
+
+def setting(key: str, label: str, *, kind: str = "other", mode: str = "sweep",
+            values: list | None = None, options: list[dict] | None = None,
+            default=None, unit: str = "", help: str = "", rerun: bool = False) -> dict:
+    """One knob in the report's control panel.
+
+    key      short identifier; also the variant key (sweep) and the CLI flag (--<key>).
+    label    what the panel shows, e.g. "Strike depth".
+    kind     entry | exit | strike | sizing | other - the band it is grouped under.  The user's
+             "entry filters" and "exit settings" are kind="entry" and kind="exit".
+    mode     "sweep" (own simulation per value) or "filter" (selects existing trades by a tag).
+    values   sweep: the values to simulate, e.g. [2, 4, 6, 8, 10].  Each becomes an option whose
+             report value is str(v) - exactly what make_trade(variant=) stores, so the panel and
+             the trades match without the script doing anything.
+    options  filter: [{"value","label","tag":{tag_key: [allowed, ...]} | None}], one per choice.
+             tag=None admits every trade (the "off" choice).  Also usable for a sweep when the
+             labels should read differently from the values.
+    default  the value the RULE itself uses; the panel marks it and the combination table points
+             at it.  Defaults to the first option.
+    unit     appended to a generated label, e.g. " strikes ITM".
+    help     one line under the dropdown.
+    rerun    True when a value outside the ones shipped needs new DATA (a deeper strike, a wider
+             window).  The panel then offers the re-run command instead of pretending.
+    """
+    if kind not in KINDS:
+        raise ValueError(f"setting {key!r}: kind must be one of {KINDS}, got {kind!r}")
+    if mode not in ("sweep", "filter"):
+        raise ValueError(f"setting {key!r}: mode must be 'sweep' or 'filter', got {mode!r}")
+    if (values is None) == (options is None):
+        raise ValueError(f"setting {key!r}: pass exactly one of values= or options=")
+    if values is not None:
+        opts = [{"value": str(v), "label": f"{v}{unit}", "raw": v, "tag": None, "var": None} for v in values]
+    else:
+        opts = []
+        for o in options:
+            o = dict(o)
+            o["value"] = str(o["value"])
+            o.setdefault("label", o["value"])
+            o.setdefault("raw", o["value"])
+            o.setdefault("tag", None)
+            o.setdefault("var", None)
+            opts.append(o)
+    if not opts:
+        raise ValueError(f"setting {key!r}: no values")
+    seen = [o["value"] for o in opts]
+    if len(set(seen)) != len(seen):
+        raise ValueError(f"setting {key!r}: duplicate values {seen}")
+    if mode == "filter" and all(o["tag"] is None and o.get("var") is None for o in opts):
+        raise ValueError(f"setting {key!r}: a filter needs at least one option with a tag= or var=")
+    if mode == "sweep":
+        for o in opts:
+            o["tag"] = None
+    dflt = str(default) if default is not None else opts[0]["value"]
+    if dflt not in seen:
+        raise ValueError(f"setting {key!r}: default {dflt!r} is not one of {seen}")
+    return {"key": key, "label": label, "kind": kind, "mode": mode, "default": dflt,
+            "unit": unit, "help": help, "rerun": bool(rerun), "options": opts}
+
+
+def _sweeps(settings: list[dict] | None) -> list[dict]:
+    return [s for s in (settings or []) if s["mode"] == "sweep"]
+
+
+def combos(settings: list[dict] | None) -> list[dict]:
+    """Every combination of the SWEEP settings, as {key: raw value} - what the strategy loops.
+
+        for c in combos(SETTINGS):
+            ... simulate using c["moneyness"], c["first_exit"] ...
+            trades.append(make_trade(..., variant=c))
+
+    Filter settings are not in here: they cost nothing and are applied in the browser.
+    """
+    sw = _sweeps(settings)
+    out: list[dict] = [{}]
+    for s in sw:
+        out = [{**c, s["key"]: o["raw"]} for c in out for o in s["options"]]
+    if len(out) > MAX_COMBOS:
+        raise ValueError(f"{len(out)} sweep combinations (> {MAX_COMBOS}): "
+                         f"{[(s['key'], len(s['options'])) for s in sw]}. Narrow one with its --flag.")
+    return out
+
+
+def default_combo(settings: list[dict] | None) -> dict:
+    """{key: raw value} for the sweep settings at their defaults - the rule's own setting."""
+    return {s["key"]: next(o["raw"] for o in s["options"] if o["value"] == s["default"])
+            for s in _sweeps(settings)}
+
+
+def _flag(key: str) -> str:
+    return "--" + key.replace("_", "-")
+
+
+def settings_cli(ap, settings: list[dict] | None) -> None:
+    """Add one --<key> flag per setting: a comma-separated list that NARROWS what is shipped.
+    `--moneyness 4,6,8` simulates three rungs instead of the whole declared ladder."""
+    for s in settings or []:
+        vals = ",".join(o["value"] for o in s["options"])
+        # argparse runs help through %-formatting, and a label like "move >= 0.15%" blows it up
+        txt = f"{s['label']} - comma separated, from: {vals} (rule: {s['default']})".replace("%", "%%")
+        ap.add_argument(_flag(s["key"]), dest=f"set_{s['key']}", default=None, help=txt)
+
+
+def narrow(settings: list[dict] | None, args) -> list[dict]:
+    """Apply the --<key> flags and return a new spec.  If the declared default was dropped the
+    default moves to the first value kept, so 'the rule' always points at something shipped."""
+    out = []
+    for s in settings or []:
+        want = getattr(args, f"set_{s['key']}", None)
+        if not want:
+            out.append(s)
+            continue
+        keep = [w.strip() for w in str(want).split(",") if w.strip()]
+        known = {o["value"]: o for o in s["options"]}
+        bad = [w for w in keep if w not in known]
+        if bad:
+            raise SystemExit(f"{_flag(s['key'])}: {bad} not one of {list(known)}")
+        s = dict(s, options=[known[w] for w in keep])
+        if s["default"] not in keep:
+            s["default"] = keep[0]
+        out.append(s)
+    return out
+
+
+def rerun_command(slug: str, settings: list[dict] | None, frm, to) -> str:
+    """The exact command that reproduces this report - shown in the panel, so a setting that
+    needs new data is one paste away instead of a guess."""
+    parts = [PYTHON_HINT, f"analysis/scripts/{slug}.py", f"--from {frm}", f"--to {to}"]
+    for s in settings or []:
+        if s.get("derived"):        # inferred from variants, so the script has no such flag
+            continue
+        parts.append(f"{_flag(s['key'])} " + ",".join(o["value"] for o in s["options"]))
+    return " ".join(parts)
+
+
+def _admits(t: dict, opt: dict) -> bool:
+    """Does this trade pass one filter option?  Neither tag nor var set admits everything.
+    `tag` selects on what the trade was tagged with, `var` on which variant produced it - the
+    second is what a PARTITION axis needs (see `_axis_shape`)."""
+    if not opt:
+        return True
+    tag, var = opt.get("tag"), opt.get("var")
+    if tag and not all(str(t["tags"].get(k)) in [str(x) for x in vals] for k, vals in tag.items()):
+        return False
+    if var and not all(str(t["variant"].get(k)) in [str(x) for x in vals] for k, vals in var.items()):
+        return False
+    return True
+
+
+def check_settings(settings: list[dict] | None, trades: list[dict]) -> list[str]:
+    """Warnings a strategy author wants before the report is written, not after."""
+    out = []
+    if not settings:
+        out.append("no SETTINGS declared, so the panel was DERIVED from the variants and tags this "
+                   "script already emits: the knobs work, but they carry raw keys for labels, none "
+                   "is marked as the rule, and none has a CLI flag. Declare them (RUN.md rule 18, "
+                   "Step 1b) next time this script is touched.")
+    elif len({s["kind"] for s in settings}) < 2:
+        out.append(f"every setting is kind={settings[0]['kind']!r}: RUN.md Step 1b lists five axes "
+                   f"(what is traded, when it enters, when it exits, timeframe, direction) - "
+                   f"say in meta['rejected'] which ones this strategy has nothing on.")
+    for s in settings or []:
+        if s["mode"] == "sweep":
+            have = {t["variant"].get(s["key"]) for t in trades}
+            missing = [o["value"] for o in s["options"] if o["value"] not in have]
+            if missing:
+                out.append(f"setting {s['key']!r}: no trade carries variant {missing} - "
+                           f"is the script looping combos(SETTINGS) and passing variant=combo?")
+        else:
+            for o in s["options"]:
+                for k in (o.get("var") or {}):
+                    if not any(k in t["variant"] for t in trades):
+                        out.append(f"setting {s['key']!r} option {o['value']!r}: no trade carries "
+                                   f"the variant {k!r}")
+                for k in (o.get("tag") or {}):
+                    if not any(k in t["tags"] for t in trades):
+                        out.append(f"setting {s['key']!r} option {o['value']!r}: no trade carries "
+                                   f"the tag {k!r}")
+                if (o.get("tag") or o.get("var")) and not any(_admits(t, o) for t in trades):
+                    out.append(f"setting {s['key']!r} option {o['value']!r}: admits no trade at all")
+    return out
+
+
+# ---------------------------------------------------------------------------
+# 7c  the session log - what happened on every session, traded or not
+# ---------------------------------------------------------------------------
+# The trades table only shows sessions that produced a trade, so a report built from trades
+# alone cannot answer "what about the other days?".  A strategy therefore emits one row per
+# session in the window - signal or no signal, traded, declined or skipped for bad data - and
+# the report renders it as "Every session", with the skips and the declines each on their own
+# tab.  The console list is for the person running the script; this is for the person reading
+# the report.
+
+STATUSES = ("traded", "declined", "no signal", "no data")
+
+
+def session_row(day: str, status: str, note: str = "", **facts) -> dict:
+    """One session in the log.
+
+    day     "YYYY-MM-DD".
+    status  traded    - the rule fired and at least one trade exists for this day
+            declined  - the rule fired but a condition of the rule said no (a filter setting
+                        turns this into a trade you can switch back on; say which in `note`)
+            no signal - the rule did not fire
+            no data   - a missing candle, a missing contract, a short session: the day is
+                        unusable, and the report must SAY so rather than swallow it
+    note    the reason, in the words the rule uses.
+    facts   any extra columns - the day's move, the direction, the premium read, the share.
+            They become columns of the table in first-seen order; keep them scalar.
+    """
+    if status not in STATUSES:
+        raise ValueError(f"session {day}: status must be one of {STATUSES}, got {status!r}")
+    return {"day": day, "status": status, "note": note, "facts": facts}
+
+
+# ---------------------------------------------------------------------------
 # 8  report - every number is computed here; the browser only picks and formats
 # ---------------------------------------------------------------------------
 DATA_START, DATA_END = "/*DATA_START*/", "/*DATA_END*/"
 ALL = "all"
-MAX_VIEWS = 400                 # filter combinations; more than this means too many dimensions
 ROLL_WINDOW = 20
 WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
-STANDARD_GROUPS = ["weekday", "month", "entry hour", "exit reason"]
+STANDARD_GROUPS = ["weekday", "week", "month", "entry hour", "exit reason"]
 OPTION_GROUP = "option type"       # CE / PE - added only when the trades are options
 DTE_GROUP = "DTE"                  # days to expiry at entry - added only when the trades are options
 _REQUIRED_TRADE = ("day", "exit_day", "side", "symbol", "entry_time", "entry_px", "exit_time",
@@ -708,6 +1204,9 @@ def _series(trs: list[dict]) -> dict:
 def _group_label(t: dict, kind: str) -> str:
     if kind == "weekday":
         return WEEKDAYS[date.fromisoformat(t["day"]).weekday()]
+    if kind == "week":
+        y, w, _ = date.fromisoformat(t["day"]).isocalendar()
+        return f"{y}-W{w:02d}"
     if kind == "month":
         return t["day"][:7]
     if kind == "entry hour":
@@ -745,10 +1244,12 @@ def _groups(trs: list[dict], custom: list[dict], standard: list[str]) -> dict:
     return out
 
 
-def _stability(trs: list[dict]) -> list[dict]:
-    """Does the result survive being cut up?  Halves, thirds, quarters by trade order, each
+def _stability(trs: list[dict], break_date: str | None = None) -> list[dict]:
+    """Does the result survive being cut up?  Halves, thirds, quarters by trade ORDER, each
     with its date range, then the book with the best 10% and the worst 10% of trades removed
-    (10% rounded UP to a whole trade)."""
+    (10% rounded UP to a whole trade), then the same by the CALENDAR - year and calendar half.
+    Order slices answer "did it decay"; calendar slices answer "which period paid", and they
+    are not the same cut when trades are unevenly spread."""
     o = _order(trs)
     n = len(o)
     rows: list[dict] = []
@@ -775,55 +1276,202 @@ def _stability(trs: list[dict]) -> list[dict]:
         worst, best = set(s[:k]), set(s[-k:])
         add("without best 10%", [t for i, t in enumerate(o) if i not in best], f"{k} best trades removed")
         add("without worst 10%", [t for i, t in enumerate(o) if i not in worst], f"{k} worst trades removed")
+    if break_date:
+        for lab, keep in ((f"before {break_date}", lambda t: t["day"] < break_date),
+                          (f"from {break_date}", lambda t: t["day"] >= break_date)):
+            sel = [t for t in o if keep(t)]
+            if sel:
+                add(lab, sel, "across the named break")
+    for label, keyf in (("year", lambda t: t["day"][:4]),
+                        ("half", lambda t: f"{t['day'][:4]} H{1 if t['day'][5:7] <= '06' else 2}")):
+        g: dict[str, list] = {}
+        for t in o:
+            g.setdefault(keyf(t), []).append(t)
+        if len(g) > 1:
+            for k2 in sorted(g):
+                add(k2, g[k2], f"by {label}")
     return rows
 
 
-def _filter_dims(trades: list[dict]) -> list[dict]:
-    """side, then every variant key, each with its values in first-seen order."""
-    dims: dict[str, list[str]] = {"side": []}
+FILL_MODES = [
+    ("worst", "worst - buy the bar's HIGH, sell its LOW"),
+    ("mid", "midpoint of the bar"),
+    ("close", "the bar's close - NOT achievable, for comparison only"),
+]
+
+
+def _bar_at(rows: list[list], hhmm: str) -> list | None:
+    for r in rows or []:
+        if r[0] == hhmm:
+            return r
+    return None
+
+
+def _price_fills(trades: list[dict], index: dict, option_sessions: dict | None) -> int:
+    """Re-price every trade at the midpoint and at the close of the SAME bars it already used.
+
+    The fill convention is the single biggest lever on an option backtest and it is usually
+    invisible: a rule can read as -Rs 89k at the worst fill and +Rs 91k at the close, on
+    identical trades, because the exit bar is the opening minute and 57 points wide.  The
+    source reports made it a dropdown, so the template does too - for every strategy, with no
+    extra fetching, because both prices are already in the bar.
+
+    `worst` stays the default and the rule (RUN.md rule 1).  The others are labelled as what
+    they are: a sensitivity check, not a result you could have traded."""
+    opt = option_sessions or {}
+    done = 0
     for t in trades:
-        for k, v in {"side": t["side"], **t["variant"]}.items():
-            if v not in dims.setdefault(k, []):
-                dims[k].append(v)
-    dims["side"].sort()
-    return [{"key": k, "values": v} for k, v in dims.items() if len(v) > 1 or k == "side"]
+        src = opt.get(t["symbol"]) if t.get("kind") == "option" else None
+        if src is None:
+            src = index
+        e = _bar_at((src or {}).get(t["day"]), t["entry_time"])
+        x = _bar_at((src or {}).get(t["exit_day"]), t["exit_time"])
+        if not e or not x:
+            continue
+        sgn = 1 if t["side"] == "LONG" else -1
+        out = {"worst": {"entry_px": t["entry_px"], "exit_px": t["exit_px"], "gross": t["gross"],
+                         "costs": t["costs"], "net": t["net"]}}
+        for mode, ep, xp in (("mid", (e[2] + e[3]) / 2, (x[2] + x[3]) / 2), ("close", e[4], x[4])):
+            ep, xp = round(ep, 2), round(xp, 2)
+            gross = round(sgn * (xp - ep) * t["qty"], 2)
+            costs = (round(option_round_trip(t["side"], ep, xp, t["qty"]), 2)
+                     if t.get("kind") == "option" else t["costs"])
+            out[mode] = {"entry_px": ep, "exit_px": xp, "gross": gross, "costs": costs,
+                         "net": round(gross - costs, 2),
+                         "prem_pts": round(xp - ep, 2),
+                         "prem_pct": (xp - ep) / ep * 100 if ep else None}
+        out["worst"]["prem_pts"] = t["prem_pts"]
+        out["worst"]["prem_pct"] = t["prem_pct"]
+        t["fills"] = out
+        done += 1
+    return done
 
 
-def view_key(dims: list[dict], chosen: dict) -> str:
-    """'side=LONG|rr=1:2' - dimensions in order, 'all' left out.  The browser builds the same."""
-    return "|".join(f"{d['key']}={chosen[d['key']]}" for d in dims if chosen.get(d["key"], ALL) != ALL)
+def _sides(trades: list[dict]) -> list[str]:
+    return sorted({t["side"] for t in trades})
 
 
-def _filter_value(t: dict, key: str) -> str | None:
-    return t["side"] if key == "side" else t["variant"].get(key)
+# Guessing a band from a variant key, for scripts that predate SETTINGS.  Crude on purpose:
+# a wrong band is cosmetic, and declaring the setting properly (Step 1b) overrides it.
+_KIND_HINTS = (
+    ("strike", ("moneyness", "strike", "itm", "otm", "depth")),
+    ("exit", ("rr", "r:r", "target", "stop", "exit", "trail", "tp", "sl", "hold")),
+    ("entry", ("entry", "decision", "signal", "trigger", "time", "delay", "filter")),
+    ("sizing", ("lot", "size", "qty", "book", "capital")),
+)
+DERIVE_MAX_FILTER_VALUES = 6      # a tag with more values than this is a group-by, not a knob
+DERIVE_MAX_COMBOS = 600           # stop adding derived filters before the panel becomes a maze
 
 
-def _views(trades: list[dict], dims: list[dict], custom: list[dict], standard: list[str]) -> dict:
-    size = 1
-    for d in dims:
-        size *= len(d["values"]) + 1
-    if size > MAX_VIEWS:
-        raise ValueError(f"{size} filter combinations (> {MAX_VIEWS}); use fewer variant keys or values. "
-                         f"Dimensions: {[(d['key'], len(d['values'])) for d in dims]}")
-    views: dict[str, dict] = {}
+def _guess_kind(key: str) -> str:
+    k = key.lower()
+    for kind, words in _KIND_HINTS:
+        if any(w in k for w in words):
+            return kind
+    return "other"
 
-    def rec(i: int, chosen: dict) -> None:
-        if i == len(dims):
-            ts = [t for t in trades if all(v == ALL or _filter_value(t, k) == v for k, v in chosen.items())]
-            if ts:
-                views[view_key(dims, chosen)] = {"overview": _book(ts), "series": _series(ts),
-                                                 "groups": _groups(ts, custom, standard), "stability": _stability(ts)}
-            return
-        for v in [ALL] + dims[i]["values"]:
-            rec(i + 1, {**chosen, dims[i]["key"]: v})
-    rec(0, {})
-    return views
+
+def _axis_shape(trades: list[dict], key: str) -> str:
+    """Is a variant key a SWEEP or a PARTITION?
+
+    A sweep re-prices THE SAME SESSION under a different parameter, so a day shows up under
+    every value (R:R, stop rule, strike depth, timeframe).  A partition splits the sessions
+    themselves - a day is a gap-up or a gap-down, a long or a short, never both - so the
+    values are disjoint and together they are ONE book.
+
+    It matters because the panel treats them differently.  A sweep must not offer "all",
+    because pooling a night's 1:2 and 1:3 versions is not a book.  A partition MUST offer
+    "any", because refusing to means the report can never show the strategy as it actually
+    trades - which is what happened when a two-direction rule opened showing one direction
+    and a third of its trades.  The test is the trades themselves, so no script has to declare
+    it and no strategy's nature is changed by the report."""
+    byval: dict[str, set] = {}
+    for t in trades:
+        byval.setdefault(t["variant"][key], set()).add(t["day"])
+    if len(byval) < 2:
+        return "sweep"
+    shared = set.intersection(*byval.values())
+    union = set().union(*byval.values())
+    return "sweep" if len(shared) > 0.2 * len(union) else "partition"
+
+
+def _one_to_one(trades: list[dict], vkey: str, tkey: str) -> bool:
+    """Do a variant key and a tag key carry the same fact?  Two dropdowns for one thing is
+    worse than none: set them to disagreeing values and the report shows nothing."""
+    fwd: dict[str, set] = {}
+    rev: dict[str, set] = {}
+    for t in trades:
+        x, y = t["variant"].get(vkey), t["tags"].get(tkey)
+        fwd.setdefault(x, set()).add(y)
+        rev.setdefault(y, set()).add(x)
+    return len(fwd) > 1 and all(len(v) == 1 for v in fwd.values()) and all(len(v) == 1 for v in rev.values())
+
+
+def _derive_settings(trades: list[dict]) -> list[dict]:
+    """Build a panel for a script that declares no SETTINGS, from what it already emits.
+
+    Every `variant` key becomes a SWEEP (it already is one - the script simulated each value).
+    Every `tag` with a handful of values becomes a FILTER with an "any" option, because a tag
+    describes the condition at entry (rule 12) and "what if I only took the trades where this
+    was true" is the question a reader asks next.  Filters are added cheapest-first and stop
+    before the combination count gets silly; the rest stay as group-bys, where they already are.
+
+    This is a floor, not a substitute for Step 1b: labels are the raw keys, nothing is marked
+    as the rule, and the CLI has no flags for them.  `check_settings` says so."""
+    vals_of: dict[str, list[str]] = {}
+    for t in trades:
+        for k, v in t["variant"].items():
+            if v not in vals_of.setdefault(k, []):
+                vals_of[k].append(v)
+    vals_of = {k: v for k, v in vals_of.items() if len(v) > 1}
+    shape = {k: _axis_shape(trades, k) for k in vals_of}
+
+    tags: dict[str, list[str]] = {}
+    for t in trades:
+        for k, v in t["tags"].items():
+            if v not in tags.setdefault(k, []):
+                tags[k].append(v)
+    # a tag that repeats a variant is dropped, and lends the variant its nicer name
+    twin = {}
+    for vk in vals_of:
+        for tk in list(tags):
+            if _one_to_one(trades, vk, tk):
+                twin.setdefault(vk, tk)
+                tags.pop(tk, None)
+
+    out = []
+    combos_so_far = 1
+    for k, vals in vals_of.items():
+        label = twin.get(k, k)
+        if shape[k] == "sweep":
+            out.append(dict(setting(k, label, kind=_guess_kind(k), mode="sweep", values=vals), derived=True))
+        else:
+            out.append(dict(setting(
+                k, label, kind=_guess_kind(twin.get(k, k)), mode="filter", default="any",
+                help="these are disjoint sets of sessions, not alternative runs, so they are one "
+                     "book and 'any' is the strategy as it trades",
+                options=[{"value": "any", "label": "any", "tag": None, "var": None}]
+                        + [{"value": v, "label": v, "var": {k: [v]}} for v in vals]), derived=True))
+        combos_so_far *= len(out[-1]["options"])
+
+    usable = [(len(v), k, v) for k, v in tags.items() if 2 <= len(v) <= DERIVE_MAX_FILTER_VALUES]
+    for _, k, vals in sorted(usable):                      # fewest values first
+        if combos_so_far * (len(vals) + 1) > DERIVE_MAX_COMBOS:
+            continue
+        out.append(dict(setting(
+            k, k, kind="entry", mode="filter", default="any",
+            help="derived from the trade tag; declare it in SETTINGS to give it a proper name",
+            options=[{"value": "any", "label": "any", "tag": None}]
+                    + [{"value": v, "label": v, "tag": {k: [v]}} for v in sorted(vals)]), derived=True))
+        combos_so_far *= len(vals) + 1
+    return out
 
 
 def build_payload(meta: dict, trades: list[dict], index_sessions: dict[str, list[list]],
                   option_sessions: dict[str, dict[str, list[list]]] | None = None,
-                  groups: list[dict] | None = None) -> dict:
-    """Assemble what the HTML reads, computing every number.
+                  groups: list[dict] | None = None, settings: list[dict] | None = None,
+                  chart: str = "default", sessions_log: list[dict] | None = None) -> dict:
+    """Assemble what the HTML reads.
 
     meta      title, subtitle, instrument, from, to, lot_size, fill_rule, cost_model,
               params {name: value}, rule_steps [str], limits [str], coverage (from `coverage()`).
@@ -832,6 +1480,23 @@ def build_payload(meta: dict, trades: list[dict], index_sessions: dict[str, list
     option_sessions  {symbol: {day: rows}} for the option chart and the bar-by-bar table.
     groups    the user's custom group-bys: [{"name": "SMA10 at entry", "keys": ["sma10"]},
               {"name": "SMA10 x RSI", "keys": ["sma10", "rsi"]}]; keys are trade tag names.
+    settings  the control panel, from `setting()`.  Omit it and every variant key becomes an
+              untyped knob, which is what older scripts get.
+    meta["break_date"]  optional "YYYY-MM-DD": a date the market itself changed (a session-time
+              change, a lot-size change).  Stability then also cuts before/from it.
+    sessions_log  one `session_row()` per session in the window, traded or not.  Without it the
+              report can only show the days that produced a trade, and a reader cannot tell a
+              day the rule declined from a day the data was missing.
+    chart     "default" embeds option candles only for the trades the RULE's own settings
+              produce - a 6-rung ladder would otherwise carry six times the option data for
+              charts nobody opens.  It trims by SYMBOL, so a sweep that only changes the exit
+              loses nothing, and it does nothing at all unless `settings` was passed: a script
+              that never declared a panel keeps every chart it always had.  "all" embeds every
+              symbol; say so in meta["limits"].
+
+    The payload carries the TRADES, not a precomputed answer per filter combination: the page
+    recomputes the book for whatever settings and date range are chosen.  `baseline` is the
+    same book computed here, over every trade, and the page checks itself against it on load.
     """
     groups = groups or []
     tag_keys = {k for t in trades for k in t["tags"]}
@@ -839,6 +1504,10 @@ def build_payload(meta: dict, trades: list[dict], index_sessions: dict[str, list
         miss = [k for k in g["keys"] if k not in tag_keys]
         if miss:
             raise ValueError(f"group {g['name']!r}: no trade carries the tag(s) {miss}")
+    declared = settings is not None
+    spec = list(settings) if declared else _derive_settings(trades)
+    for w in check_settings(settings, trades):
+        print("WARNING  " + w)
     # every session a trade lives through: entry day, exit day, and any session between them
     need = {d for t in trades for d in index_sessions if t["day"] <= d <= t["exit_day"]}
     need |= {d for t in trades for d in (t["day"], t["exit_day"])}      # validate_payload reports a missing one
@@ -851,22 +1520,52 @@ def build_payload(meta: dict, trades: list[dict], index_sessions: dict[str, list
         es, xs = t["entry_spot"], t["exit_spot"]
         t["spot_pts"] = None if es is None or xs is None else xs - es
         t["spot_pct"] = None if not es or xs is None else (xs - es) / es * 100
+    # option candles: by default only for the trades the rule's own settings produce
+    chart_syms = None
+    if chart == "default" and declared and spec:
+        dflt = {s["key"]: s["default"] for s in spec}
+        fopt = {s["key"]: next(o for o in s["options"] if o["value"] == s["default"])
+                for s in spec if s["mode"] == "filter"}
+        chart_syms = {t["symbol"] for t in trades
+                      if all(t["variant"].get(k) == v for k, v in dflt.items() if k not in fopt)
+                      and all(_admits(t, o) for o in fopt.values())}
+    elif chart not in ("default", "all"):
+        raise ValueError(f"chart must be 'default' or 'all', got {chart!r}")
     opt: dict[str, dict] = {}
     for sym, days in (option_sessions or {}).items():
+        if chart_syms is not None and sym not in chart_syms:
+            continue
         keep = {d: _round_rows(r) for d, r in days.items() if d in need and r}
         if keep:
             opt[sym] = keep
     trades = sorted(trades, key=lambda t: (t["day"], t["entry_time"], t["symbol"]))
-    dims = _filter_dims(trades)
+    priced = _price_fills(trades, index, option_sessions)
     for t in trades:
-        t["filters"] = {"side": t["side"], **t["variant"]}
-    meta = dict(meta)
-    meta.setdefault("generated", datetime.now(IST).strftime("%Y-%m-%d %H:%M IST"))
-    meta["filters"] = dims
+        t["filters"] = {"side": t["side"], **t["variant"]}      # kept for older readers
     standard = (STANDARD_GROUPS + ([OPTION_GROUP] if any(t.get("option_type") for t in trades) else [])
                 + ([DTE_GROUP] if any(t.get("dte") is not None for t in trades) else []))
+    meta = dict(meta)
+    meta.setdefault("generated", datetime.now(IST).strftime("%Y-%m-%d %H:%M IST"))
+    meta["settings"] = spec
+    meta["sides"] = _sides(trades)
+    meta["fill_modes"] = [{"value": k, "label": v} for k, v in FILL_MODES] if priced == len(trades) and trades else []
+    if trades and priced != len(trades):
+        print(f"WARNING  fill comparison off: only {priced} of {len(trades)} trades had both bars "
+              f"in the embedded candles")
+    meta["group_defs"] = {"standard": standard, "custom": groups}
     meta["groups"] = standard + [g["name"] for g in groups]
-    payload = {"meta": meta, "trades": trades, "views": _views(trades, dims, groups, standard),
+    meta["chart_scope"] = ("every setting" if chart_syms is None else
+                           "the rule's own settings only - other settings show metrics but no option chart")
+    log = sorted(sessions_log or [], key=lambda r: r["day"])
+    counts: dict[str, int] = {k: 0 for k in STATUSES}
+    for r in log:
+        counts[r["status"]] += 1
+    meta["session_counts"] = dict(counts, total=len(log))
+    meta["log_columns"] = list(dict.fromkeys(k for r in log for k in r["facts"]))
+    payload = {"meta": meta, "trades": trades, "sessions": log,
+               "baseline": {"overview": _book(trades), "series": _series(trades),
+                            "groups": _groups(trades, groups, standard),
+                            "stability": _stability(trades, meta.get("break_date"))},
                "candles": {"index": index, "option": opt}}
     validate_payload(payload)
     return payload
@@ -888,9 +1587,22 @@ def validate_payload(p: dict) -> None:
         for d in {t.get("day"), t.get("exit_day")}:
             if d not in p["candles"]["index"]:
                 bad.append(f"trade {i}: no index candles for {d}")
-    top = p["views"].get("")
-    if p["trades"] and (top is None or top["overview"]["n"] != len(p["trades"])):
-        bad.append("the all-trades view does not hold every trade")
+    log = p.get("sessions") or []
+    if log:
+        days = {r["day"] for r in log}
+        tdays = {t["day"] for t in p["trades"]}
+        miss = sorted(tdays - days)
+        if miss:
+            bad.append(f"{len(miss)} trade day(s) are not in the session log, e.g. {miss[:3]}")
+        orphan = sorted({r["day"] for r in log if r["status"] == "traded"} - tdays)
+        if orphan:
+            bad.append(f"{len(orphan)} session(s) logged 'traded' but produced no trade, e.g. {orphan[:3]}")
+        dupes = sorted({d for d in days if sum(1 for r in log if r["day"] == d) > 1})
+        if dupes:
+            bad.append(f"{len(dupes)} day(s) appear twice in the session log, e.g. {dupes[:3]}")
+    base = (p.get("baseline") or {}).get("overview")
+    if p["trades"] and (base is None or base["n"] != len(p["trades"])):
+        bad.append("the baseline book does not hold every trade")
     if bad:
         raise ValueError("report payload invalid:\n  " + "\n  ".join(bad[:25]))
 
@@ -912,6 +1624,9 @@ def write_report(payload: dict, name: str, template: str = SAMPLE_HTML) -> str:
     the same function rewrites sample.html itself when asked to."""
     with open(template, encoding="utf-8") as f:
         html = f.read()
+    m = payload.get("meta", {})
+    slug = os.path.splitext(os.path.basename(name))[0]
+    m.setdefault("rerun", rerun_command(slug, m.get("settings"), m.get("from"), m.get("to")))
     a, b = html.index(DATA_START), html.index(DATA_END)
     blob = json.dumps(_clean(payload), separators=(",", ":"), default=str).replace("</", "<\\/")
     html = html[:a] + DATA_START + blob + html[b:]
@@ -920,8 +1635,13 @@ def write_report(payload: dict, name: str, template: str = SAMPLE_HTML) -> str:
         html = re.sub(r"<title>.*?</title>", lambda _m: f"<title>{_esc(title)}</title>", html, count=1, flags=re.S)
     os.makedirs(REPORT_DIR, exist_ok=True)
     path = os.path.join(REPORT_DIR, f"{name}.html") if os.path.dirname(name) == "" else name
-    with open(path, "w", encoding="utf-8") as f:
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
         f.write(html)
+    mb = len(blob) / 1e6
+    cand = len(json.dumps(_clean(payload.get("candles", {})), separators=(",", ":"), default=str)) / 1e6
+    print(cache_stats())
+    print(f"report data {mb:.1f} MB ({cand:.1f} MB of it candles)"
+          + ("  - consider a shorter window or chart='default'" if mb > 40 else ""))
     return path
 
 

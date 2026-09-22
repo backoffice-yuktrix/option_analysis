@@ -44,3 +44,6 @@ package-lock.json
 .DS_Store
 Thumbs.db
 *.log
+
+# fetched candles for closed sessions - reproducible from Upstox, not source
+analysis/cache/

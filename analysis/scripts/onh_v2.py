@@ -20,7 +20,7 @@ STRATEGY PROMPT (verbatim summary of 10_onh_v2.txt)
 
 RUN.md STEP 1 CHECKLIST (no user was available; every non-clear item is marked)
   1  Underlying          clear    NIFTY 50 index (signal + strike reference)
-  2  Window              ASSUMED  last 6 months ending yesterday (--from/--to = the SIGNAL/entry days)
+  2  Window              ASSUMED  2026-01-01 through the current IST date (--from/--to = SIGNAL/entry days)
   3  Signal timeframe    clear    1m candles; the signal compares the 09:15 open with the 15:14 close
   4  Signal rule         clear    close(15:14 bar) > open(09:15 bar) -> BUY; < -> SELL; == -> no trade
   5  Decision time       clear    after the 15:14 candle completes (15:15); entry 15:20 (Step 7)
@@ -54,7 +54,7 @@ ASSUMPTIONS
      non-positive) skips the day. The exit-day index session must also be complete (375 bars).
   A6 Session data for today is used only after 15:45 (rule 7).
   A7 Trades that have entered but whose exit day is not yet available/complete are skipped (the last
-     signal day of a window ending yesterday is normally skipped for this reason).
+     final signal day is normally skipped when its next session is not available for this reason).
   A8 15:14 forced exit: if the 15:14 option bar is missing the trade is skipped.
 
 CONFLICTS WITH THE RULES TO LIVE BY (rules win)
@@ -80,6 +80,53 @@ ENTRY_MIN = "15:20"
 SCAN_START, FORCE_EXIT = "09:30", "15:14"
 ITM_STEPS = 6
 LOTS = 1
+TREND_LOOKBACK_DAYS = 70          # calendar days of daily candles behind --from, for the 30-day trend
+
+# The three axes the source compares and this script used to fix at one point each.
+# EXIT RULES - all six re-read bars already fetched, so the sweep is free.
+#   (key, label, start minute, limit minute, trigger price, threshold)
+#   threshold None = a scheduled time exit in the start bar itself (rule 3)
+EXIT_RULES = [
+    ("low-0930", "first minute whose LOW clears costs, from 09:30", "09:30", "15:14", "low", 1.0),
+    ("low-0916", "first minute whose LOW clears costs, from 09:16", "09:16", "15:14", "low", 1.0),
+    ("low1-0930", "first minute whose LOW clears costs +1%, from 09:30", "09:30", "15:14", "low", 1.01),
+    ("close-0915", "first CLOSE above costs, from 09:15", "09:15", "15:14", "close", 1.0),
+    ("fixed-0930", "09:30 fixed", "09:30", "09:30", "low", None),
+    ("fixed-1514", "15:14 fixed - hold the full session", "15:14", "15:14", "low", None),
+]
+EXIT_BY_KEY = {k: (st, lim, trig, thr) for k, _l, st, lim, trig, thr in EXIT_RULES}
+RULE_EXIT = "low-0930"
+# THE STRIKE LADDER - each rung is its own fetch, which is the only part that costs anything.
+RUNGS = [0, 2, 4, 6, 8]
+RULE_RUNG = 6
+# THE EXTRA HOLD CONDITIONS - a filter over trades that already exist, so every night is
+# traded and tagged and any condition can be switched off. (tag name, label)
+HOLD_TAGS = [
+    ("move >= 0.15%", "day move at least 0.15%"),
+    ("move >= 0.30%", "day move at least 0.30%"),
+    ("previous day agrees", "previous day moved the same way"),
+    ("5-day trend agrees", "5-day trend agrees with the day"),
+    ("30-day trend agrees", "30-day trend agrees with the day"),
+    ("gap agrees", "opening gap agrees with the day"),
+    ("range >= 0.69x", "day range at least 0.69 x the 5-day average"),
+    ("range below average", "day range below the 5-day average"),
+    ("not Friday", "no Friday entries - no weekend hold"),
+]
+YES, NO, NA = "yes", "no", "n/a"
+
+SETTINGS = [
+    setting("hold_filter", "Extra hold condition", kind="entry", mode="filter", default="none",
+            help="one extra condition on top of the rule; 'none' is the rule as it is",
+            options=[{"value": "none", "label": "none - the rule as it is", "tag": None}]
+                    + [{"value": t, "label": lab, "tag": {t: [YES]}} for t, lab in HOLD_TAGS]),
+    setting("exit_rule", "Exit rule", kind="exit", default=RULE_EXIT,
+            options=[{"value": k, "label": lab, "raw": k} for k, lab, *_ in EXIT_RULES],
+            help="how the next morning is exited; all six re-read the same bars"),
+    setting("moneyness", "Strike depth", kind="strike", default=RULE_RUNG, rerun=True,
+            options=[{"value": v, "label": ("at the money" if v == 0 else f"{v} strikes in the money"),
+                      "raw": v} for v in RUNGS],
+            help="each rung is fetched and priced on the same nights"),
+]
 MAX_GAP_DAYS = 5
 
 
@@ -140,7 +187,7 @@ def signal(rows: list[list]) -> tuple[str | None, str, dict]:
 # ---------------------------------------------------------------------------
 # simulate (pure): entry-day option bars + exit-day option bars -> entry / exit
 # ---------------------------------------------------------------------------
-def simulate(entry_rows: list[list], exit_rows: list[list], qty: int) -> dict:
+def simulate(entry_rows: list[list], exit_rows: list[list], qty: int, exit_key: str = RULE_EXIT) -> dict:
     """Returns {"skip": reason} or {entry_bar, exit_bar, trigger, reason, line}.
     Entry: the 15:20 bar (buy at its HIGH). Exit: first completed bar >= 09:30 (and before 15:14)
     whose LOW > line -> sell in the NEXT bar at its LOW (rule 2/3); else the 15:14 bar itself."""
@@ -155,29 +202,84 @@ def simulate(entry_rows: list[list], exit_rows: list[list], qty: int) -> dict:
         return {"skip": "no option bars on exit day"}
     if not valid_bars(exit_rows):
         return {"skip": "invalid option bar on exit day"}
+    start, limit, trig, thr = EXIT_BY_KEY[exit_key]
+    if thr is None:                                   # a scheduled time exit fills in that bar (rule 3)
+        fb = by.get(start)
+        if fb is None:
+            return {"skip": f"option bar {start} missing on exit day (fixed exit)"}
+        return {"entry_bar": eb, "exit_bar": fb, "trigger": None, "reason": f"fixed exit {start}", "line": line}
+    want_px = line * thr
     ordered = sorted(exit_rows)
-    for i, r in enumerate(ordered):
-        if r[0] < SCAN_START:
+    for r in ordered:
+        if r[0] < start:
             continue
-        if r[0] >= FORCE_EXIT:
+        if r[0] >= limit:
             break
-        if r[3] > line:                                               # completed minute's LOW above line
+        px = r[3] if trig == "low" else r[4]          # the completed minute's LOW, or its CLOSE
+        if px > want_px:
             m = hhmm_minutes(r[0]) + 1
-            want = f"{m // 60:02d}:{m % 60:02d}"
-            nxt = by.get(want)
+            nxt = by.get(f"{m // 60:02d}:{m % 60:02d}")
             if nxt is None:
-                return {"skip": f"option bar {want} missing (needed to act on the {r[0]} signal)"}
-            return {"entry_bar": eb, "exit_bar": nxt, "trigger": r, "reason": "cleared costs", "line": line}
+                return {"skip": f"option bar after {r[0]} missing (needed to act on the signal)"}
+            return {"entry_bar": eb, "exit_bar": nxt, "trigger": r, "line": line,
+                    "reason": "cleared costs" + ("" if thr == 1.0 else f" +{(thr - 1) * 100:.0f}%")}
     fb = by.get(FORCE_EXIT)
     if fb is None:
         return {"skip": "option bar 15:14 missing on exit day (time exit)"}
     return {"entry_bar": eb, "exit_bar": fb, "trigger": None, "reason": "time exit 15:14", "line": line}
 
 
+def day_features(daily: list[dict], day: str, move_pct: float, open_915: float) -> dict:
+    """The facts the extra hold conditions test, from DAILY candles up to and including the
+    session BEFORE `day` (rule 4: nothing from the future, nothing from the day itself except
+    its own 09:15 open and 15:14 close, which the signal already used).
+
+    Returns tag values, not booleans, so the report can group by them as well as filter."""
+    past = [c for c in daily if c["timestamp"][:10] < day]
+    prev = past[-1] if past else None
+    closes = [c["close"] for c in past]
+    ranges = [c["high"] - c["low"] for c in past]
+    today = next((c for c in daily if c["timestamp"][:10] == day), None)
+    agree = lambda x: NA if x is None else (YES if x * move_pct > 0 else NO)
+
+    prev_move = None
+    if len(past) >= 2 and past[-2]["close"]:
+        prev_move = (past[-1]["close"] - past[-2]["close"]) / past[-2]["close"] * 100
+    ret5 = None
+    if len(closes) >= 6 and closes[-6]:
+        ret5 = (closes[-1] - closes[-6]) / closes[-6] * 100
+    trend30 = None
+    if len(closes) >= 31 and closes[-31]:
+        trend30 = (closes[-1] - closes[-31]) / closes[-31] * 100
+    gap = None
+    if prev and prev["close"]:
+        gap = (open_915 - prev["close"]) / prev["close"] * 100
+    ratio = None
+    if today and len(ranges) >= 5:
+        avg5 = sum(ranges[-5:]) / 5
+        if avg5:
+            ratio = (today["high"] - today["low"]) / avg5
+
+    wd = date.fromisoformat(day).weekday()
+    return {
+        "move >= 0.15%": YES if abs(move_pct) >= 0.15 else NO,
+        "move >= 0.30%": YES if abs(move_pct) >= 0.30 else NO,
+        "previous day agrees": agree(prev_move),
+        "5-day trend agrees": agree(ret5),
+        "30-day trend agrees": agree(trend30),
+        "gap agrees": agree(gap),
+        "range >= 0.69x": NA if ratio is None else (YES if ratio >= 0.69 else NO),
+        "range below average": NA if ratio is None else (YES if ratio < 1.0 else NO),
+        "not Friday": YES if wd != 4 else NO,
+    }
+
+
 # ---------------------------------------------------------------------------
 # fetch + main
 # ---------------------------------------------------------------------------
-async def run(frm: date, to: date) -> None:
+async def run(frm: date, to: date, settings: list[dict]) -> None:
+    rungs = [o["raw"] for o in next(x for x in settings if x["key"] == "moneyness")["options"]]
+    exit_keys = [o["raw"] for o in next(x for x in settings if x["key"] == "exit_rule")["options"]]
     skips: list[tuple[str, str]] = []
     trades: list[dict] = []
     option_sessions: dict[str, dict[str, list[list]]] = {}
@@ -194,6 +296,11 @@ async def run(frm: date, to: date) -> None:
         print(f"NIFTY key {key}; strike step {step}; fetching 1m index {frm} .. {end}")
         cs = await up.candles(key, "1m", frm, end)
         sessions = sessions_from(cs)
+        # daily candles behind the window, for the 5- and 30-day trend conditions only.
+        # No trade is taken outside the window; these are read, never traded.
+        daily = await up.candles(key, "1d", frm - timedelta(days=TREND_LOOKBACK_DAYS), end)
+        print(f"daily candles for the trend conditions: {len(daily)} "
+              f"({frm - timedelta(days=TREND_LOOKBACK_DAYS)} .. {end}, read only)")
         expiries = await up.expiry_calendar(key, frm, end)
         days = [d for d in sessions if frm.isoformat() <= d <= to.isoformat()]
         all_days = list(sessions)
@@ -218,42 +325,49 @@ async def run(frm: date, to: date) -> None:
 
             opt_type = "CE" if direction == "BUY" else "PE"
             spot = f["spot_1520"]
-            strike = strike_offset(spot, step, ITM_STEPS, opt_type, itm=True)
             exp = next_expiry(expiries, date.fromisoformat(xday), 1)
             if exp is None:
                 skips.append((day, "no expiry at least 1 day after the exit day")); continue
-            c = await up.resolve_option(key, exp, strike, opt_type)
-            if c is None:
-                skips.append((day, f"contract not found: {exp} {strike:.0f} {opt_type}")); continue
-            erows = await up.option_candles(c, date.fromisoformat(day))
-            xrows = await up.option_candles(c, date.fromisoformat(xday))
-            qty = LOTS * c["lot_size"]
-            if qty <= 0:
-                skips.append((day, "contract carries no lot size")); continue
-            sim = simulate(erows, xrows, qty)
-            if "skip" in sim:
-                skips.append((day, f"{c['trading_symbol']}: {sim['skip']}")); continue
+            move_pct = (f["close"] - f["open"]) / f["open"] * 100 if f["open"] else 0.0
+            holds = day_features(daily, day, move_pct, f["open"])
 
-            eb, xb = sim["entry_bar"], sim["exit_bar"]
-            entry_px, exit_px = worst_fills("LONG", eb, xb)           # rule 1: buy high, sell low
-            m1, a1 = excursion(erows, "LONG", entry_px, ENTRY_MIN, "15:29")
-            m2, a2 = excursion(xrows, "LONG", entry_px, "09:15", xb[0])
-            trades.append(make_trade(
-                day=day, exit_day=xday, side="LONG", symbol=c["trading_symbol"],
-                entry_time=eb[0], entry_px=entry_px, exit_time=xb[0], exit_px=exit_px, qty=qty,
-                exit_reason=sim["reason"], kind="option", capital=entry_px * qty,
-                entry_spot=spot, mfe=max(m1, m2), mae=min(a1, a2),
-                option_type=opt_type, expiry=c["expiry"],
-                tags={"direction": direction},
-                levels=[{"name": "09:15 open", "price": f["open"], "from": SIGNAL_OPEN, "to": SIGNAL_CLOSE},
-                        {"name": "15:14 close", "price": f["close"], "from": SIGNAL_CLOSE, "to": ENTRY_MIN}],
-                note=(f"{direction}: 15:14 close {f['close']:.2f} vs 09:15 open {f['open']:.2f}; strike {strike:.0f} "
-                      f"({ITM_STEPS} in) from 15:20 price {spot:.2f}; line to beat {sim['line']:.2f}"
-                      + (f"; trigger bar {sim['trigger'][0]} low {sim['trigger'][3]:.2f}" if sim["trigger"] else ""))))
-            osess = option_sessions.setdefault(c["trading_symbol"], {})
-            osess[day], osess[xday] = erows, xrows
-            print(f"{day} {direction:4s} {c['trading_symbol']}  buy {entry_px:.2f} -> {xday} {xb[0]} sell {exit_px:.2f}  "
-                  f"({sim['reason']})  net {trades[-1]['net']:.0f}")
+            for rung in rungs:
+                tag = f"{day} [{rung} ITM]"
+                strike = strike_offset(spot, step, rung, opt_type, itm=True)
+                c = await up.resolve_option(key, exp, strike, opt_type)
+                if c is None:
+                    skips.append((tag, f"contract not found: {exp} {strike:.0f} {opt_type}")); continue
+                erows = await up.option_candles(c, date.fromisoformat(day))
+                xrows = await up.option_candles(c, date.fromisoformat(xday))
+                qty = LOTS * c["lot_size"]
+                if qty <= 0:
+                    skips.append((tag, "contract carries no lot size")); continue
+                for ex_key in exit_keys:
+                    sim = simulate(erows, xrows, qty, ex_key)
+                    if "skip" in sim:
+                        skips.append((f"{tag} {ex_key}", f"{c['trading_symbol']}: {sim['skip']}")); continue
+                    eb, xb = sim["entry_bar"], sim["exit_bar"]
+                    entry_px, exit_px = worst_fills("LONG", eb, xb)   # rule 1: buy high, sell low
+                    m1, a1 = excursion(erows, "LONG", entry_px, ENTRY_MIN, "15:29")
+                    m2, a2 = excursion(xrows, "LONG", entry_px, "09:15", xb[0])
+                    trades.append(make_trade(
+                        day=day, exit_day=xday, side="LONG", symbol=c["trading_symbol"],
+                        entry_time=eb[0], entry_px=entry_px, exit_time=xb[0], exit_px=exit_px, qty=qty,
+                        exit_reason=sim["reason"], kind="option", capital=entry_px * qty,
+                        entry_spot=spot, mfe=max(m1, m2), mae=min(a1, a2),
+                        option_type=opt_type, expiry=c["expiry"],
+                        variant={"moneyness": rung, "exit_rule": ex_key},
+                        tags={"direction": direction, **holds},
+                        levels=[{"name": "09:15 open", "price": f["open"], "from": SIGNAL_OPEN, "to": SIGNAL_CLOSE},
+                                {"name": "15:14 close", "price": f["close"], "from": SIGNAL_CLOSE, "to": ENTRY_MIN}],
+                        note=(f"{direction}: 15:14 close {f['close']:.2f} vs 09:15 open {f['open']:.2f} "
+                              f"({move_pct:+.2f}%); strike {strike:.0f} ({rung} in) from 15:20 price {spot:.2f}; "
+                              f"line to beat {sim['line']:.2f}; exit rule {ex_key}"
+                              + (f"; trigger {sim['trigger'][0]}" if sim["trigger"] else ""))))
+                if rung == RULE_RUNG:                 # only the rule's rung keeps candles for the chart
+                    osess = option_sessions.setdefault(c["trading_symbol"], {})
+                    osess[day], osess[xday] = erows, xrows
+            print(f"{day} {direction:4s} {spot:.0f}  {len(rungs)}x{len(exit_keys)} priced")
 
     print(f"\nSkipped {len(skips)} day(s):")
     for d, why in skips:
@@ -284,7 +398,7 @@ async def run(frm: date, to: date) -> None:
             "If nothing qualifies before 15:14, sell in the 15:14 minute at its low.",
             "No stop and no target; the premium paid is the maximum loss."],
         "limits": [
-            "ASSUMED: window = last 6 months ending yesterday unless --from/--to given (dates are entry days).",
+            "ASSUMED: window = 2026-01-01 through the current IST date unless --from/--to given (dates are entry days).",
             "ASSUMED: '15:20 index price' = open of the 15:20 index bar; strike step read from Upstox and applied to the whole window.",
             "ASSUMED: line to beat uses the standard option costs evaluated at an exit price equal to the line; the trade carries the real costs.",
             "ASSUMED: 1 lot; qty from each contract's own lot size; one position at a time; standard option costs.",
@@ -296,20 +410,29 @@ async def run(frm: date, to: date) -> None:
             f"Skipped in this run: {len(skips)} day(s)."],
         "coverage": coverage(window, frm, to, SESSION_ROWS),
     }
-    groups = [{"name": "direction (BUY call / SELL put)", "keys": ["direction"]}]
-    payload = build_payload(meta, trades, sessions, option_sessions, groups)
+    groups = ([{"name": "direction (BUY call / SELL put)", "keys": ["direction"]}]
+              + [{"name": lab, "keys": [t]} for t, lab in HOLD_TAGS]
+              + [{"name": "direction x day move", "keys": ["direction", "move >= 0.30%"]}])
+    payload = build_payload(meta, trades, sessions, option_sessions, groups,
+                            settings=settings, chart="default")
     path = write_report(payload, NAME)
     print(console_summary(trades))
     print(path)
 
 
 def main() -> None:
-    yesterday = datetime.now(IST).date() - timedelta(days=1)
     ap = argparse.ArgumentParser(description="Overnight Hold v2 backtest")
-    ap.add_argument("--from", dest="frm", default=(yesterday - timedelta(days=182)).isoformat())
-    ap.add_argument("--to", dest="to", default=yesterday.isoformat())
+    ap.add_argument("--from", dest="frm", default=START_DATE.isoformat())
+    ap.add_argument("--to", dest="to", default=END_DATE.isoformat())
+    settings_cli(ap, SETTINGS)
     a = ap.parse_args()
-    asyncio.run(run(date.fromisoformat(a.frm), date.fromisoformat(a.to)))
+    settings = narrow(SETTINGS, a)
+    frm, to = date.fromisoformat(a.frm), date.fromisoformat(a.to)
+    check_window(frm, to)
+    rungs = [o["raw"] for o in next(x for x in settings if x["key"] == "moneyness")["options"]]
+    print(f"strike ladder {rungs}; exit rules "
+          f"{[o['raw'] for o in next(x for x in settings if x['key'] == 'exit_rule')['options']]} are free")
+    asyncio.run(run(frm, to, settings))
 
 
 if __name__ == "__main__":

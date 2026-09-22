@@ -23,7 +23,7 @@ Two other readings of step 4 exist but are not the default: the loose one looks 
 CHECKLIST (RUN.md Step 1) - no interactive gaps; assumptions marked ASSUMED
 ---------------------------------------------------------------------------
 1  Underlying        clear     NIFTY 50 index 1-minute candles.
-2  Window            ASSUMED   default: last 6 months ending yesterday (--from / --to).
+2  Window            ASSUMED   default: 2026-01-01 through the current IST date (--from / --to).
 3  Signal timeframe  clear     1 minute.
 4  Signal rule       clear     OR = 09:15-09:19 high/low; window = 1m candles 09:20..decision; OLS slope of closes;
                                strict comparisons (touch is not a break); >= 20 window candles.
@@ -271,7 +271,7 @@ async def main_async(frm: date, to: date) -> None:
     for k, v in skip_kinds.most_common():
         print(f"  {v:5d} x {k}")
     limits = [
-        "ASSUMED: window = last 6 months ending yesterday unless --from/--to given.",
+        "ASSUMED: window = 2026-01-01 through the current IST date unless --from/--to given.",
         "ASSUMED: 'close at 11:30' = the candle stamped 11:30 (complete at 11:31); trade placed in the 11:31 bar (rule 2).",
         "ASSUMED: an ATM NIFTY option is bought (strike step read from the live chain), expiry = nearest at least 1 day "
         "after the trade day, 1 lot; costs = standard option schedule.",
@@ -324,8 +324,8 @@ def main() -> None:
     today = datetime.now(IST).date()
     yday = today - timedelta(days=1)
     ap = argparse.ArgumentParser(description="Opening Range Reversal v1")
-    ap.add_argument("--from", dest="frm", default=(yday - timedelta(days=182)).isoformat())
-    ap.add_argument("--to", dest="to", default=yday.isoformat())
+    ap.add_argument("--from", dest="frm", default=START_DATE.isoformat())
+    ap.add_argument("--to", dest="to", default=END_DATE.isoformat())
     a = ap.parse_args()
     asyncio.run(main_async(date.fromisoformat(a.frm), date.fromisoformat(a.to)))
 

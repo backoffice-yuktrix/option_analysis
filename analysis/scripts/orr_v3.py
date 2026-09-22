@@ -34,7 +34,7 @@ Step 18 Run the whole thing separately at 11:00, 11:10, 11:15, 11:20, 11:40, 11:
 CHECKLIST (RUN.md Step 1) - ASSUMED items are marked
 ----------------------------------------------------
  1 Underlying         clear    NIFTY 50 index.
- 2 Window             ASSUMED  not stated: last 6 months ending yesterday (--from / --to override).
+ 2 Window             ASSUMED  not stated: 2026-01-01 through the current IST date (--from / --to override).
  3 Signal timeframe   clear    1-minute candles.
  4 Signal rule        clear    all thresholds numeric (RSI 40/60, 1.0 SD, run >= 1, >= 20 candles, 0.1% stop).
  5 Decision time      clear    candle labelled D (09:20..D window). ASSUMED reading: "1-minute close at exactly
@@ -288,7 +288,7 @@ async def main_async(frm: date, to: date) -> None:
             "One trade per day per decision time and R:R; each (decision time, R:R) is an independent set.",
         ],
         "limits": [
-            "ASSUMED: window = last 6 months ending yesterday unless --from/--to given.",
+            "ASSUMED: window = 2026-01-01 through the current IST date unless --from/--to given.",
             "ASSUMED: decision candle = the candle starting at D (complete at D+1); entry in the bar starting D+1.",
             "ASSUMED: BUY CE for a faded down move, BUY PE for a faded up move; ATM strike, 1 lot, nearest expiry >= 1 day after the trade day.",
             "ASSUMED: entry spot for stop/target = the decision-candle close; stop/target are INDEX levels (shown as chart levels).",
@@ -321,8 +321,8 @@ def main() -> None:
     now = datetime.now(IST)
     yesterday = now.date() - timedelta(days=1)
     ap = argparse.ArgumentParser(description="Opening Range Reversal v3 backtest")
-    ap.add_argument("--from", dest="frm", type=date.fromisoformat, default=None)
-    ap.add_argument("--to", dest="to", type=date.fromisoformat, default=yesterday)
+    ap.add_argument("--from", dest="frm", type=date.fromisoformat, default=START_DATE)
+    ap.add_argument("--to", dest="to", type=date.fromisoformat, default=END_DATE)
     a = ap.parse_args()
     to = a.to
     if to >= now.date() and (now.hour, now.minute) < (15, 45):   # Rule 7: today not used until over

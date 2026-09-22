@@ -27,7 +27,7 @@ Step 10 - Square off anything still open at 15:15.
 RUN.md STEP 1 CHECKLIST (no user available; ASSUMED = default or simplest reading)
 -----------------------------------------------------------------------------------
  1 Underlying        ASSUMED  NIFTY 50 index (prompt names none).
- 2 Window            ASSUMED  last 6 months ending yesterday (default).
+ 2 Window            ASSUMED  2026-01-01 through the current IST date (default).
  3 Signal timeframe  clear    15m candles built from 1m; opening range = 09:15 candle.
  4 Signal rule       clear    gap >= +/-0.30%; first 15m close beyond OR high/low. ASSUMED: the scan covers
                               15m candles that START 09:30 .. 10:45 (i.e. complete by 11:00). ASSUMED: the
@@ -80,6 +80,25 @@ TF = 15
 ROWS_PER_SESSION = 375
 EXPECTED = [f"{m // 60:02d}:{m % 60:02d}" for m in range(9 * 60 + 15, 15 * 60 + 30)]
 
+# The axis the source (gap_breakout_v1) compares and this script fixed at one point.
+# It matters more than it looks: the gap decides WHICH days qualify, so the two bases do not
+# merely reprice the same trades, they choose different ones.
+PDC_MODES = [("last", "the 15:29 print - the close the chart actually shows"),
+             ("daily", "the official settlement close from the daily feed")]
+RULE = {"pdc": "last"}
+
+SETTINGS = [
+    setting("pdc", "Previous close", kind="entry", default=RULE["pdc"],
+            options=[{"value": k, "label": v, "raw": k} for k, v in PDC_MODES],
+            help="what the gap is measured from"),
+    setting("stop", "Stop trigger", kind="exit", values=STOP_MODES, default="close-confirmed"),
+    setting("rr", "Reward:risk", kind="exit", values=[f"1:{r}" for r in RRS], default="1:2"),
+]
+
+
+def _vals(key):
+    return [o["raw"] for o in next(x for x in SETTINGS if x["key"] == key)["options"]]
+
 
 def valid_session(rows: list[list]) -> str | None:
     """None if the 1m session is complete and sane, else the reason."""
@@ -94,9 +113,18 @@ def valid_session(rows: list[list]) -> str | None:
 
 
 # ---------------------------------------------------------------- signal (pure) ------------------
-def signal(prev_rows: list[list], rows: list[list]) -> dict:
-    """Completed candles only.  Returns {"skip": reason} or the signal dict."""
+def signal(prev_rows: list[list], rows: list[list], prev_daily_close: float | None = None,
+           pdc: str = "last") -> dict:
+    """Completed candles only.  Returns {"skip": reason} or the signal dict.
+
+    pdc "last"  the previous session's 15:29 one-minute close - what the chart shows
+        "daily" the official settlement close from the daily feed; they differ, and the gap
+                threshold decides which days qualify, so this picks different trades."""
     prev_close = prev_rows[-1][4]                                   # 15:29 close
+    if pdc == "daily":
+        if prev_daily_close is None:
+            return {"skip": "no official daily close for the previous session"}
+        prev_close = prev_daily_close
     gap = (rows[0][1] - prev_close) / prev_close * 100
     gap = round(gap, 9)
     if gap >= GAP_PCT:
@@ -156,6 +184,9 @@ def simulate(mode: str, bars: list[list], direction: str, entry_key: str, stop: 
 
 # ---------------------------------------------------------------- main ---------------------------
 async def run(frm: date, to: date) -> None:
+    use_pdc = _vals("pdc")
+    use_stops = _vals("stop")
+    use_rrs = [int(v.split(":")[1]) for v in _vals("rr")]
     now = datetime.now(IST)
     last_ok = now.date() if (now.hour, now.minute) >= (15, 45) else now.date() - timedelta(days=1)
     to = min(to, last_ok)
@@ -169,10 +200,16 @@ async def run(frm: date, to: date) -> None:
         step = info["strike_step"]
         cal = await up.expiry_calendar(ukey, frm, to)
         cs = await up.candles(ukey, "1m", frm - timedelta(days=10), to)
+        # the official daily closes, for the alternative gap base (read only, no trades outside)
+        dl = await up.candles(ukey, "1d", frm - timedelta(days=20), to)
+        daily_close = {c["timestamp"][:10]: c["close"] for c in dl}
+        print(f"daily closes for the alternative gap base: {len(daily_close)}")
         sessions = sessions_from(cs)
         alldays = sorted(sessions)
         days = [d for d in alldays if frm.isoformat() <= d <= to.isoformat()]
-        for day in days:
+        # the previous-close base changes WHICH days qualify, so it belongs in the day loop.
+        # Pairing it into the header keeps the body at one indent level.
+        for day, pdc in [(d, p) for d in days for p in use_pdc]:
             i = alldays.index(day)
             if i == 0:
                 skips[day] = "no previous session in the fetched data"
@@ -186,7 +223,7 @@ async def run(frm: date, to: date) -> None:
             if bad:
                 skips[day] = f"previous session {prev} unusable: {bad}"
                 continue
-            sig = signal(sessions[prev], sessions[day])
+            sig = signal(sessions[prev], sessions[day], daily_close.get(prev), pdc)
             if "skip" in sig:
                 skips[day] = sig["skip"]
                 continue
@@ -229,8 +266,8 @@ async def run(frm: date, to: date) -> None:
                     "trigger candle": trig[0],
                     "risk size": bucket(rsk_pct, [0.15, 0.30], ["<0.15%", "0.15-0.30%", "0.30%+"]),
                     "direction": f"{direction} ({opt_type})"}
-            for mode in STOP_MODES:
-                for rr in RRS:
+            for mode in use_stops:
+                for rr in use_rrs:
                     tgt = idx_entry + rr * risk if direction == "LONG" else idx_entry - rr * risk
                     ex = simulate(mode, rows, direction, entry_bar[0], stop, tgt)
                     if ex["bar"] is None:
@@ -253,7 +290,8 @@ async def run(frm: date, to: date) -> None:
                         entry_px=epx, exit_time=ex["bar"][0], exit_px=xpx, qty=qty,
                         exit_reason=ex["reason"], capital=epx * qty, mfe=mfe, mae=mae,
                         expiry=contract["expiry"], option_type=opt_type,
-                        variant={"gap": "up" if direction == "LONG" else "down", "stop": mode, "rr": f"1:{rr}"},
+                        variant={"gap": "up" if direction == "LONG" else "down", "stop": mode,
+                                 "rr": f"1:{rr}", "pdc": pdc},
                         tags=tags, levels=levels,
                         note=(f"gap {sig['gap']:+.2f}% | level {sig['level']:.2f} | trigger candle {trig[0]} "
                               f"close {trig[4]:.2f} | index entry {idx_entry:.2f} stop {stop:.2f} "
@@ -309,7 +347,8 @@ async def run(frm: date, to: date) -> None:
               {"name": "trigger candle", "keys": ["trigger candle"]},
               {"name": "risk size", "keys": ["risk size"]},
               {"name": "gap size x risk size", "keys": ["gap size", "risk size"]}]
-    payload = build_payload(meta, trades, sessions, option_sessions, groups)
+    payload = build_payload(meta, trades, sessions, option_sessions, groups,
+                            settings=SETTINGS, chart="default")
     path = write_report(payload, SLUG)
     print(console_summary(trades))
     print(path)
@@ -318,8 +357,9 @@ async def run(frm: date, to: date) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     y = date.today() - timedelta(days=1)
-    ap.add_argument("--from", dest="frm", type=date.fromisoformat, default=y - timedelta(days=182))
-    ap.add_argument("--to", dest="to", type=date.fromisoformat, default=y)
+    ap.add_argument("--from", dest="frm", type=date.fromisoformat, default=START_DATE)
+    ap.add_argument("--to", dest="to", type=date.fromisoformat, default=END_DATE)
+    settings_cli(ap, SETTINGS)
     a = ap.parse_args()
     asyncio.run(run(a.frm, a.to))
 

@@ -30,7 +30,7 @@ literal reading is kept behind a flag (--literal-short-stop).
 CHECKLIST (RUN.md Step 1)
 -------------------------
  1 Underlying          clear    NIFTY 50 index (signal levels read from it)
- 2 Window              assumed  prompt names none -> last 6 months ending yesterday
+ 2 Window              assumed  prompt names none -> 2026-01-01 through the current IST date
  3 Signal timeframe    clear    3m and 5m (variant tf=); profile itself on 5m candles of the previous session
  4 Signal rule         assumed  see ASSUMPTIONS 3-9
  5 Decision time       clear    the close of the confirming retest candle
@@ -101,6 +101,41 @@ SQUARE_OFF = "15:15"
 LAST_ENTRY = "15:15"
 LOOKBACK_DAYS = 14
 
+# The axes the source (va_retest_v1) compares. All are re-simulations of bars already fetched.
+CONFIRMS = [("close", "reaches the band and closes beyond it"),
+            ("touch", "reaches the band; no close test"),
+            ("two-candle", "a later candle closes beyond it after the touch")]
+STOP_MODES = [("band", "inside the broken band - the spec"),
+              ("entry", "a fixed distance from the entry price")]
+EOD_MODES = [("close", "square off at the session close time"),
+             ("hold", "run to stop or target, give up at the last candle")]
+BOOKS = [("session", "the first placeable entry of the day, then done"),
+         ("flow", "one position at a time, re-entering whenever it re-arms")]
+READINGS = [("mirror", "the short stop mirrored to VAL + 25"),
+            ("literal", "the spec word for word - the short stop at VAH + 25")]
+RULE = {"confirm": "close", "stop_mode": "band", "eod": "close", "book": "session",
+        "reading": "mirror"}
+
+SETTINGS = [
+    setting("confirm", "Retest confirmation", kind="entry", default=RULE["confirm"],
+            options=[{"value": k, "label": v, "raw": k} for k, v in CONFIRMS]),
+    setting("tf", "Signal timeframe", kind="other", values=[f"{t}m" for t in TFS], default="3m"),
+    setting("rr", "Reward:risk", kind="exit", values=[f"1:{r}" for r in RRS], default="1:2"),
+    setting("stop_mode", "Stop anchor", kind="exit", default=RULE["stop_mode"],
+            options=[{"value": k, "label": v, "raw": k} for k, v in STOP_MODES]),
+    setting("eod", "End of day", kind="exit", default=RULE["eod"],
+            options=[{"value": k, "label": v, "raw": k} for k, v in EOD_MODES]),
+    setting("book", "Position rule", kind="sizing", default=RULE["book"],
+            options=[{"value": k, "label": v, "raw": k} for k, v in BOOKS]),
+    setting("reading", "Short-stop reading", kind="exit", default=RULE["reading"],
+            options=[{"value": k, "label": v, "raw": k} for k, v in READINGS],
+            help="the spec's short stop is ambiguous; both readings are priced"),
+]
+
+
+def _vals(key):
+    return [o["raw"] for o in next(x for x in SETTINGS if x["key"] == key)["options"]]
+
 
 # ------------------------------------------------------------------ signal (pure) -----------------
 def build_profile(rows_5m: list[list]) -> dict | None:
@@ -138,7 +173,7 @@ def build_profile(rows_5m: list[list]) -> dict | None:
     return {"poc": (poc + 0.5) * ROW, "vah": (hi_k + 1) * ROW, "val": lo_k * ROW, "units": total}
 
 
-def find_retests(candles: list[list], vah: float, val: float) -> list[dict]:
+def find_retests(candles: list[list], vah: float, val: float, confirm: str = "close") -> list[dict]:
     """Confirmed retests in time order.  candles = [[HH:MM,o,h,l,c]] of ONE session, completed candles only.
     A candle is read with information up to and including itself only."""
     breaks = {"LONG": [], "SHORT": []}
@@ -156,24 +191,110 @@ def find_retests(candles: list[list], vah: float, val: float) -> list[dict]:
                 continue
             reach = r[3] <= lvl if side == "LONG" else r[2] >= lvl
             beyond = r[4] > lvl if side == "LONG" else r[4] < lvl
-            if reach and beyond:
+            if not reach:
+                continue
+            if confirm == "close" and beyond:
                 out.append({"i": i, "start": r[0], "side": side, "lag": min(lag), "close": r[4]})
+            elif confirm == "touch":
+                out.append({"i": i, "start": r[0], "side": side, "lag": min(lag), "close": r[4]})
+            elif confirm == "two-candle":
+                for m in range(i + 1, len(candles)):      # the first LATER close beyond the band
+                    cl = candles[m][4]
+                    if (cl > lvl) if side == "LONG" else (cl < lvl):
+                        out.append({"i": m, "start": candles[m][0], "side": side,
+                                    "lag": min(lag), "close": cl})
+                        break
+    out.sort(key=lambda x: x["start"])
     return out
 
 
 # ------------------------------------------------------------------ simulate (pure) ---------------
-def index_stop_target(side: str, entry_ref: float, vah: float, val: float, rr: float, literal: bool):
+def index_stop_target(side: str, entry_ref: float, vah: float, val: float, rr: float,
+                      literal: bool, stop_mode: str = "band"):
+    """stop_mode "band": the stop sits inside the broken band (the spec).
+       stop_mode "entry": STOP_PTS from the entry price, so every loss is the same size."""
     if side == "LONG":
-        stop = vah - STOP_PTS
+        stop = (vah - STOP_PTS) if stop_mode == "band" else (entry_ref - STOP_PTS)
         risk = entry_ref - stop
         return stop, entry_ref + rr * risk, risk
-    stop = (vah if literal else val) + STOP_PTS
+    band = vah if literal else val
+    stop = (band + STOP_PTS) if stop_mode == "band" else (entry_ref + STOP_PTS)
     risk = stop - entry_ref
     return stop, entry_ref - rr * risk, risk
 
 
 # ------------------------------------------------------------------ main --------------------------
+async def place(day, d_, tf, rt, rows1, vah, val, poc, step, expiries, contracts,
+                opt_sessions, up, key, literal, stop_mode, eod, rr, confirm, book, reading):
+    """One (retest x settings) combination -> a trade, or None if it is not placeable.
+    Every reason to decline is a silent None here; the caller counts them."""
+    eb = bar_after_candle(rows1, rt["start"], tf)
+    if eb is None or eb[0] >= LAST_ENTRY:
+        return None
+    side = rt["side"]
+    ref = eb[2] if side == "LONG" else eb[3]
+    stop, target, risk = index_stop_target(side, ref, vah, val, rr, literal, stop_mode)
+    if risk <= 0:
+        return None
+    otype = "CE" if side == "LONG" else "PE"
+    exp = next_expiry(expiries, d_, 1)
+    if exp is None:
+        return None
+    strike = atm_strike(rt["close"], step)
+    ck = (exp, strike, otype)
+    if ck not in contracts:
+        contracts[ck] = await up.resolve_option(key, exp, strike, otype)
+    c = contracts[ck]
+    if not c:
+        return None
+    opt_sessions.setdefault(c["trading_symbol"], {})
+    orows = opt_sessions[c["trading_symbol"]].get(day)
+    if orows is None:
+        orows = await up.option_candles(c, d_)
+        opt_sessions[c["trading_symbol"]][day] = orows
+    if not orows:
+        return None
+    oby = {r[0]: r for r in orows}
+    oe = oby.get(eb[0])
+    if oe is None:
+        return None
+    res = scan_exit(rows1, side, eb[0], stop, target, SQUARE_OFF if eod == "close" else None)
+    xb = res["bar"]
+    if xb is None:
+        return None
+    ox = oby.get(xb[0])
+    if ox is None:
+        return None
+    epx, xpx = worst_fills("LONG", oe, ox)
+    mfe, mae = excursion(orows, "LONG", epx, eb[0], xb[0])
+    width = vah - val
+    trade = make_trade(
+        day=day, side="LONG", symbol=c["trading_symbol"], entry_time=eb[0], entry_px=epx,
+        exit_time=xb[0], exit_px=xpx, qty=c["lot_size"], exit_reason=res["reason"],
+        capital=epx * c["lot_size"], expiry=c["expiry"], option_type=otype, mfe=mfe, mae=mae,
+        variant={"tf": f"{tf}m", "rr": f"1:{rr}", "confirm": confirm, "stop_mode": stop_mode,
+                 "eod": eod, "book": book, "reading": reading},
+        tags={"direction": "long break (CE)" if side == "LONG" else "short break (PE)",
+              "retest lag": f"{rt['lag']} candles",
+              "va width": bucket(width, [60, 100], ["under 60", "60-100", "over 100"])},
+        levels=[{"name": "VAH", "price": vah}, {"name": "POC", "price": poc},
+                {"name": "VAL", "price": val},
+                {"name": f"stop {stop:.1f}", "price": stop},
+                {"name": f"target {target:.1f}", "price": target}],
+        note=f"{'long' if side == 'LONG' else 'short'} signal, {confirm} confirmation; retest "
+             f"{rt['start']} ({tf}m) lag {rt['lag']}; stop {stop_mode} {stop:.1f}, target "
+             f"{target:.1f}, risk {risk:.1f}; end of day {eod}, {book}, {reading} reading")
+    return {"trade": trade, "lot": c["lot_size"], "exit_key": xb[0]}
+
+
 async def run(frm: date, to: date, literal: bool):
+    use_confirms = _vals("confirm")
+    use_stops = _vals("stop_mode")
+    use_eods = _vals("eod")
+    use_books = _vals("book")
+    use_readings = _vals("reading")
+    use_tfs = [int(v[:-1]) for v in _vals("tf")]
+    use_rrs = [int(v.split(":")[1]) for v in _vals("rr")]
     trades: list[dict] = []
     skips: list[str] = []
     opt_sessions: dict[str, dict[str, list]] = {}
@@ -214,100 +335,45 @@ async def run(frm: date, to: date, literal: bool):
             vah, val, poc = prof["vah"], prof["val"], prof["poc"]
             rows1 = sess[day]
             d_ = date.fromisoformat(day)
-            for tf in TFS:
+            # Every axis the source compares, wrapped round the placement logic. Only the
+            # contract fetch is shared; everything else is a re-simulation of the same bars.
+            for tf in use_tfs:
                 cand = resample(rows1, tf)
-                rets = find_retests(cand, vah, val)
-                if not rets:
-                    print(f"SKIP {day} tf={tf}m: no confirmed retest")
-                    continue
-                placed = None
-                for rt in rets:
-                    eb = bar_after_candle(rows1, rt["start"], tf)
-                    if eb is None:
-                        print(f"SKIP {day} tf={tf}m: entry bar after {rt['start']} missing")
-                        placed = "bad"
-                        break
-                    if eb[0] >= LAST_ENTRY:
-                        print(f"  {day} tf={tf}m: retest {rt['start']} entry {eb[0]} too late")
+                for confirm in use_confirms:
+                    rets = find_retests(cand, vah, val, confirm)
+                    if not rets:
                         continue
-                    ref = eb[2] if rt["side"] == "LONG" else eb[3]
-                    _, _, risk = index_stop_target(rt["side"], ref, vah, val, 2, literal)
-                    if risk <= 0:
-                        print(f"  {day} tf={tf}m: retest {rt['start']} passed over (risk {risk:.1f} <= 0)")
-                        continue
-                    placed = (rt, eb, ref)
-                    break
-                if placed is None:
-                    print(f"SKIP {day} tf={tf}m: no placeable retest")
-                    continue
-                if placed == "bad":
-                    continue
-                rt, eb, ref = placed
-                side = rt["side"]
-                otype = "CE" if side == "LONG" else "PE"
-                exp = next_expiry(expiries, d_, 1)
-                if exp is None:
-                    print(f"SKIP {day} tf={tf}m: no expiry >= 1 day after")
-                    continue
-                strike = atm_strike(rt["close"], step)
-                ck = (exp, strike, otype)
-                if ck not in contracts:
-                    contracts[ck] = await up.resolve_option(key, exp, strike, otype)
-                c = contracts[ck]
-                if not c:
-                    print(f"SKIP {day} tf={tf}m: no contract {exp} {strike} {otype}")
-                    continue
-                lot = c["lot_size"] or lot
-                opt_sessions.setdefault(c["trading_symbol"], {})
-                orows = opt_sessions[c["trading_symbol"]].get(day)
-                if orows is None:
-                    orows = await up.option_candles(c, d_)
-                    opt_sessions[c["trading_symbol"]][day] = orows
-                if not orows:
-                    print(f"SKIP {day} tf={tf}m: no option bars for {c['trading_symbol']}")
-                    continue
-                oby = {r[0]: r for r in orows}
-                oe = oby.get(eb[0])
-                if oe is None:
-                    print(f"SKIP {day} tf={tf}m: option bar {eb[0]} missing for {c['trading_symbol']}")
-                    continue
-                qty = c["lot_size"]
-                width = vah - val
-                tags = {"direction": "long break (CE)" if side == "LONG" else "short break (PE)",
-                        "retest lag": f"{rt['lag']} candles",
-                        "va width": bucket(width, [60, 100], ["under 60", "60-100", "over 100"])}
-                for rr in RRS:
-                    stop, target, risk = index_stop_target(side, ref, vah, val, rr, literal)
-                    res = scan_exit(rows1, "LONG" if side == "LONG" else "SHORT", eb[0], stop, target, SQUARE_OFF)
-                    xb = res["bar"]
-                    if xb is None:
-                        print(f"SKIP {day} tf={tf}m rr={rr}: no exit bar ({res['reason']})")
-                        continue
-                    ox = oby.get(xb[0])
-                    if ox is None:
-                        print(f"SKIP {day} tf={tf}m rr={rr}: option exit bar {xb[0]} missing")
-                        continue
-                    epx, xpx = worst_fills("LONG", oe, ox)
-                    mfe, mae = excursion(orows, "LONG", epx, eb[0], xb[0])
-                    levels = [{"name": "VAH", "price": vah}, {"name": "POC", "price": poc},
-                              {"name": "VAL", "price": val},
-                              {"name": f"stop {stop:.1f}", "price": stop},
-                              {"name": f"target {target:.1f}", "price": target}]
-                    trades.append(make_trade(
-                        day=day, side="LONG", symbol=c["trading_symbol"], entry_time=eb[0], entry_px=epx,
-                        exit_time=xb[0], exit_px=xpx, qty=qty, exit_reason=res["reason"],
-                        capital=epx * qty, expiry=c["expiry"], option_type=otype, mfe=mfe, mae=mae,
-                        variant={"tf": f"{tf}m", "rr": f"1:{rr}"}, tags=tags, levels=levels,
-                        note=f"{'long' if side == 'LONG' else 'short'} signal; retest candle {rt['start']} ({tf}m), "
-                             f"lag {rt['lag']}; index stop {stop:.1f} target {target:.1f} risk {risk:.1f}"))
+                    for reading in use_readings:
+                        literal = (reading == "literal")
+                        for stop_mode in use_stops:
+                            for book in use_books:
+                                for eod in use_eods:
+                                    for rr in use_rrs:
+                                        busy_until = ""
+                                        for rt in rets:
+                                            if rt["start"] < busy_until:
+                                                continue          # "flow": still in a position
+                                            out = await place(
+                                                day, d_, tf, rt, rows1, vah, val, poc, step,
+                                                expiries, contracts, opt_sessions, up, key,
+                                                literal, stop_mode, eod, rr, confirm, book, reading)
+                                            if out is None:
+                                                continue
+                                            trades.append(out["trade"])
+                                            if out["lot"]:
+                                                lot = out["lot"]
+                                            if book == "session":
+                                                break             # the first placeable, then done
+                                            busy_until = out["exit_key"]
     return trades, sess, opt_sessions, lot, cov, skips
 
 
 def main():
     ap = argparse.ArgumentParser()
     yest = datetime.now(IST).date() - timedelta(days=1)
-    ap.add_argument("--from", dest="frm", default=(yest - timedelta(days=182)).isoformat())
-    ap.add_argument("--to", dest="to", default=yest.isoformat())
+    ap.add_argument("--from", dest="frm", default=START_DATE.isoformat())
+    ap.add_argument("--to", dest="to", default=END_DATE.isoformat())
+    settings_cli(ap, SETTINGS)
     ap.add_argument("--literal-short-stop", action="store_true",
                     help="short stop at VAH+25 (the spec as literally written) instead of VAL+25")
     a = ap.parse_args()
@@ -316,6 +382,9 @@ def main():
     if to >= now.date() and now.strftime("%H:%M") < "15:45":
         to = now.date() - timedelta(days=1)
         print(f"today's session is not over: window ends {to}")
+    SETTINGS[:] = narrow(SETTINGS, a)
+    check_window(frm, to)
+    print(f"axes: {len(combos(SETTINGS))} simulated combinations")
     trades, sess, opt, lot, cov, _ = asyncio.run(run(frm, to, a.literal_short_stop))
     meta = {
         "title": "Volume Profile Range v1 - value-area break and retest",
@@ -329,7 +398,7 @@ def main():
         "params": {"timeframes": "3m, 5m", "profile": "prev session, 5m, 5-pt rows, time-weighted, 70% VA",
                    "retest window": f"{RETEST_MIN}-{RETEST_MAX} candles after break", "stop": f"{STOP_PTS:.0f} pts from level",
                    "target": "1:2 / 1:3 / 1:4", "square off": SQUARE_OFF, "lots": 1,
-                   "short stop": "literal VAH+25" if a.literal_short_stop else "mirrored VAL+25"},
+                   "short stop": "both readings priced: mirrored VAL+25 (the rule) and literal VAH+25"},
         "rule_steps": [
             "Profile the previous full session on 5-minute candles: one unit per bar per 5-point row it spans; POC, VAH, VAL (70% value area).",
             "Fix those three lines for today.",
@@ -357,7 +426,7 @@ def main():
     if not trades:
         print("0 trades")
         return
-    payload = build_payload(meta, trades, sess, opt, groups)
+    payload = build_payload(meta, trades, sess, opt, groups, settings=SETTINGS, chart="default")
     path = write_report(payload, "vpr_v1")
     print(console_summary(trades))
     print(path)

@@ -21,7 +21,7 @@ STRATEGY PROMPT (verbatim summary of 15_vpr_v2.txt)
 
 RUN.md STEP 1 CHECKLIST (non-interactive: gaps closed by ASSUMPTIONS)
   Underlying ...... ASSUMED  NIFTY 50 (prompt only says "points").
-  Window .......... default  last 6 months ending yesterday (--from/--to).
+  Window .......... default  2026-01-01 through the current IST date (--from/--to).
   Timeframe ....... clear    signals on 3m and 5m (built from 1m); profile on 5m.
   Signal rule ..... partly ASSUMED (below): bin size, value-area %, band edges, retest touch.
   Decision time ... clear    close of the confirming (retest) candle; fill fixed by rules 1-2.
@@ -84,6 +84,43 @@ BOOKS = ["one per day", "flow"]
 TFS = [3, 5]
 SESSION_KEYS = [f"{m // 60:02d}:{m % 60:02d}" for m in range(9 * 60 + 15, 15 * 60 + 30)]
 
+# The axes the source (va_retest_v2) compares. All are re-simulations of bars already fetched.
+# The timeframe is NOT swept here: this rule runs 3m and 5m TOGETHER as one book (its Step 9),
+# so it stays a tag and "any" is the strategy as it trades.
+CONFIRMS = [("close", "reaches the band and closes beyond it"),
+            ("touch", "reaches the band; no close test"),
+            ("two-candle", "a later candle closes beyond it after the touch")]
+STOP_MODES = [("band", "inside the broken band - the spec"),
+              ("entry", "a fixed distance from the entry price")]
+EOD_MODES = [("close", "square off at the session close time"),
+             ("hold", "run to stop or target, give up at the last candle")]
+READINGS = [("mirror", "the short stop mirrored to VAL + 25"),
+            ("literal", "the spec word for word - the short stop at VAH + 25")]
+REENTRIES = [("on", "keep taking setups after a stop"),
+             ("off", "take the stop and stand down for the day")]
+RULE = {"confirm": "close", "stop_mode": "band", "eod": "close", "book": "one per day",
+        "reading": "mirror", "reentry": "on"}
+
+SETTINGS = [
+    setting("confirm", "Retest confirmation", kind="entry", default=RULE["confirm"],
+            options=[{"value": k, "label": v, "raw": k} for k, v in CONFIRMS]),
+    setting("rr", "Reward:risk", kind="exit", values=[f"1:{r}" for r in RRS], default="1:2"),
+    setting("stop_mode", "Stop anchor", kind="exit", default=RULE["stop_mode"],
+            options=[{"value": k, "label": v, "raw": k} for k, v in STOP_MODES]),
+    setting("eod", "End of day", kind="exit", default=RULE["eod"],
+            options=[{"value": k, "label": v, "raw": k} for k, v in EOD_MODES]),
+    setting("book", "Position rule", kind="sizing", default=RULE["book"],
+            options=[{"value": k, "label": k, "raw": k} for k in BOOKS]),
+    setting("reading", "Short-stop reading", kind="exit", default=RULE["reading"],
+            options=[{"value": k, "label": v, "raw": k} for k, v in READINGS]),
+    setting("reentry", "After a stop", kind="entry", default=RULE["reentry"],
+            options=[{"value": k, "label": v, "raw": k} for k, v in REENTRIES]),
+]
+
+
+def _vals(key):
+    return [o["raw"] for o in next(x for x in SETTINGS if x["key"] == key)["options"]]
+
 
 # ---------------------------------------------------------------------------
 # signal (pure, completed candles only)
@@ -120,7 +157,7 @@ def volume_profile(rows5: list[list]) -> dict:
     return {"poc": (poc_k + 0.5) * BIN, "vah": (keys[hi_i] + 1) * BIN, "val": keys[lo_i] * BIN}
 
 
-def find_setups(rows_1m: list[list], prof: dict) -> list[dict]:
+def find_setups(rows_1m: list[list], prof: dict, confirm: str = "close") -> list[dict]:
     """Crossings, then the first retest 4..15 candles later that reaches the band and closes beyond it.
     Uses only candles up to and including the confirming (retest) candle."""
     vah, val = prof["vah"], prof["val"]
@@ -138,9 +175,24 @@ def find_setups(rows_1m: list[list], prof: dict) -> list[dict]:
             else:
                 continue
             for j in range(i + RETEST_MIN, min(i + RETEST_MAX, len(c) - 1) + 1):
-                held = (c[j][3] <= vah and c[j][4] > vah) if side == "LONG" else (c[j][2] >= val and c[j][4] < val)
-                if not held:
+                lvl = vah if side == "LONG" else val
+                reach = (c[j][3] <= lvl) if side == "LONG" else (c[j][2] >= lvl)
+                beyond = (c[j][4] > lvl) if side == "LONG" else (c[j][4] < lvl)
+                if not reach:
                     continue
+                jj = None
+                if confirm == "close" and beyond:
+                    jj = j
+                elif confirm == "touch":
+                    jj = j
+                elif confirm == "two-candle":
+                    for mm in range(j + 1, len(c)):        # the first LATER close beyond the band
+                        if (c[mm][4] > lvl) if side == "LONG" else (c[mm][4] < lvl):
+                            jj = mm
+                            break
+                if jj is None:
+                    continue
+                j = jj
                 eb = bar_after_candle(rows_1m, c[j][0], tf)          # strict: next 1m bar
                 if eb is None or eb[0] >= LAST_ENTRY:
                     break
@@ -157,12 +209,16 @@ def find_setups(rows_1m: list[list], prof: dict) -> list[dict]:
 # simulate (pure: setups + bars -> trades)
 # ---------------------------------------------------------------------------
 def simulate_book(day: str, setups: list[dict], idx_rows: list[list], rr: int, book: str,
-                  skips: set) -> list[dict]:
+                  skips: set, stop_mode: str = "band", eod: str = "close",
+                  reading: str = "mirror", reentry: str = "on", confirm: str = "close") -> list[dict]:
     trades: list[dict] = []
     free = ""
+    stopped = False
     for s in setups:
         if book == "one per day" and trades:
             break
+        if stopped and reentry == "off":
+            break                                    # took the stop and stood down
         et = s["entry_bar"][0]
         if et <= free:
             continue
@@ -173,13 +229,18 @@ def simulate_book(day: str, setups: list[dict], idx_rows: list[list], rr: int, b
         side = s["side"]                                              # index direction
         eb = s["entry_bar"]
         ref = eb[2] if side == "LONG" else eb[3]                      # worst fill on the index (A7)
-        stop = s["vah"] - STOP_PTS if side == "LONG" else s["val"] + STOP_PTS
+        if stop_mode == "entry":
+            stop = ref - STOP_PTS if side == "LONG" else ref + STOP_PTS
+        elif side == "LONG":
+            stop = s["vah"] - STOP_PTS
+        else:                                        # the spec's short stop is ambiguous
+            stop = (s["vah"] if reading == "literal" else s["val"]) + STOP_PTS
         risk = (ref - stop) if side == "LONG" else (stop - ref)
         if risk <= 0:
             skips.add(f"{day} {s['tf']}m {side} retest {s['retest_start']}: risk<=0 (entry {ref} vs stop {stop})")
             continue
         target = ref + rr * risk if side == "LONG" else ref - rr * risk
-        res = scan_exit(idx_rows, side, et, stop, target, FORCE)
+        res = scan_exit(idx_rows, side, et, stop, target, FORCE if eod == "close" else None)
         if res["bar"] is None:
             skips.add(f"{day} {s['tf']}m {side} retest {s['retest_start']}: exit not found ({res['reason']})")
             continue
@@ -202,13 +263,15 @@ def simulate_book(day: str, setups: list[dict], idx_rows: list[list], rr: int, b
             day=day, side="LONG", symbol=contract["trading_symbol"], entry_time=oe[0], entry_px=epx,
             exit_time=ox[0], exit_px=xpx, qty=qty, exit_reason=res["reason"], kind="option",
             capital=epx * qty, stop=None, target=None, mfe=mfe, mae=mae,
-            variant={"rr": f"1:{rr}", "book": book},
+            variant={"rr": f"1:{rr}", "book": book, "confirm": confirm, "stop_mode": stop_mode,
+                     "eod": eod, "reading": reading, "reentry": reentry},
             tags={"timeframe": f"{s['tf']}m", "direction": "long (buy CE)" if side == "LONG" else "short (buy PE)",
                   "retest gap": bucket(s["gap"], [7, 11], ["4-6 candles", "7-10 candles", "11-15 candles"])},
             levels=levels, expiry=contract["expiry"], option_type=contract["option_type"],
             note=f"{s['tf']}m crossing {s['cross_start']}, retest {s['retest_start']} (+{s['gap']}); index entry ref {ref:.2f}, "
                  f"stop {stop:.2f}, target {target:.2f}"))
         free = xk
+        stopped = "stop" in (res["reason"] or "").lower()
     return trades
 
 
@@ -248,7 +311,11 @@ async def run(frm: date, to: date) -> None:
             if pw:
                 print(f"SKIP {d}: previous session {prev} {pw}"); continue
             prof = volume_profile(resample(sessions[prev], 5))
-            setups = find_setups(sessions[d], prof)
+            setups = []
+            for _cf in _vals("confirm"):
+                for _s in find_setups(sessions[d], prof, _cf):
+                    _s["confirm"] = _cf
+                    setups.append(_s)
             expiry = next_expiry(cal, date.fromisoformat(d), 1)
             for s in setups:
                 s["opt"], s["opt_why"] = None, ""
@@ -282,9 +349,20 @@ async def run(frm: date, to: date) -> None:
         for d, setups in setups_by_day.items():
             if not setups:
                 continue
-            for rr in RRS:
-                for book in BOOKS:
-                    trades += simulate_book(d, setups, sessions[d], rr, book, skips)
+            for cf in _vals("confirm"):
+                mine = [s for s in setups if s["confirm"] == cf]
+                if not mine:
+                    continue
+                for rr in _vals("rr"):
+                    rr_n = int(str(rr).split(":")[1]) if ":" in str(rr) else int(rr)
+                    for book in _vals("book"):
+                        for stop_mode in _vals("stop_mode"):
+                            for eod in _vals("eod"):
+                                for reading in _vals("reading"):
+                                    for reentry in _vals("reentry"):
+                                        trades += simulate_book(
+                                            d, mine, sessions[d], rr_n, book, skips,
+                                            stop_mode, eod, reading, reentry, cf)
         for m in sorted(skips):
             print("SKIP", m)
         if not trades:
@@ -328,7 +406,8 @@ async def run(frm: date, to: date) -> None:
     }
     groups = [{"name": "Timeframe", "keys": ["timeframe"]}, {"name": "Direction", "keys": ["direction"]},
               {"name": "Retest gap", "keys": ["retest gap"]}, {"name": "Timeframe x direction", "keys": ["timeframe", "direction"]}]
-    payload = build_payload(meta, trades, sessions, option_sessions, groups)
+    payload = build_payload(meta, trades, sessions, option_sessions, groups,
+                            settings=SETTINGS, chart="default")
     path = write_report(payload, REPORT)
     print(console_summary(trades))
     print(path)
@@ -336,11 +415,16 @@ async def run(frm: date, to: date) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    yest = date.today() - timedelta(days=1)
-    ap.add_argument("--from", dest="frm", default=(yest - timedelta(days=182)).isoformat())
-    ap.add_argument("--to", default=yest.isoformat())
+    ap.add_argument("--from", dest="frm", default=START_DATE.isoformat())
+    ap.add_argument("--to", default=END_DATE.isoformat())
+    settings_cli(ap, SETTINGS)
     a = ap.parse_args()
-    asyncio.run(run(date.fromisoformat(a.frm), date.fromisoformat(a.to)))
+    SETTINGS[:] = narrow(SETTINGS, a)
+    frm, to = date.fromisoformat(a.frm), date.fromisoformat(a.to)
+    check_window(frm, to)
+    print(f"axes: {len(combos(SETTINGS))} simulated combinations "
+          f"(3m and 5m run TOGETHER as one book, so the timeframe is a tag, not an axis)")
+    asyncio.run(run(frm, to))
 
 
 if __name__ == "__main__":

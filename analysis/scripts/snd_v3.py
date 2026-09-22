@@ -39,7 +39,7 @@ Step 13 - 3-minute candles by default, 1-minute alongside.
 CHECKLIST (RUN.md Step 1) - ASSUMED items are marked
 ----------------------------------------------------
  1 Underlying        ASSUMED  NIFTY 50 (the prompt names none).
- 2 Window            ASSUMED  last 6 months ending yesterday (--from/--to override).
+ 2 Window            ASSUMED  2026-01-01 through the current IST date (--from/--to override).
  3 Signal timeframe  clear    3-minute (default) and 1-minute, both built from 1-minute candles; variant `tf`.
  4 Signal rule       clear    steps 1-4 and 10 exactly; swings/zones are intraday (see assumptions).
  5 Decision time     clear    the close of the candle that touches the zone (before 13:00 by candle start).
@@ -94,6 +94,50 @@ MIN_RISK = 1.0
 SWING_N = 3
 LOTS = 1
 EXPECTED = [f"{m // 60:02d}:{m % 60:02d}" for m in range(9 * 60 + 15, 15 * 60 + 30)]   # 375 minutes
+
+# The axes the source (nes_supply_demand_v3) compares that APPLY to this rule.
+# Its STOP_ANCHORS list has four values, but three of them name a sweep and a micro-BOS that
+# v3 does not have - it is "the zone alone" - so only the zone anchor is real here. Recorded
+# in meta["rejected"] rather than faked.
+STOP_TRIGGERS = [("touch", "an order resting at the level, filled on touch"),
+                 ("close", "a candle CLOSE beyond the level, filled next bar")]
+EOD_MODES = [("close", "square off at the session close time"),
+             ("hold", "run to stop or target, give up at the last candle")]
+NEVER = "99:99"                 # a force-exit key later than any bar: "hold" runs to the end
+RULE = {"trigger": "touch", "eod": "close"}
+
+SETTINGS = [
+    setting("tf", "Signal timeframe", kind="other", default="3m",
+            values=[f"{t}m" for t in TIMEFRAMES]),
+    setting("target", "Target", kind="exit", values=TARGETS, default="1:2"),
+    setting("trigger", "Stop trigger", kind="exit", default=RULE["trigger"],
+            options=[{"value": k, "label": v, "raw": k} for k, v in STOP_TRIGGERS]),
+    setting("eod", "End of day", kind="exit", default=RULE["eod"],
+            options=[{"value": k, "label": v, "raw": k} for k, v in EOD_MODES]),
+]
+
+
+def _vals(key):
+    return [o["raw"] for o in next(x for x in SETTINGS if x["key"] == key)["options"]]
+
+
+def scan_close_stop(bars, side, entry_key, stop, target, force_key):
+    """Close-confirmed stop: a bar must CLOSE beyond the stop, which is a signal, so the exit
+    is the NEXT bar (rule 3). The target stays a touch. Stop first if a bar does both."""
+    for i, r in enumerate(bars):
+        if r[0] <= entry_key:
+            continue
+        if r[0] == force_key:
+            return {"bar": r, "reason": "time exit", "trigger": None}
+        hit_stop = r[4] < stop if side == "LONG" else r[4] > stop
+        hit_tgt = target is not None and (r[2] >= target if side == "LONG" else r[3] <= target)
+        if hit_stop or hit_tgt:
+            nxt = bars[i + 1] if i + 1 < len(bars) else None
+            if nxt is not None and nxt[0] > force_key:
+                nxt = None
+            return {"bar": nxt, "reason": "stop (close-confirmed)" if hit_stop else "target",
+                    "trigger": r}
+    return {"bar": None, "reason": "no exit found", "trigger": None}
 RISK_EDGES, RISK_LABELS = [10, 20, 40], ["risk < 10", "risk 10-20", "risk 20-40", "risk 40+"]
 
 
@@ -179,7 +223,8 @@ def sane(bar: list | None) -> bool:
     return bool(bar) and bar[3] > 0 and bar[2] >= bar[3] and bar[3] <= bar[1] <= bar[2] and bar[3] <= bar[4] <= bar[2]
 
 
-def simulate(setup: dict, tf: int, target: str, idx_rows: list[list], opt_rows: list[list]) -> dict:
+def simulate(setup: dict, tf: int, target: str, idx_rows: list[list], opt_rows: list[list],
+             trigger: str = "touch", eod: str = "close") -> dict:
     """Index stop/target scan -> exit minute -> option fills (Rules 1-3). {"skip":...} or the fill data."""
     entry_idx = bar_after_candle(idx_rows, setup["start"], tf)
     entry_opt = bar_after_candle(opt_rows, setup["start"], tf)
@@ -189,7 +234,9 @@ def simulate(setup: dict, tf: int, target: str, idx_rows: list[list], opt_rows: 
         return {"skip": "option entry bar missing or invalid"}
     key0 = candle_done_at(setup["start"], tf - 1) if tf > 1 else setup["start"]   # last minute of the touch candle
     tgt = target_price(setup, target)
-    ex = scan_exit(idx_rows, setup["side"], key0, stop=setup["stop"], target=tgt, force_key=SQUARE_OFF)
+    scan = scan_exit if trigger == "touch" else scan_close_stop
+    ex = scan(idx_rows, setup["side"], key0, setup["stop"], tgt,
+              SQUARE_OFF if eod == "close" else NEVER)
     if ex["bar"] is None:
         return {"skip": f"no exit bar ({ex['reason']}; trigger {ex['trigger'][0] if ex['trigger'] else '-'})"}
     exit_opt = next((r for r in opt_rows if r[0] == ex["bar"][0]), None)
@@ -204,6 +251,10 @@ def simulate(setup: dict, tf: int, target: str, idx_rows: list[list], opt_rows: 
 # fetch + main
 # ---------------------------------------------------------------------------
 async def main(frm: date, to: date) -> None:
+    use_tfs = [int(v[:-1]) for v in _vals("tf")]
+    use_targets = _vals("target")
+    use_triggers = _vals("trigger")
+    use_eods = _vals("eod")
     now = datetime.now(IST)
     skips: list[str] = []
     trades: list[dict] = []
@@ -235,7 +286,7 @@ async def main(frm: date, to: date) -> None:
 
         for day, rows in usable.items():
             dd = date.fromisoformat(day)
-            for tf in TIMEFRAMES:
+            for tf in use_tfs:
                 tag = f"{day} {tf}m"
                 cd = rows if tf == 1 else resample(rows, tf)
                 setup = find_setup(cd, tf)
@@ -265,8 +316,10 @@ async def main(frm: date, to: date) -> None:
                 if not orows:
                     msg = f"{tag}: option {contract['trading_symbol']} has no bars"
                     skips.append(msg); print("SKIP " + msg); continue
-                for target in TARGETS:
-                    sim = simulate(setup, tf, target, rows, orows)
+                for target in use_targets:
+                  for trig in use_triggers:
+                   for eod in use_eods:
+                    sim = simulate(setup, tf, target, rows, orows, trig, eod)
                     if sim["skip"]:
                         msg = f"{tag} {target}: {sim['skip']}"
                         skips.append(msg); print("SKIP " + msg); continue
@@ -286,7 +339,7 @@ async def main(frm: date, to: date) -> None:
                         exit_reason=sim["reason"], kind="option", capital=sim["entry_px"] * qty,
                         stop=None, target=None, mfe=mfe, mae=mae, expiry=contract["expiry"],
                         option_type=otype, levels=lv,
-                        variant={"tf": f"{tf}m", "target": target},
+                        variant={"tf": f"{tf}m", "target": target, "trigger": trig, "eod": eod},
                         tags={"direction": "demand (buy CE)" if setup["side"] == "LONG" else "supply (buy PE)",
                               "risk": bucket(setup["risk"], RISK_EDGES, RISK_LABELS)},
                         note=(f"{setup['kind']} break {setup['break_time']} (swing {setup['swing_time']}), zone "
@@ -334,7 +387,13 @@ async def main(frm: date, to: date) -> None:
     groups = [{"name": "direction", "keys": ["direction"]},
               {"name": "risk at entry", "keys": ["risk"]},
               {"name": "direction x risk", "keys": ["direction", "risk"]}]
-    payload = build_payload(meta, trades, usable, option_sessions, groups)
+    meta.setdefault("rejected", []).append(
+        ["Three of the source's four stop anchors",
+         "its STOP_ANCHORS list offers the sweep candle's extreme, the micro-BOS candle's "
+         "extreme and the nearer of the two. This rule is the zone alone - it has no sweep and "
+         "no micro-BOS - so only the zone anchor exists to price."])
+    payload = build_payload(meta, trades, usable, option_sessions, groups,
+                            settings=SETTINGS, chart="default")
     path = write_report(payload, SLUG)
     print(console_summary(trades))
     print(path)
@@ -343,7 +402,11 @@ async def main(frm: date, to: date) -> None:
 if __name__ == "__main__":
     yesterday = datetime.now(IST).date() - timedelta(days=1)
     ap = argparse.ArgumentParser(description="Supply and Demand v3 backtest")
-    ap.add_argument("--from", dest="frm", type=date.fromisoformat, default=yesterday - timedelta(days=182))
-    ap.add_argument("--to", dest="to", type=date.fromisoformat, default=yesterday)
+    ap.add_argument("--from", dest="frm", type=date.fromisoformat, default=START_DATE)
+    ap.add_argument("--to", dest="to", type=date.fromisoformat, default=END_DATE)
+    settings_cli(ap, SETTINGS)
     a = ap.parse_args()
+    SETTINGS[:] = narrow(SETTINGS, a)
+    check_window(a.frm, a.to)
+    print(f"axes: {len(combos(SETTINGS))} simulated combinations")
     asyncio.run(main(a.frm, a.to))

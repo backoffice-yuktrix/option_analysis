@@ -44,7 +44,7 @@ Step 13 - 3-minute candles by default, 1-minute alongside.
 RUN.md STEP 1 CHECKLIST  (non-interactive run: every gap closed with a default / simplest reading = ASSUMED)
 --------------------------------------------------------------------------------------------------------
  1 Underlying        ASSUMED  NIFTY 50 index (prompt names none). Signals are read from the index.
- 2 Window            ASSUMED  last 6 months ending yesterday (--from / --to).
+ 2 Window            ASSUMED  2026-01-01 through the current IST date (--from / --to).
  3 Signal timeframe  clear    3-minute (default) and 1-minute, built from 1-minute data. Variant filter tf.
  4 Signal rule       clear    swing = 3 left / 3 right strict highs/lows; break = close beyond latest swing.
                      ASSUMED  - swings are computed on the same day's candles only (no carry-over from prior day)
@@ -105,6 +105,30 @@ DEATH_WIDTHS = 4.0
 NO_ENTRY_FROM = "13:00"
 SQUARE_OFF = "15:15"
 TIMEFRAMES = [3, 1]                  # minutes; 3m is the default, 1m alongside
+
+# The axes the source (nes_supply_demand_v4) compares that APPLY to this rule.
+# Its STOP_ANCHORS name a sweep and a micro-BOS; v4 is the trailing rule and has neither, so
+# only its own 100-point stop exists. Said in meta["rejected"] rather than faked.
+TARGET_MODES = [("trail", "no fixed target - the trailing stop is the exit"),
+                ("rr", "a fixed 1:2 off the 100-point stop, with the trail still active"),
+                ("liq", "opposing liquidity")]
+EOD_MODES = [("close", "square off at the session close time"),
+             ("hold", "run to the stop or target, give up at the last candle")]
+RULE = {"target_mode": "trail", "eod": "close"}
+
+SETTINGS = [
+    setting("tf", "Signal timeframe", kind="other", default="3m",
+            values=[f"{t}m" for t in TIMEFRAMES]),
+    setting("target_mode", "Target", kind="exit", default=RULE["target_mode"],
+            options=[{"value": k, "label": v, "raw": k} for k, v in TARGET_MODES]),
+    setting("eod", "End of day", kind="exit", default=RULE["eod"],
+            options=[{"value": k, "label": v, "raw": k} for k, v in EOD_MODES]),
+]
+RR_FIXED = 2.0
+
+
+def _vals(key):
+    return [o["raw"] for o in next(x for x in SETTINGS if x["key"] == key)["options"]]
 
 _EXPECTED = None
 
@@ -173,9 +197,19 @@ def find_setup(c: list[list], tf: int) -> tuple[dict | None, str]:
             done = candle_done_at(c[j][0], tf)
             if done >= NO_ENTRY_FROM:
                 return None, f"{direction} zone first touched at {c[j][0]} (completes {done}): no entry from {NO_ENTRY_FROM}"
+            long_ = direction.startswith("demand") or direction == "long"
+            ref = c[j][4]
+            before = c[:j]
+            sw = latest_confirmed(c, j, "high" if long_ else "low")
+            pool = [max((r[2] for r in before), default=None) if long_
+                    else min((r[3] for r in before), default=None),
+                    (c[sw][2] if (sw is not None and long_) else
+                     c[sw][3] if sw is not None else None)]
+            pool = [x for x in pool if x is not None and ((x > ref) if long_ else (x < ref))]
+            liq = (max(pool) if long_ else min(pool)) if pool else None
             return {"direction": direction, "zone_lo": zlo, "zone_hi": zhi, "zone_t": zone[0],
                     "break_t": c[i][0], "level": level, "level_t": level_t,
-                    "signal_start": c[j][0], "signal_close": c[j][4], "tf": tf}, ""
+                    "signal_start": c[j][0], "signal_close": c[j][4], "tf": tf, "liq": liq}, ""
         if candle_done_at(c[j][0], tf) >= NO_ENTRY_FROM:
             return None, f"{direction} zone {zlo:.2f}-{zhi:.2f} not touched before {NO_ENTRY_FROM}"
     return None, f"{direction} zone {zlo:.2f}-{zhi:.2f} never touched"
@@ -184,13 +218,22 @@ def find_setup(c: list[list], tf: int) -> tuple[dict | None, str]:
 # ---------------------------------------------------------------------------
 # simulate: pure - index 1-minute bars -> exit trigger; option bars -> fills
 # ---------------------------------------------------------------------------
-def scan_index(rows_1m: list[list], long_: bool, entry_t: str, ref: float) -> dict | None:
+def scan_index(rows_1m: list[list], long_: bool, entry_t: str, ref: float,
+               target_mode: str = "trail", eod: str = "close", liq: float | None = None) -> dict | None:
     """Walk the INDEX 1-minute bars from the entry bar on.  Stop = ref -/+ 100; once the best price is
     40 in favour the stop trails 30 behind it (only in favour).  A touch inside a completed bar is a
     signal, acted on in the NEXT bar; a bar's own high/low updates the trail only after that bar's stop
     check (conservative); the entry bar checks the stop but does not feed the trail.  15:15 = time exit
     in that bar.  Returns {exit_t, reason, trigger_t, stop0, stop, armed_at} or None."""
     stop = stop0 = ref - STOP_PTS if long_ else ref + STOP_PTS
+    # the target the source compares: none (the trail alone), a fixed R:R off the same
+    # 100-point stop with the trail still running, or the opposing liquidity level
+    if target_mode == "rr":
+        tgt = ref + RR_FIXED * STOP_PTS if long_ else ref - RR_FIXED * STOP_PTS
+    elif target_mode == "liq":
+        tgt = liq
+    else:
+        tgt = None
     best, armed, armed_at, pending, trig = ref, False, None, None, None
     for r in rows_1m:
         t = r[0]
@@ -198,10 +241,13 @@ def scan_index(rows_1m: list[list], long_: bool, entry_t: str, ref: float) -> di
             continue
         if pending:
             return {"exit_t": t, "reason": pending, "trigger_t": trig, "stop0": stop0, "stop": stop, "armed_at": armed_at}
-        if t >= SQUARE_OFF:
+        if eod == "close" and t >= SQUARE_OFF:
             return {"exit_t": t, "reason": "time exit", "trigger_t": None, "stop0": stop0, "stop": stop, "armed_at": armed_at}
         if (r[3] <= stop) if long_ else (r[2] >= stop):
             pending, trig = ("trail" if armed else "stop"), t
+            continue
+        if tgt is not None and ((r[2] >= tgt) if long_ else (r[3] <= tgt)):
+            pending, trig = "target", t          # a touch is a signal: exit in the next bar
             continue
         if t > entry_t:
             best = max(best, r[2]) if long_ else min(best, r[3])
@@ -220,6 +266,9 @@ def clean_rows(rows: list[list]) -> bool:
 
 # ---------------------------------------------------------------------------
 async def main(frm: date, to: date) -> None:
+    use_tfs = [int(v[:-1]) for v in _vals("tf")]
+    use_targets = _vals("target_mode")
+    use_eods = _vals("eod")
     today = datetime.now(IST)
     if to >= today.date() and today.strftime("%H:%M") < "15:45":
         to = today.date() - timedelta(days=1)
@@ -252,7 +301,7 @@ async def main(frm: date, to: date) -> None:
                 print("SKIP " + msg); skipped.append(msg)
                 continue
             d_ = date.fromisoformat(day)
-            for tf in TIMEFRAMES:
+            for tf in use_tfs:
                 candles = rows if tf == 1 else resample(rows, tf)
                 setup, why = find_setup(candles, tf)
                 tag = f"{day} [{tf}m]"
@@ -266,7 +315,10 @@ async def main(frm: date, to: date) -> None:
                     msg = f"{tag}: entry bar after {setup['signal_start']} missing"
                     print("SKIP " + msg); skipped.append(msg)
                     continue
-                sc = scan_index(rows, long_, ebar[0], setup["signal_close"])
+                for tmode in use_targets:
+                 for eod in use_eods:
+                  sc = scan_index(rows, long_, ebar[0], setup["signal_close"], tmode, eod,
+                                  setup.get("liq"))
                 if sc is None:
                     msg = f"{tag}: no exit found in the index bars"
                     print("SKIP " + msg); skipped.append(msg)
@@ -314,7 +366,8 @@ async def main(frm: date, to: date) -> None:
                     day=day, side="LONG", symbol=con["trading_symbol"], entry_time=ebar[0], entry_px=epx,
                     exit_time=sc["exit_t"], exit_px=xpx, qty=qty, exit_reason=sc["reason"], kind="option",
                     capital=epx * qty, entry_spot=ref, stop=None, target=None, mfe=mfe, mae=mae,
-                    variant={"tf": f"{tf}m"}, tags={"direction": setup["direction"]}, levels=lv,
+                    variant={"tf": f"{tf}m", "target_mode": tmode, "eod": eod},
+                    tags={"direction": setup["direction"]}, levels=lv,
                     option_type=otype, expiry=con["expiry"],
                     note=(f"signal candle {setup['signal_start']} ({tf}m), touch of zone "
                           f"{setup['zone_lo']:.2f}-{setup['zone_hi']:.2f}; index stop/trail; trigger {sc['trigger_t']}")))
@@ -362,7 +415,12 @@ async def main(frm: date, to: date) -> None:
         "coverage": cov,
     }
     groups = [{"name": "Direction at entry", "keys": ["direction"]}]
-    payload = build_payload(meta, trades, sessions, option_sessions, groups)
+    meta.setdefault("rejected", []).append(
+        ["The source's sweep and micro-BOS stop anchors",
+         "its STOP_ANCHORS list names a sweep candle and a micro-BOS candle. This is the "
+         "trailing rule and has neither, so only its own 100-point stop exists to price."])
+    payload = build_payload(meta, trades, sessions, option_sessions, groups,
+                            settings=SETTINGS, chart="default")
     path = write_report(payload, REPORT_NAME)
     print(f"\nSkipped {len(skipped)} day/timeframe combinations (listed above).")
     print(console_summary(trades))
@@ -372,7 +430,11 @@ async def main(frm: date, to: date) -> None:
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="Supply and Demand v4 backtest")
     yday = date.today() - timedelta(days=1)
-    ap.add_argument("--from", dest="frm", type=date.fromisoformat, default=yday - timedelta(days=182))
-    ap.add_argument("--to", dest="to", type=date.fromisoformat, default=yday)
+    ap.add_argument("--from", dest="frm", type=date.fromisoformat, default=START_DATE)
+    ap.add_argument("--to", dest="to", type=date.fromisoformat, default=END_DATE)
+    settings_cli(ap, SETTINGS)
     a = ap.parse_args()
+    SETTINGS[:] = narrow(SETTINGS, a)
+    check_window(a.frm, a.to)
+    print(f"axes: {len(combos(SETTINGS))} simulated combinations")
     asyncio.run(main(a.frm, a.to))

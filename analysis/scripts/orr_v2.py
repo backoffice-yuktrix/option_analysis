@@ -21,7 +21,7 @@ Step 14 - Run the whole thing separately at 11:00, 11:10, 11:15, 11:20, 11:40, 1
 CHECKLIST (RUN.md Step 1)
 -------------------------
  1 Underlying        clear    NIFTY 50 index, 1-minute candles.
- 2 Window            ASSUMED  last 6 months ending yesterday (default); --from / --to override.
+ 2 Window            ASSUMED  2026-01-01 through the current IST date (default); --from / --to override.
  3 Signal timeframe  clear    1m.
  4 Signal rule       clear    range = 09:15-09:19 high/low; window = 09:20..T; least-squares slope of closes;
                               touching is not breaking.  (Which candle is "the close at 11:30" -> ASSUMED below.)
@@ -311,8 +311,8 @@ def main():
     last_done = today.date() if today.hour * 60 + today.minute > 15 * 60 + 45 else today.date() - timedelta(days=1)
     default_to = today.date() - timedelta(days=1)
     ap = argparse.ArgumentParser(description="Opening Range Reversal v2 backtest")
-    ap.add_argument("--from", dest="frm", type=date.fromisoformat, default=None)
-    ap.add_argument("--to", dest="to", type=date.fromisoformat, default=default_to)
+    ap.add_argument("--from", dest="frm", type=date.fromisoformat, default=START_DATE)
+    ap.add_argument("--to", dest="to", type=date.fromisoformat, default=END_DATE)
     a = ap.parse_args()
     to = min(a.to, last_done)                       # rule 7: today only after 15:45
     frm = a.frm or (to - timedelta(days=182))

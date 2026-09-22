@@ -40,7 +40,7 @@ Step 18 3-minute candles by default, 1-minute alongside.
 RUN.md STEP 1 - CHECKLIST (non-interactive run: every gap closed by a default / simplest reading)
 ----------------------------------------------------------------------------------------------
  1 Underlying          clear    NIFTY 50 index, 1-minute candles from Upstox
- 2 Window              assumed  default: last 6 months ending yesterday (--from / --to override)
+ 2 Window              assumed  default: 2026-01-01 through the current IST date (--from / --to override)
  3 Signal timeframe    clear    3m (default) and 1m, both built from 1-minute candles, as variants
  4 Signal rule         clear*   Steps 1-16; see ASSUMED items for the numbers the prompt leaves out
  5 Decision time       clear    close of the micro break candle; the fill is the NEXT 1m bar (rule 2)
@@ -102,6 +102,72 @@ TFS = [3, 1]              # Step 18
 LOTS = 1
 SESSION_ROWS = 375
 SLUG = "snd_v2"
+
+# The axes the source (nes_supply_demand_v2) compares. All four stop anchors apply here:
+# this rule has both a sweep and a micro-BOS, unlike v3 (zone only) and v4 (trailing).
+STOP_ANCHORS = [("zone", "far side of the zone, or the sweep - the spec"),
+                ("sweep", "the sweep candle's extreme"),
+                ("bos", "the micro-BOS candle's extreme"),
+                ("tight", "the nearer of the sweep and the micro-BOS candle")]
+TARGET_MODES = [("rr", "fixed R:R"), ("liq", "opposing liquidity")]
+STOP_TRIGGERS = [("touch", "an order resting at the level, filled on touch"),
+                 ("close", "a candle CLOSE beyond the level, filled next bar")]
+EOD_MODES = [("close", "square off at the session close time"),
+             ("hold", "run to stop or target, give up at the last candle")]
+NEVER = "99:99"                 # a force-exit key later than any bar: "hold" runs to the end
+RULE = {"anchor": "zone", "target_mode": "rr", "trigger": "touch", "eod": "close"}
+
+SETTINGS = [
+    setting("tf", "Signal timeframe", kind="other", values=[f"{t}m" for t in TFS], default="3m"),
+    setting("rr", "Reward:risk", kind="exit", default="1:2",
+            values=[f"1:{r:g}" for r in RRS]),   # rr_label is defined below
+    setting("anchor", "Stop anchor", kind="exit", default=RULE["anchor"],
+            options=[{"value": k, "label": v, "raw": k} for k, v in STOP_ANCHORS]),
+    setting("trigger", "Stop trigger", kind="exit", default=RULE["trigger"],
+            options=[{"value": k, "label": v, "raw": k} for k, v in STOP_TRIGGERS]),
+    setting("target_mode", "Target", kind="exit", default=RULE["target_mode"],
+            options=[{"value": k, "label": v, "raw": k} for k, v in TARGET_MODES]),
+    setting("eod", "End of day", kind="exit", default=RULE["eod"],
+            options=[{"value": k, "label": v, "raw": k} for k, v in EOD_MODES]),
+]
+
+
+def _vals(key):
+    return [o["raw"] for o in next(x for x in SETTINGS if x["key"] == key)["options"]]
+
+
+def anchored_stop(setup: dict, anchor: str) -> float:
+    """The stop for one anchor. 'zone' is the spec: the far side of the zone or the sweep,
+    whichever is further from the entry."""
+    bull = setup["bull"]
+    zlo, zhi = setup["zone"]
+    sweep, bos = setup["sweep"]["extreme"], setup["bos_extreme"]
+    if anchor == "sweep":
+        return sweep
+    if anchor == "bos":
+        return bos
+    if anchor == "tight":
+        return max(sweep, bos) if bull else min(sweep, bos)
+    return min(zlo, sweep) if bull else max(zhi, sweep)
+
+
+def scan_close_stop(bars, side, entry_key, stop, target, force_key):
+    """Close-confirmed stop: a bar must CLOSE beyond the stop, which is a signal, so the exit
+    is the NEXT bar (rule 3). The target stays a touch. Stop first if a bar does both."""
+    for i, r in enumerate(bars):
+        if r[0] <= entry_key:
+            continue
+        if r[0] == force_key:
+            return {"bar": r, "reason": "time exit", "trigger": None}
+        hit_stop = r[4] < stop if side == "LONG" else r[4] > stop
+        hit_tgt = r[2] >= target if side == "LONG" else r[3] <= target
+        if hit_stop or hit_tgt:
+            nxt = bars[i + 1] if i + 1 < len(bars) else None
+            if nxt is not None and nxt[0] > force_key:
+                nxt = None
+            return {"bar": nxt, "reason": "stop (close-confirmed)" if hit_stop else "target",
+                    "trigger": r}
+    return {"bar": None, "reason": "no exit found", "trigger": None}
 
 
 def rr_label(rr: float) -> str:
@@ -213,17 +279,34 @@ def find_setup(c: list[list], tf: int) -> dict:
         if risk < MIN_RISK:
             return {"skip": f"{direction} confirmation at {c[k][0]}: risk {risk:.2f} < {MIN_RISK:g} point, "
                             f"day used up"}
+        # what the source's other anchors and its liquidity target need, read from candles
+        # complete at the signal (rule 4)
+        bos_extreme = c[k][3] if bull else c[k][2]
+        before = c[:k]
+        if bull:
+            pool = [max((r[2] for r in before), default=None),
+                    (mh[1] if mh is not None else None)]
+            pool = [x for x in pool if x is not None and x > cl]
+            liq = max(pool) if pool else None
+        else:
+            pool = [min((r[3] for r in before), default=None),
+                    (ml[1] if ml is not None else None)]
+            pool = [x for x in pool if x is not None and x < cl]
+            liq = min(pool) if pool else None
         return {"setup": {"direction": direction, "bull": bull, "zone": (zlo, zhi), "zone_start": c[zi][0],
                           "break_start": c[bi][0], "swing": swing[1], "width": w,
                           "sweep": sweep, "sweep_start": c[sweep["i"]][0], "signal_start": c[k][0],
-                          "signal_done": done(c[k], tf), "entry_index": cl, "stop": stop, "risk": risk}}
+                          "signal_done": done(c[k], tf), "entry_index": cl, "stop": stop, "risk": risk,
+                          "bos_extreme": bos_extreme, "liq": liq}}
     return {"skip": f"{direction} zone {zlo:.2f}-{zhi:.2f}: session ended without a confirmation"}
 
 
 # ---------------------------------------------------------------------------
 # simulate (pure: bars -> exit)
 # ---------------------------------------------------------------------------
-def simulate(setup: dict, tf: int, rr: float, index_rows: list[list], opt_rows: list[list]):
+def simulate(setup: dict, tf: int, rr: float, index_rows: list[list], opt_rows: list[list],
+             anchor: str = "zone", trigger: str = "touch", target_mode: str = "rr",
+             eod: str = "close"):
     """Returns ({trade fields}) or a string (the reason the trade could not be taken)."""
     bull = setup["bull"]
     entry_bar_1m = bar_after_candle(index_rows, setup["signal_start"], tf)            # rule 2
@@ -232,10 +315,21 @@ def simulate(setup: dict, tf: int, rr: float, index_rows: list[list], opt_rows: 
     ek = entry_bar_1m[0]
     if ek >= SQUARE_OFF:
         return f"entry bar {ek} is at/after {SQUARE_OFF}"
-    e, risk = setup["entry_index"], setup["risk"]
-    target = e + rr * risk if bull else e - rr * risk
-    ex = scan_exit(index_rows, "LONG" if bull else "SHORT", ek, stop=setup["stop"], target=target,
-                   force_key=SQUARE_OFF)                                              # rule 3
+    e = setup["entry_index"]
+    stop = anchored_stop(setup, anchor)
+    risk = abs(e - stop)
+    if risk < MIN_RISK:
+        return f"{anchor} stop gives risk {risk:.2f} < {MIN_RISK:g} point"
+    if target_mode == "liq":
+        target = setup.get("liq")
+        if target is None:
+            return "no opposing liquidity beyond the entry"
+    else:
+        target = e + rr * risk if bull else e - rr * risk
+    side = "LONG" if bull else "SHORT"
+    force = SQUARE_OFF if eod == "close" else NEVER
+    scan = scan_exit if trigger == "touch" else scan_close_stop
+    ex = scan(index_rows, side, ek, stop, target, force)                              # rule 3
     if ex["bar"] is None:
         return f"exit not resolvable ({ex['reason']})"
     xk = ex["bar"][0]
@@ -248,7 +342,7 @@ def simulate(setup: dict, tf: int, rr: float, index_rows: list[list], opt_rows: 
     entry_px, exit_px = worst_fills("LONG", eb, xb)                                   # rule 1
     mfe, mae = excursion(opt_rows, "LONG", entry_px, ek, xk)
     return {"ek": ek, "xk": xk, "entry_px": entry_px, "exit_px": exit_px, "reason": ex["reason"],
-            "target": target, "mfe": mfe, "mae": mae}
+            "target": target, "mfe": mfe, "mae": mae, "stop": stop, "risk": risk}
 
 
 # ---------------------------------------------------------------------------
@@ -268,6 +362,12 @@ def clean_session(rows: list[list]) -> str | None:
 
 
 async def main(frm: date, to: date) -> None:
+    use_tfs = [int(v[:-1]) for v in _vals("tf")]
+    use_rrs = [float(v.split(":")[1]) for v in _vals("rr")]
+    use_anchors = _vals("anchor")
+    use_triggers = _vals("trigger")
+    use_targets = _vals("target_mode")
+    use_eods = _vals("eod")
     now = datetime.now(IST)
     if to >= now.date() and now.strftime("%H:%M") <= "15:45":
         to = now.date() - timedelta(days=1)                                           # rule 7
@@ -298,7 +398,7 @@ async def main(frm: date, to: date) -> None:
             if bad:
                 print(f"SKIP {day} (all): {bad}"); skips += 1
                 continue
-            for tf in TFS:
+            for tf in use_tfs:
                 res = find_setup(resample(rows, tf), tf)
                 if "skip" in res:
                     print(f"SKIP {day} [{tf}m]: {res['skip']}"); skips += 1
@@ -326,31 +426,36 @@ async def main(frm: date, to: date) -> None:
                 option_sessions.setdefault(con["trading_symbol"], {})[day] = orows
                 qty = LOTS * con["lot_size"]
                 zlo, zhi = s["zone"]
-                for rr in RRS:
-                    r = simulate(s, tf, rr, rows, orows)
-                    if isinstance(r, str):
-                        print(f"SKIP {day} [{tf}m {rr_label(rr)}]: {r}"); skips += 1
-                        continue
-                    depth_w = s["sweep"]["depth"] / s["width"]
-                    trades.append(make_trade(
-                        day=day, side="LONG", symbol=con["trading_symbol"], entry_time=r["ek"],
-                        entry_px=r["entry_px"], exit_time=r["xk"], exit_px=r["exit_px"], qty=qty,
-                        exit_reason=r["reason"], kind="option", capital=r["entry_px"] * qty,
-                        mfe=r["mfe"], mae=r["mae"], expiry=con["expiry"], option_type=ot,
-                        variant={"tf": f"{tf}m", "rr": rr_label(rr)},
-                        tags={"direction": "bullish (buy CE)" if s["bull"] else "bearish (buy PE)",
-                              "sweep depth": bucket(depth_w, [0.25, 0.5, 1.0],
-                                                    ["0.1-0.25 w", "0.25-0.5 w", "0.5-1 w", "over 1 w"]),
-                              "risk pts": bucket(s["risk"], [30, 50, 80],
-                                                 ["under 30", "30-50", "50-80", "over 80"])},
-                        levels=[{"name": "zone", "price": zlo, "price2": zhi, "from": s["zone_start"], "to": r["xk"]},
-                                {"name": "swing broken", "price": s["swing"], "from": s["break_start"], "to": s["signal_start"]},
-                                {"name": "sweep level", "price": s["sweep"]["level"], "from": s["sweep_start"], "to": s["signal_start"]},
-                                {"name": "index entry (signal close)", "price": s["entry_index"], "from": s["signal_start"], "to": r["xk"]},
-                                {"name": "index stop", "price": s["stop"], "from": s["signal_start"], "to": r["xk"]},
-                                {"name": "index target", "price": r["target"], "from": s["signal_start"], "to": r["xk"]}],
-                        note=f"signal candle {s['signal_start']} ({tf}m), index risk {s['risk']:.2f} pts, "
-                             f"zone width {s['width']:.2f}"))
+                for rr in use_rrs:
+                 for anchor in use_anchors:
+                  for trig in use_triggers:
+                   for tmode in use_targets:
+                    for eod in use_eods:
+                        r = simulate(s, tf, rr, rows, orows, anchor, trig, tmode, eod)
+                        if isinstance(r, str):
+                            skips += 1
+                            continue
+                        depth_w = s["sweep"]["depth"] / s["width"]
+                        trades.append(make_trade(
+                            day=day, side="LONG", symbol=con["trading_symbol"], entry_time=r["ek"],
+                            entry_px=r["entry_px"], exit_time=r["xk"], exit_px=r["exit_px"], qty=qty,
+                            exit_reason=r["reason"], kind="option", capital=r["entry_px"] * qty,
+                            mfe=r["mfe"], mae=r["mae"], expiry=con["expiry"], option_type=ot,
+                            variant={"tf": f"{tf}m", "rr": rr_label(rr), "anchor": anchor,
+                                     "trigger": trig, "target_mode": tmode, "eod": eod},
+                            tags={"direction": "bullish (buy CE)" if s["bull"] else "bearish (buy PE)",
+                                  "sweep depth": bucket(depth_w, [0.25, 0.5, 1.0],
+                                                        ["0.1-0.25 w", "0.25-0.5 w", "0.5-1 w", "over 1 w"]),
+                                  "risk pts": bucket(s["risk"], [30, 50, 80],
+                                                     ["under 30", "30-50", "50-80", "over 80"])},
+                            levels=[{"name": "zone", "price": zlo, "price2": zhi, "from": s["zone_start"], "to": r["xk"]},
+                                    {"name": "swing broken", "price": s["swing"], "from": s["break_start"], "to": s["signal_start"]},
+                                    {"name": "sweep level", "price": s["sweep"]["level"], "from": s["sweep_start"], "to": s["signal_start"]},
+                                    {"name": "index entry (signal close)", "price": s["entry_index"], "from": s["signal_start"], "to": r["xk"]},
+                                    {"name": "index stop", "price": s["stop"], "from": s["signal_start"], "to": r["xk"]},
+                                    {"name": "index target", "price": r["target"], "from": s["signal_start"], "to": r["xk"]}],
+                            note=f"signal candle {s['signal_start']} ({tf}m), index risk {s['risk']:.2f} pts, "
+                                 f"zone width {s['width']:.2f}"))
     print(f"\n{len(trades)} trades, {skips} skips/rejections listed above")
     meta = {
         "title": "Supply and Demand v2 - NIFTY",
@@ -391,7 +496,8 @@ async def main(frm: date, to: date) -> None:
             "Sold-option margin does not apply: capital is premium x quantity (bought option).",
             "Rule 1 fills at high/low are deliberately pessimistic, and stop checks use index prices not option prices."],
         "coverage": cov}
-    payload = build_payload(meta, trades, sessions, option_sessions, [
+    payload = build_payload(meta, trades, sessions, option_sessions, settings=SETTINGS,
+                            chart="default", groups=[
         {"name": "Direction", "keys": ["direction"]},
         {"name": "Sweep depth (zone widths)", "keys": ["sweep depth"]},
         {"name": "Index risk (points)", "keys": ["risk pts"]}])
@@ -403,7 +509,11 @@ async def main(frm: date, to: date) -> None:
 if __name__ == "__main__":
     yday = datetime.now(IST).date() - timedelta(days=1)
     ap = argparse.ArgumentParser(description="Supply and Demand v2 backtest")
-    ap.add_argument("--from", dest="frm", type=date.fromisoformat, default=yday - timedelta(days=182))
-    ap.add_argument("--to", dest="to", type=date.fromisoformat, default=yday)
+    ap.add_argument("--from", dest="frm", type=date.fromisoformat, default=START_DATE)
+    ap.add_argument("--to", dest="to", type=date.fromisoformat, default=END_DATE)
+    settings_cli(ap, SETTINGS)
     a = ap.parse_args()
+    SETTINGS[:] = narrow(SETTINGS, a)
+    check_window(a.frm, a.to)
+    print(f"axes: {len(combos(SETTINGS))} simulated combinations")
     asyncio.run(main(a.frm, a.to))

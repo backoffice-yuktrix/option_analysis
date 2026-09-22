@@ -27,7 +27,7 @@ USER PROMPT (verbatim summary of the steps)
 
 CHECKLIST (RUN.md Step 1) - answers and ASSUMPTIONS
     1  Underlying          clear    NIFTY 50 index.
-    2  Window              ASSUMED  last 6 months ending yesterday (--from / --to override).
+    2  Window              ASSUMED  2026-01-01 through the current IST date (--from / --to override).
     3  Signal timeframe    clear    daily bars built from 1m (09:15-15:14) plus the 1m late-session candles.
     4  Signal rule         clear    all inputs and thresholds numeric (steps 3-10).
     5  Decision time       clear    after the 15:14 candle completes.
@@ -65,6 +65,33 @@ import asyncio
 from datetime import date, timedelta
 
 SLUG = "onh_v1"
+
+# The axes the source (eod_trend_signal_v1) compares and this script fixed at one point.
+# Expiry changes WHICH contract is bought, so it is the only one that costs fetches.
+EXPIRY_MODES = [("next", "nearest expiry strictly after the signal day - may expire next morning"),
+                ("skip-1dte", "nearest expiry strictly after the EXIT day - never hold into expiry morning"),
+                ("always", "one expiry further out than 'next'")]
+RULE = {"expiry_mode": "next"}
+
+SETTINGS = [
+    setting("expiry_mode", "Which expiry", kind="other", default=RULE["expiry_mode"], rerun=True,
+            options=[{"value": k, "label": v, "raw": k} for k, v in EXPIRY_MODES],
+            help="the contract the night is bought in; each one is its own fetch"),
+]
+
+
+def _vals(key):
+    return [o["raw"] for o in next(x for x in SETTINGS if x["key"] == key)["options"]]
+
+
+def pick_expiry(expiries, signal_day, exit_day, mode):
+    """The expiry for one mode, or None. 'always' steps one further out than 'next'."""
+    if mode == "skip-1dte":
+        return next_expiry(expiries, date.fromisoformat(exit_day), 1)
+    nxt = next_expiry(expiries, signal_day, 1)
+    if mode != "always" or nxt is None:
+        return nxt
+    return next_expiry(expiries, nxt, 1)
 LOTS = 1
 ENTRY_TIME, EXIT_TIME = "15:29", "09:15"
 SIGNAL_LAST, WINDOW_FIRST = "15:14", "09:15"
@@ -180,6 +207,7 @@ def simulate(entry_rows: list[list], exit_rows: list[list]) -> tuple[list | None
 # main
 # ---------------------------------------------------------------------------
 async def run(frm: date, to: date) -> None:
+    use_expiry = _vals("expiry_mode")
     today = date.today()
     fetch_to = min(to + timedelta(days=7), today - timedelta(days=1))    # next session for the last signal day
     async with Upstox() as up:
@@ -198,7 +226,8 @@ async def run(frm: date, to: date) -> None:
         print(f"{len(days)} index sessions fetched ({days[0]} .. {days[-1]})" if days else "no index data")
 
         trades, skipped, opt_sessions, holds = [], [], {}, 0
-        for i, d in enumerate(days):
+        # the expiry mode changes which contract is bought, so it pairs with the day.
+        for (i, d), expiry_mode in [((i, d), m) for i, d in enumerate(days) for m in use_expiry]:
             dd = date.fromisoformat(d)
             if not (frm <= dd <= to):
                 continue
@@ -226,9 +255,9 @@ async def run(frm: date, to: date) -> None:
                 skip(f"no index candle at {EXIT_TIME} on exit day {xd}"); continue
 
             opt_type = "CE" if s["action"] == "BUY" else "PE"
-            expiry = next_expiry(expiries, dd, 1)                        # strictly after the signal day
+            expiry = pick_expiry(expiries, dd, xd, expiry_mode)
             if expiry is None:
-                skip("no expiry after the signal day"); continue
+                skip(f"no expiry for mode {expiry_mode}"); continue
             strike = atm_strike(s["close"], step)                       # 15:14 close, the completed signal candle
             c = await up.resolve_option(ukey, expiry, strike, opt_type)
             if c is None or not c["lot_size"]:
@@ -254,7 +283,8 @@ async def run(frm: date, to: date) -> None:
                 entry_time=ENTRY_TIME, entry_px=entry_px, exit_time=EXIT_TIME, exit_px=exit_px, qty=qty,
                 exit_reason="next-morning time exit", capital=entry_px * qty, expiry=c["expiry"],
                 option_type=opt_type, mfe=mfe, mae=mae, levels=levels,
-                variant={"signal": s["action"]}, tags=make_tags(s, exp_at_exit),
+                variant={"signal": s["action"], "expiry_mode": expiry_mode},
+                tags=make_tags(s, exp_at_exit),
                 note=(f"trend30 {s['trend30']:.2f}%  loc30 {s['loc30']:.2f}  mom15 {s['mom15']:.1f}  "
                       f"mom10 {s['mom10']:.1f}  volr {s['volr']:.2f}  range20 {s['rr20']:.2f}")))
             opt_sessions.setdefault(c["trading_symbol"], {})[d] = er
@@ -305,7 +335,14 @@ async def run(frm: date, to: date) -> None:
               {"name": "VolatilityRatio10", "keys": ["volratio10"]},
               {"name": "DailyRangeRatio20", "keys": ["dailyrange20"]},
               {"name": "Expiry at exit", "keys": ["expiry at exit"]}]
-    payload = build_payload(meta, trades, sessions, opt_sessions, groups)
+    meta.setdefault("rejected", []).append(
+        ["The source's two partial-session readings",
+         "PARTIAL_MODES asks whether a short session poisons every daily window that contains "
+         "it or is simply left out. This script does not build a daily series at all - its "
+         "features come from the intraday sessions - so there is no window for a partial day "
+         "to poison, and the axis has nothing to price here."])
+    payload = build_payload(meta, trades, sessions, opt_sessions, groups,
+                            settings=SETTINGS, chart="default")
     path = write_report(payload, SLUG)
     print(console_summary(trades))
     print(path)
@@ -314,9 +351,13 @@ async def run(frm: date, to: date) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser(description="ONH v1 backtest")
     yday = date.today() - timedelta(days=1)
-    ap.add_argument("--from", dest="frm", type=date.fromisoformat, default=yday - timedelta(days=182))
-    ap.add_argument("--to", dest="to", type=date.fromisoformat, default=yday)
+    ap.add_argument("--from", dest="frm", type=date.fromisoformat, default=START_DATE)
+    ap.add_argument("--to", dest="to", type=date.fromisoformat, default=END_DATE)
+    settings_cli(ap, SETTINGS)
     a = ap.parse_args()
+    SETTINGS[:] = narrow(SETTINGS, a)
+    check_window(a.frm, a.to)
+    print(f"axes: {len(combos(SETTINGS))} simulated combinations")
     if a.to > date.today() - timedelta(days=1):
         a.to = date.today() - timedelta(days=1)                          # rule 7: today is not complete
     asyncio.run(run(a.frm, a.to))

@@ -54,7 +54,7 @@ STRATEGY PROMPT (verbatim):
 
 CHECKLIST (RUN.md Step 1) - non-interactive, so gaps were closed by ASSUMPTION
     1 Underlying        ASSUMED  NIFTY 50 index (the prompt names none).
-    2 Window            ASSUMED  default: last 6 months ending yesterday (--from / --to override).
+    2 Window            ASSUMED  default: 2026-01-01 through the current IST date (--from / --to override).
     3 Signal timeframe  clear    3m and 1m, both built from 1-minute candles, shown as variant tf.
     4 Signal rule       clear except: "minor swing" has no number -> ASSUMED 1 candle each side
                         (higher/lower than the 1 candle before and the 1 after, confirmed once 1 candle
@@ -109,6 +109,50 @@ MIN_RISK = 1.0              # index points (prompt)
 RRS = [1.0, 2.0, 3.0, 5.0]  # 2 is the base, 1/3/5 alongside (prompt)
 TFS = [3, 1]
 STOP_MODES = ["touch", "close"]
+
+# The axes the source (nes_supply_demand_v1) compares. All are re-simulations of fetched bars.
+STOP_ANCHORS = [("zone", "far side of the zone, or the sweep - the spec"),
+                ("sweep", "the sweep candle's extreme"),
+                ("bos", "the micro-BOS candle's extreme"),
+                ("tight", "the nearer of the sweep and the micro-BOS candle")]
+TARGET_MODES = [("rr", "fixed R:R"),
+                ("liq", "opposing liquidity")]
+EOD_MODES = [("close", "square off at the session close time"),
+             ("hold", "run to stop or target, give up at the last candle")]
+NEVER = "99:99"                 # a force-exit key later than any bar: "hold" runs to the end
+RULE = {"anchor": "zone", "target_mode": "rr", "eod": "close", "stop": "touch"}
+
+SETTINGS = [
+    setting("tf", "Signal timeframe", kind="other", values=[f"{t}m" for t in TFS], default="3m"),
+    setting("rr", "Reward:risk", kind="exit", values=[f"1:{r:g}" for r in RRS], default="1:2"),
+    setting("stop", "Stop trigger", kind="exit", values=STOP_MODES, default=RULE["stop"],
+            help="an order resting at the level, or a candle CLOSE beyond it"),
+    setting("anchor", "Stop anchor", kind="exit", default=RULE["anchor"],
+            options=[{"value": k, "label": v, "raw": k} for k, v in STOP_ANCHORS]),
+    setting("target_mode", "Target", kind="exit", default=RULE["target_mode"],
+            options=[{"value": k, "label": v, "raw": k} for k, v in TARGET_MODES]),
+    setting("eod", "End of day", kind="exit", default=RULE["eod"],
+            options=[{"value": k, "label": v, "raw": k} for k, v in EOD_MODES]),
+]
+
+
+def _vals(key):
+    return [o["raw"] for o in next(x for x in SETTINGS if x["key"] == key)["options"]]
+
+
+def anchored_stop(setup: dict, anchor: str) -> float:
+    """The stop for one anchor.  'zone' is the spec: the far side of the zone, or the sweep,
+    whichever is further away.  The others are the source's alternatives."""
+    short = setup["direction"] != "long"
+    sweep, bos = setup["sweep_extreme"], setup["bos_extreme"]
+    far = setup["zone_high"] if short else setup["zone_low"]
+    if anchor == "sweep":
+        return sweep
+    if anchor == "bos":
+        return bos
+    if anchor == "tight":
+        return min(sweep, bos) if short else max(sweep, bos)
+    return max(far, sweep) if short else min(far, sweep)
 LAST_SIGNAL_DONE = "15:14"  # the entry bar must start before 15:15
 SQUARE_OFF = "15:15"
 FULL_TIMES = [f"{m // 60:02d}:{m % 60:02d}" for m in range(9 * 60 + 15, 15 * 60 + 30)]   # 375 minutes
@@ -207,10 +251,25 @@ def find_setup(rows: list[list], tf: int) -> dict:
                            "zone never touched before 15:15")}
     if risk < MIN_RISK:
         return {"status": f"risk {risk:.2f} pts < {MIN_RISK:g}: no trade, the day's slot is used"}
+    # the alternatives the source compares need the micro-BOS extreme and the opposing
+    # liquidity, both read from candles complete at the signal (rule 4)
+    bos_extreme = h[break_k] if direction != "long" else l[break_k]
+    before = rows[:break_k]
+    if direction == "long":
+        cands = [max((r[2] for r in before), default=None),
+                 max((h[k] for k in range(break_k) if sh[k]), default=None)]
+        cands = [x for x in cands if x is not None and x > entry_ref]
+        liq = max(cands) if cands else None
+    else:
+        cands = [min((r[3] for r in before), default=None),
+                 min((l[k] for k in range(break_k) if sl[k]), default=None)]
+        cands = [x for x in cands if x is not None and x < entry_ref]
+        liq = min(cands) if cands else None
     return {"status": "signal", "direction": direction, "tf": tf, "signal_start": rows[break_k][0],
             "signal_close": entry_ref, "stop": stop, "risk": risk, "zone_low": zl, "zone_high": zh,
             "zone_time": rows[zi][0], "break_time": rows[brk][0], "sweep_time": rows[sweep[0]][0],
-            "sweep_level": sweep[2], "sweep_extreme": sweep[1]}
+            "sweep_level": sweep[2], "sweep_extreme": sweep[1],
+            "bos_extreme": bos_extreme, "liq": liq}
 
 
 # ---------------------------------------------------------------------------
@@ -236,7 +295,8 @@ def scan_close_stop(bars: list[list], side: str, entry_key: str, stop: float, ta
     return {"bar": None, "reason": "no exit found", "trigger": None}
 
 
-def simulate(setup: dict, rr: float, mode: str, idx1: list[list], opt: list[list]) -> dict:
+def simulate(setup: dict, rr: float, mode: str, idx1: list[list], opt: list[list],
+             anchor: str = "zone", target_mode: str = "rr", eod: str = "close") -> dict:
     """Index-level exit scan, then the fills on the OPTION's bars (bought option = LONG)."""
     d = setup["direction"]
     iside = "LONG" if d == "long" else "SHORT"
@@ -246,11 +306,21 @@ def simulate(setup: dict, rr: float, mode: str, idx1: list[list], opt: list[list
     if entry_bar[0] >= SQUARE_OFF:
         return {"skip": f"entry bar {entry_bar[0]} is not before {SQUARE_OFF}"}
     sgn = 1 if d == "long" else -1
-    target = setup["signal_close"] + sgn * rr * setup["risk"]
-    if mode == "touch":
-        ex = scan_exit(idx1, iside, entry_bar[0], setup["stop"], target, SQUARE_OFF)
+    stop = anchored_stop(setup, anchor)
+    risk = (setup["signal_close"] - stop) if d == "long" else (stop - setup["signal_close"])
+    if risk < MIN_RISK:
+        return {"skip": f"{anchor} stop gives risk {risk:.2f} pts < {MIN_RISK:g}"}
+    if target_mode == "liq":
+        target = setup.get("liq")
+        if target is None:
+            return {"skip": "no opposing liquidity beyond the entry"}
     else:
-        ex = scan_close_stop(idx1, iside, entry_bar[0], setup["stop"], target, SQUARE_OFF)
+        target = setup["signal_close"] + sgn * rr * risk
+    force = SQUARE_OFF if eod == "close" else NEVER
+    if mode == "touch":
+        ex = scan_exit(idx1, iside, entry_bar[0], stop, target, force)
+    else:
+        ex = scan_close_stop(idx1, iside, entry_bar[0], stop, target, force)
     if ex["bar"] is None:
         return {"skip": f"no exit bar ({ex['reason']}"
                         f"{', trigger ' + ex['trigger'][0] if ex['trigger'] else ''})"}
@@ -262,7 +332,7 @@ def simulate(setup: dict, rr: float, mode: str, idx1: list[list], opt: list[list
         return {"skip": f"option bar missing at exit {ex['bar'][0]}"}
     epx, xpx = worst_fills("LONG", ob_in, ob_out)
     return {"entry_bar": entry_bar, "exit_bar": ex["bar"], "reason": ex["reason"], "trigger": ex["trigger"],
-            "entry_px": epx, "exit_px": xpx, "target": target}
+            "entry_px": epx, "exit_px": xpx, "target": target, "stop": stop, "risk": risk}
 
 
 # ---------------------------------------------------------------------------
@@ -292,10 +362,20 @@ def session_problem(day: str, rows: list[list]) -> str | None:
 async def main() -> None:
     ap = argparse.ArgumentParser(description="Supply and Demand v1 backtest")
     d0, d1 = default_window()
-    ap.add_argument("--from", dest="frm", default=d0.isoformat())
-    ap.add_argument("--to", dest="to", default=d1.isoformat())
+    ap.add_argument("--from", dest="frm", default=START_DATE.isoformat())
+    ap.add_argument("--to", dest="to", default=END_DATE.isoformat())
+    settings_cli(ap, SETTINGS)
     a = ap.parse_args()
+    SETTINGS[:] = narrow(SETTINGS, a)
+    use_tfs = [int(v[:-1]) for v in _vals("tf")]
+    use_rrs = [float(v.split(":")[1]) for v in _vals("rr")]
+    use_stops = _vals("stop")
+    use_anchors = _vals("anchor")
+    use_targets = _vals("target_mode")
+    use_eods = _vals("eod")
     frm, to = date.fromisoformat(a.frm), date.fromisoformat(a.to)
+    check_window(frm, to)
+    print(f"axes: {len(combos(SETTINGS))} simulated combinations")
     now = datetime.now(IST)
     if to >= now.date() and now.strftime("%H:%M") <= "15:45":
         to = now.date() - timedelta(days=1)          # rule 7: today's session is not over
@@ -324,7 +404,7 @@ async def main() -> None:
             if prob:
                 skipped.append(f"{day}: {prob}"); print(f"SKIP {day}: {prob}"); continue
             exp = next_expiry(expiries, dd, 1)
-            for tf in TFS:
+            for tf in use_tfs:
                 rows_tf = rows1 if tf == 1 else resample(rows1, tf)
                 st = find_setup(rows_tf, tf)
                 if st["status"] != "signal":
@@ -350,20 +430,23 @@ async def main() -> None:
                     msg = f"{day} [{tf}m]: option {sym} has no bars"
                     skipped.append(msg); print(f"SKIP {msg}"); continue
                 qty = con["lot_size"]               # 1 lot
-                for rr in RRS:
-                    for mode in STOP_MODES:
-                        sim = simulate(st, rr, mode, rows1, orows)
+                for rr in use_rrs:
+                  for mode in use_stops:
+                   for anchor in use_anchors:
+                    for tmode in use_targets:
+                     for eod in use_eods:
+                        sim = simulate(st, rr, mode, rows1, orows, anchor, tmode, eod)
                         if "skip" in sim:
-                            msg = f"{day} [{tf}m rr 1:{rr:g} stop {mode}]: {sim['skip']}"
-                            skipped.append(msg); print(f"SKIP {msg}"); continue
+                            skipped.append(f"{day} [{tf}m 1:{rr:g} {mode} {anchor} {tmode} {eod}]: {sim['skip']}")
+                            continue
                         ent, ext = sim["entry_bar"][0], sim["exit_bar"][0]
                         mfe, mae = excursion(orows, "LONG", sim["entry_px"], ent, ext)
                         end = ext
                         levels = [
                             {"name": f"{'demand' if st['direction'] == 'long' else 'supply'} zone",
                              "price": st["zone_low"], "price2": st["zone_high"], "from": st["zone_time"], "to": end},
-                            {"name": "stop (index)", "price": st["stop"], "from": ent, "to": end},
-                            {"name": f"target 1:{rr:g} (index)", "price": sim["target"], "from": ent, "to": end},
+                            {"name": f"stop ({anchor}, index)", "price": sim["stop"], "from": ent, "to": end},
+                            {"name": "target (index)", "price": sim["target"], "from": ent, "to": end},
                             {"name": "signal close", "price": st["signal_close"], "from": st["signal_start"], "to": end},
                             {"name": "sweep level", "price": st["sweep_level"], "from": st["sweep_time"], "to": end},
                         ]
@@ -372,11 +455,13 @@ async def main() -> None:
                             exit_time=ext, exit_px=sim["exit_px"], qty=qty, exit_reason=sim["reason"],
                             capital=sim["entry_px"] * qty, expiry=con["expiry"], option_type=otype,
                             mfe=mfe, mae=mae, levels=levels,
-                            variant={"tf": f"{tf}m", "rr": f"1:{rr:g}", "stop": mode},
+                            variant={"tf": f"{tf}m", "rr": f"1:{rr:g}", "stop": mode,
+                                     "anchor": anchor, "target_mode": tmode, "eod": eod},
                             tags={"direction": "long (buy CE)" if st["direction"] == "long" else "short (buy PE)"},
                             note=(f"{st['direction']} setup: break {st['break_time']}, zone candle {st['zone_time']}, "
                                   f"sweep {st['sweep_time']}, micro break candle {st['signal_start']} closed "
-                                  f"{st['signal_close']:.2f}; risk {st['risk']:.2f} pts on the index")))
+                                  f"{st['signal_close']:.2f}; {anchor} stop {sim['stop']:.2f}, risk "
+                                  f"{sim['risk']:.2f} pts, target {tmode}, end of day {eod}")))
 
     print(f"\n{len(skipped)} skips / no-setup lines listed above; trades built: {len(trades)}")
     meta = {
@@ -405,7 +490,7 @@ async def main() -> None:
         "limits": [
             "ASSUMED: underlying NIFTY 50; the traded instrument is the ATM option (bullish buys CE, bearish buys PE) because only the option cost schedule is available; the stop/target are on the index level.",
             "ASSUMED: minor swing = 1 candle each side; swings come from the same day's candles only; a doji is neither colour; the break candle cannot arm the zone; the touch candle cannot also be the sweep.",
-            "ASSUMED: no new setup once the entry bar would start at or after 15:15; window default last 6 months ending yesterday; 1 lot; expiry nearest at least 1 day after the exit day; close-confirmed stop uses 1-minute closes.",
+            "ASSUMED: no new setup once the entry bar would start at or after 15:15; window default 2026-01-01 through the current IST date; 1 lot; expiry nearest at least 1 day after the exit day; close-confirmed stop uses 1-minute closes.",
             "OVERRIDDEN by the fill rules: the prompt's entry at the micro-break candle's close is replaced by the next 1m option bar's HIGH; a stop 'resting order filled at its level/open' is replaced by a stop signal exiting in the next 1m option bar at its LOW; close-confirmed exits fill in the next 1m bar, not at the close.  Risk and target are still measured from the signal candle's index close, so realised R differs from planned R.",
             "Capital = option premium x quantity (bought option).",
             "Variants (tf, rr, stop mode) are all shown; nothing is selected, but the whole window is in-sample and the 3m/1m and RR variants share the same days, so they are not independent evidence.",
@@ -414,7 +499,8 @@ async def main() -> None:
         "coverage": cov,
     }
     payload = build_payload(meta, trades, sessions, opt_sessions,
-                            [{"name": "Direction", "keys": ["direction"]}])
+                            [{"name": "Direction", "keys": ["direction"]}],
+                            settings=SETTINGS, chart="default")
     path = write_report(payload, SLUG)
     print(console_summary(trades))
     print(path)
