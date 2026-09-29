@@ -280,7 +280,7 @@ class Upstox:
         self._client: httpx.AsyncClient | None = None
         self._instruments: dict[str, list[dict]] = {}          # exchange -> rows (this run only)
         self._expired_contracts: dict[tuple[str, str], list[dict]] = {}
-        self._bars: dict[tuple[str, str, int], list[list]] = {}   # (key, day, interval) -> rows
+        self._bars: dict[tuple[str, str, int, int], list[list]] = {}   # (key, day, interval, columns) -> rows
         self._times: list[float] = []      # when recent calls went out, for the rolling windows
         self._said_pacing = False
         self.calls = 0
@@ -617,9 +617,16 @@ Pacing happens in `_slot` before the
             os.replace(man_path + ".tmp", man_path)
         return dict(sorted(out.items()))
 
-    async def option_candles(self, contract: dict, day: date, interval_minutes: int = 1) -> list[list]:
+    async def option_candles(self, contract: dict, day: date, interval_minutes: int = 1,
+                             volume: bool = False) -> list[list]:
         """One session of an option contract as [[HH:MM, o, h, l, c], ...] ([] if it did not trade).
         `contract` is what `resolve_option` returned.
+
+        volume=True adds the minute's traded volume as a sixth column (cached separately, kind
+        'opt1mv').  Upstox returns a candle for a minute in which nothing traded (volume 0, usually
+        open = high = low = close); its "price" is the last trade, not one anybody could have
+        filled at, so a rule that wants real fills reads the volume and treats such a minute as no
+        trade (RUN.md rule 6).  build_payload keeps only the first five columns for the charts.
 
         Memoised for THIS RUN only (nothing on disk, so rule 15 holds): a strike ladder asks for
         the same contract-day over and over, because one night's exit day is the next night's
@@ -628,11 +635,12 @@ Pacing happens in `_slot` before the
         halves the number of calls, which is what keeps the run under the rate limit."""
         key = quote(contract["instrument_key"], safe="")
         d_ = day.isoformat()
-        memo = (contract["instrument_key"], d_, interval_minutes)
+        kind, cols = ("opt1mv", 6) if volume else ("opt1m", 5)
+        memo = (contract["instrument_key"], d_, interval_minutes, cols)
         if memo in self._bars and day != datetime.now(IST).date():
             return self._bars[memo]
         if interval_minutes == 1:
-            hit = _cache_read("opt1m", d_, contract["instrument_key"])
+            hit = _cache_read(kind, d_, contract["instrument_key"], cols)
             if hit is not None:
                 self._bars[memo] = hit
                 return hit
@@ -646,10 +654,11 @@ Pacing happens in `_slot` before the
         d = await self.get(url)
         raw = (d.get("data") or {}).get("candles") or []
         rows = sorted([c[0][11:16], float(c[1]), float(c[2]), float(c[3]), float(c[4])]
-                      for c in raw if len(c) >= 5)
+                      + ([int(c[5] or 0)] if volume else [])
+                      for c in raw if len(c) >= (6 if volume else 5))
         self._bars[memo] = rows
         if interval_minutes == 1:
-            _cache_write("opt1m", d_, contract["instrument_key"], rows)
+            _cache_write(kind, d_, contract["instrument_key"], rows, cols)
         return rows
 
 
@@ -2181,13 +2190,33 @@ def build_payload(meta: dict, trades: list[dict], index_sessions: dict[str, list
         counts[r["status"]] += 1
     meta["session_counts"] = dict(counts, total=len(log))
     meta["log_columns"] = list(dict.fromkeys(k for r in log for k in r["facts"]))
+    # every trading day of the window (market open, traded or not), for the 'average trades per week' card: the page
+    # counts the days inside whatever date range the reader picks, so holiday weeks and part-weeks come out exact
+    meta["trading_days"] = trading_days_in(index_sessions, meta.get("from"), meta.get("to"))
+    overview = _book(trades)
+    overview.update(_per_week(len(trades), len(meta["trading_days"])))
     payload = {"meta": meta, "trades": trades, "sessions": log,
-               "baseline": {"overview": _book(trades), "series": _series(trades),
+               "baseline": {"overview": overview, "series": _series(trades),
                             "groups": _groups(trades, groups, standard),
                             "stability": _stability(trades, meta.get("break_date"))},
                "candles": {"index": index, "option": opt}}
     validate_payload(payload)
     return payload
+
+
+def trading_days_in(index_sessions: dict, frm: str | None, to: str | None) -> list[str]:
+    """The sessions of the window, oldest first: every day the index has candles, from `frm` to `to` inclusive.
+    A script that fetches look-back days before its window (for an average range, a trend) passes them in
+    index_sessions too, so the window bounds are applied here rather than trusted."""
+    return sorted(d for d in index_sessions if (not frm or d >= frm) and (not to or d <= to))
+
+
+def _per_week(n_trades: int, n_days: int) -> dict:
+    """Average trades per week, measured on TRADING days: weeks = trading days / 5.  A calendar count would call a
+    holiday week (4 sessions) a full week and a window that starts on a Thursday one week too; the trading-day count
+    gets both right.  The page uses the same formula for any date range and checks itself against this one."""
+    weeks = n_days / 5 if n_days else None
+    return {"trading_days": n_days, "weeks": weeks, "per_week": n_trades / weeks if weeks else None}
 
 
 def _round_rows(rows: list[list]) -> list[list]:

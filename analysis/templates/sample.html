@@ -450,6 +450,10 @@ function selfCheck() {
   const bad = [];
   const got = book(ALL);
   CHECK_KEYS.forEach(k => { if (!near(base.overview[k], got[k])) bad.push('overview.' + k + ': python ' + base.overview[k] + ', page ' + got[k]); });
+  if (base.overview.per_week !== undefined) {         // average trades per week, whole window (added 2026-09-29)
+    const pw = perWeek(ALL.length, tradingDaysIn(WIN.from, WIN.to));
+    if (!near(base.overview.per_week, pw)) bad.push('overview.per_week: python ' + base.overview.per_week + ', page ' + pw);
+  }
   const g = groupsOf(ALL);
   Object.keys(base.groups || {}).forEach(name => {
     const py = base.groups[name], js = g[name] || [];
@@ -711,7 +715,25 @@ const DEFS = {
   mae: 'Worst point: the furthest the price went against the trade between entry and exit, points per share.',
   capture: 'Average points per trade ÷ average best point: how much of the best move the exit kept.',
   hold: 'Average time from entry to exit (overnight included).',
+  perWeek: 'Trades ÷ weeks in the chosen window, where weeks = trading days in the window ÷ 5. Counting trading days (not calendar weeks) keeps a holiday week, or a window that starts or ends mid-week, from being counted as a full week. The same formula is computed by the script and checked on load.',
 };
+/* Trading days in a date range, for 'average trades per week'.  The script ships every session of its window as
+   meta.trading_days; an older report without it falls back to its day-by-day log, and then to the weekdays of the
+   range minus the weekdays the coverage note lists as having no candles (holidays and feed misses). */
+function tradingDaysIn(from, to) {
+  const inR = d => (!from || d >= from) && (!to || d <= to);
+  if ((M.trading_days || []).length) return M.trading_days.filter(inR).length;
+  if ((DATA.sessions || []).length) return DATA.sessions.filter(r => inR(r.day)).length;
+  if (!from || !to) return 0;
+  const gaps = {}; ((M.coverage || {}).weekday_gaps || []).forEach(g => gaps[g] = 1);
+  let n = 0;
+  for (let d = new Date(from + 'T00:00:00'); isoOf(d) <= to; d.setDate(d.getDate() + 1)) {
+    const wd = d.getDay();
+    if (wd !== 0 && wd !== 6 && !gaps[isoOf(d)]) n++;
+  }
+  return n;
+}
+const perWeek = (n, days) => days ? n / (days / 5) : null;
 if (PTSU) Object.assign(DEFS, {
   win: 'Winning trades ÷ all trades. A win is a trade that gained points (rupees per share). Costs are not in this report.',
   net: 'Every trade’s points added up: the rupees per share each trade made in its favour (a short that falls ₹5 is +5).',
@@ -734,6 +756,9 @@ function renderOverview(v) {
     card('bad data', sc['no data'], sc['no data'] ? 'neg' : 'dimc', 'Days skipped for missing or broken data. Never filled in with a guess.', 'skipped'),
   ] : []).concat([
     card('trades', b.n, '', DEFS.trades, 'on ' + b.sessions + ' days'),
+    (() => { const td = tradingDaysIn(S.from, S.to), pw = perWeek(b.n, td);
+      return card('average trades / week', fmt(pw, 2), '', DEFS.perWeek,
+        td ? b.n + ' trades ÷ ' + fmt(td / 5, 1) + ' weeks (' + td + ' trading days ÷ 5)' : 'no trading days in the window'); })(),
     card('win rate', pct(b.win), sgn(num(b.win) ? b.win - 50 : null), DEFS.win, '<span class="pos">' + b.wins + ' won</span> / <span class="neg">' + b.losses + ' lost</span>'),
   ].concat(PTSU ? [
     card('total points', rs(b.net), sgn(b.net), DEFS.net, 'rupees per share, added up'),
@@ -997,6 +1022,10 @@ const TCOLS_EQ = [
   {k: 'mae', l: 'worst point', f: t => cls(t.mae, fmt(t.mae))},
   {k: 'exit_reason', l: 'closed by', f: t => esc(t.exit_reason), c: 'l'},
 ]);
+// A trade's net result as a share of the capital it tied up (premium x qty for a bought option):
+// Rs 10,000 lost on Rs 50,000 of capital reads -20.0%, Rs 5,000 made reads +10.0%.  Computed from the
+// trade's current net, so it follows any fill view the report offers.
+const capPct = t => t.capital > 0 ? t.net / t.capital * 100 : null;
 const TCOLS_OPT = [
   {k: 'id', l: '#', f: t => t.id + 1, c: 'l'},
   {k: 'day', l: 'day', f: t => esc(t.day) + (t.overnight ? ' <span class="dimc">→ ' + esc(t.exit_day.slice(5)) + '</span>' : ''), c: 'l'},
@@ -1009,11 +1038,14 @@ const TCOLS_OPT = [
   {k: 'prem_pts', l: 'prem. pts', f: t => '<span class="' + sgn(t.prem_pts) + '">' + fmt(t.prem_pts) + '</span>'},
   {k: 'prem_pct', l: 'prem. %', f: t => '<span class="' + sgn(t.prem_pct) + '">' + fmt(t.prem_pct, 2) + '%</span>'},
   {k: 'net', l: 'net &#8377;', f: t => '<b class="' + sgn(t.net) + '">' + fmt(t.net, 0) + '</b>'},
+  {k: 'cap_pct', l: 'cap. %', v: capPct,
+   f: t => { const v = capPct(t); return v == null ? '<span class="dimc">&ndash;</span>' : cls(v, (v > 0 ? '+' : '') + fmt(v, 1) + '%'); }},
   {k: 'exit_reason', l: 'exit', f: t => esc(t.exit_reason), c: 'l'},
 ];
 const TCOLS = EQ ? TCOLS_EQ : TCOLS_OPT;
 function renderTrades(trs) {
-  const k = S.sortKey, d = S.sortDir, val = t => t[k] ?? -Infinity;
+  const k = S.sortKey, d = S.sortDir, col = TCOLS.find(c => c.k === k);
+  const val = t => (col && col.v ? col.v(t) : t[k]) ?? -Infinity;    // a computed column sorts on its own value
   const shown = S.trView === 'win' ? trs.filter(t => t.net > 0)
               : S.trView === 'loss' ? trs.filter(t => t.net <= 0) : trs;
   if ($('trNote')) $('trNote').textContent = shown.length + ' of ' + trs.length +
