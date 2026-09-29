@@ -410,58 +410,67 @@ Any discrepancy should be visible/logged.
 
 ## 13. MyStrategy_Buy
 
+### Price basis
+
+All signal, stop-loss, target and exit-monitoring logic is based on **NIFTY index points** (NIFTY 1-minute candles and the live NIFTY tick).
+
+The option (CE/PE) is only the instrument orders are sent to. Stop loss and target are **not** option-premium prices.
+
 ### Strategy
 
-Use NIFTY 1-minute candles.
-
-Entry:
+Entry (bullish NIFTY view):
 
 ```text
 Close(Cn-1) > Close(Cn-2)
 ```
 
-Then during current candle `Cn`, enter a long position.
-
-Instrument:
+Then during current candle `Cn`:
 
 ```text
-NIFTY 23600 CE
+BUY  NIFTY 23600 CE   (market order)
 Expiry: 22 September 2026
 ```
 
 The actual broker instrument identifier should be resolved from broker instrument metadata/configuration rather than relying only on the display name.
 
-### Stop Loss
+### Stop Loss (NIFTY points)
 
 ```text
-Stop Loss = Low(Cn-2)
+Stop Loss = Low(Cn-2)      # NIFTY candle low
 ```
 
-### Target
+### Target (NIFTY points)
 
 ```text
-Risk = Entry Price - Stop Loss
-
-Target = Entry Price + 2 * Risk
+Entry Ref = NIFTY price at entry trigger
+Risk      = Entry Ref - Stop Loss
+Target    = Entry Ref + 2 * Risk
 ```
 
-Therefore:
+Risk : Reward = 1 : 2.
+
+Validate `Risk > 0` (i.e. `Stop Loss < Entry Ref`) before accepting the entry.
+
+Example (NIFTY points):
 
 ```text
-Risk : Reward = 1 : 2
+Entry Ref = 23520
+SL        = 23500     (Low of Cn-2)
+
+Risk   = 20
+Target = 23520 + 2 * 20 = 23560
 ```
 
-Example:
+### Exit (NIFTY points)
+
+Monitor the live NIFTY price, starting from the next candle (see section 15):
 
 ```text
-Entry = 120
-SL    = 110
-
-Risk = 10
-
-Target = 120 + (2 * 10)
-       = 140
+NIFTY <= Stop Loss  -> exit (STOP_LOSS)
+NIFTY >= Target     -> exit (TARGET)
 ```
+
+Exit action: `SELL NIFTY 23600 CE` (market order), the same option that was bought.
 
 ### Strategy response
 
@@ -471,80 +480,78 @@ Conceptually:
 {
     "confirmed": True,
     "side": "LONG",
-    "instrument": "...",
     "entry_reason": "...",
-    "stop_loss": ...,
-    "target": ...,
+    "stop_loss": ...,     # NIFTY points
+    "target": ...,        # NIFTY points
     "risk_reward": "1:2"
 }
 ```
+
+The instrument is owned by `StrategyExecutor`/configuration, not by the strategy.
 
 ---
 
 ## 14. MyStrategy_Sell
 
+### Price basis
+
+Same as `MyStrategy_Buy`: all logic is on **NIFTY index points**. The PE is only the order instrument.
+
 ### Strategy
 
-Use NIFTY 1-minute candles.
-
-Entry:
+Entry (bearish NIFTY view):
 
 ```text
 Close(Cn-1) < Close(Cn-2)
 ```
 
-Then during current candle `Cn`, enter a short position.
-
-Instrument:
+Then during current candle `Cn`:
 
 ```text
-NIFTY 23200 PE
+BUY  NIFTY 23200 PE   (market order)
 Expiry: 22 September 2026
 ```
 
+"Sell" refers to the NIFTY view (short NIFTY). The order placed is a **BUY of the PE**, which gains when NIFTY falls.
+
 Again, resolve the actual broker instrument identifier through instrument metadata/configuration.
 
-### Stop Loss
-
-The requested rule is:
+### Stop Loss (NIFTY points)
 
 ```text
-Stop Loss = Low(Cn-2)
+Stop Loss = High(Cn-2)     # NIFTY candle high
 ```
 
-For a conventional short-position risk model, this requires validation because a short stop is normally above the entry price. If `Low(Cn-2)` is below the short entry, the resulting stop/risk calculation is invalid.
-
-Therefore validate:
+### Target (NIFTY points)
 
 ```text
-stop_loss > entry_price
+Entry Ref = NIFTY price at entry trigger
+Risk      = Stop Loss - Entry Ref
+Target    = Entry Ref - 2 * Risk
 ```
 
-before accepting the short entry.
+Validate `Risk > 0` (i.e. `Stop Loss > Entry Ref`) before accepting the entry.
 
-Do not silently invert the rule.
-
-### Target
-
-For a valid short trade:
+Example (NIFTY points):
 
 ```text
-Risk = Stop Loss - Entry Price
+Entry Ref = 23520
+SL        = 23540     (High of Cn-2)
 
-Target = Entry Price - (2 * Risk)
+Risk   = 20
+Target = 23520 - 2 * 20 = 23480
 ```
 
-Example:
+### Exit (NIFTY points)
+
+Monitor the live NIFTY price, starting from the next candle (see section 15):
 
 ```text
-Entry = 120
-SL    = 130
-
-Risk = 10
-
-Target = 120 - (2 * 10)
-       = 100
+NIFTY >= Stop Loss  -> exit (STOP_LOSS)
+NIFTY <= Target     -> exit (TARGET)
 ```
+
+Exit action: `SELL NIFTY 23200 PE` (market order), the same option that was bought.
 
 ---
 
@@ -746,12 +753,13 @@ Example:
 |  10:16  reconciled candle                      |
 |  10:17  live candle                            |
 |                                                |
-|  Current Price: 123.40                         |
+|  NIFTY Price: 23531.40  (option LTP: 123.40)   |
 |                                                |
 |  Position: OPEN                                |
-|  Entry: 120                                    |
-|  SL: 110                                       |
-|  Target: 140                                   |
+|  Entry Ref (NIFTY): 23520                      |
+|  SL (NIFTY): 23500                             |
+|  Target (NIFTY): 23560                         |
+|  Option fill: 121.20                           |
 +------------------------------------------------+
 
 Orders / Events
@@ -1030,13 +1038,14 @@ Before placing an order:
 10. Risk/reward calculation is valid
 ```
 
-For the sell strategy under the stated rule:
+For both strategies (NIFTY points):
 
 ```text
-SL > entry price
+Buy : Stop Loss < Entry Ref
+Sell: Stop Loss > Entry Ref
 ```
 
-must be validated.
+must be validated (Risk > 0).
 
 ---
 
