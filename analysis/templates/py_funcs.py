@@ -1,12 +1,13 @@
 """Everything a generated strategy script needs from Upstox, plus the report writer.
 
-A strategy script in analysis/scripts/ imports this file and contains ONLY the
-strategy: decide, simulate, build trades.  Nothing is cached - every run fetches
-what it needs.
+A strategy script in analysis/scripts/<category>/ imports this file and contains ONLY the
+strategy: decide, simulate, build trades.  Only CLOSED sessions and EXPIRED contracts are
+cached (section 1b, analysis/cache); everything else is fetched on every run.
 
     import os, sys
-    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "templates"))
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "templates"))
     from py_funcs import *
+    CATEGORY = "index_options"        # or "stock_options" / "stock_intraday" - see CATEGORIES
 
 FLOW OF A SCRIPT
     async with Upstox() as up:
@@ -19,7 +20,7 @@ FLOW OF A SCRIPT
         rows  = await up.option_candles(c, day)                      # [[HH:MM,o,h,l,c], ...]
     trade = make_trade(...)
     payload = build_payload(meta, trades, days, {symbol: {day: rows}}, groups)
-    write_report(payload, "my_strategy")                             # -> analysis/report/my_strategy.html
+    write_report(payload, "my_strategy")                             # -> analysis/report/<category>/my_strategy.html
 
 Sections: 1 paths  2 Upstox client (3 instruments and options, 4 candles inside it)
           5 pure helpers  6 costs  6b rules and indicators  7 trades  7b settings  7c session log  8 report
@@ -33,6 +34,7 @@ import math
 import os
 import re
 import statistics
+import sys
 from datetime import date, datetime, timedelta, timezone
 from urllib.parse import quote
 
@@ -45,6 +47,7 @@ TEMPLATES_DIR = os.path.dirname(os.path.abspath(__file__))
 ANALYSIS_DIR = os.path.abspath(os.path.join(TEMPLATES_DIR, ".."))
 CONFIG_FILE = os.path.join(ANALYSIS_DIR, "upstox_config.txt")     # line 4 = access token
 REPORT_DIR = os.path.join(ANALYSIS_DIR, "report")
+SCRIPTS_DIR = os.path.join(ANALYSIS_DIR, "scripts")
 SAMPLE_HTML = os.path.join(TEMPLATES_DIR, "sample.html")
 
 IST = timezone(timedelta(hours=5, minutes=30), "IST")
@@ -107,14 +110,19 @@ def _cache_is_past(day: str) -> bool:
     return day < datetime.now(IST).date().isoformat()
 
 
-def _rows_ok(rows) -> bool:
-    """A cached session must look exactly like what the API gives, or it is not used."""
+def _rows_ok(rows, cols: int = 5) -> bool:
+    """A cached session must look exactly like what the API gives, or it is not used.  cols=6 adds
+    the minute's volume (a whole number, zero allowed)."""
     if not isinstance(rows, list) or not rows:
         return False
     last = ""
     for r in rows:
-        if not isinstance(r, list) or len(r) != 5:
+        if not isinstance(r, list) or len(r) != cols:
             return False
+        if cols == 6:
+            if not isinstance(r[5], (int, float)) or r[5] < 0:
+                return False
+            r = r[:5]
         t, o, h, l, c = r
         if not isinstance(t, str) or len(t) != 5 or t[2] != ":" or t <= last:
             return False                                  # unique and ascending
@@ -128,7 +136,7 @@ def _rows_ok(rows) -> bool:
     return True
 
 
-def _cache_read(kind: str, day: str, key: str):
+def _cache_read(kind: str, day: str, key: str, cols: int = 5):
     if CACHE_OFF or not _cache_is_past(day):
         return None
     path = _cache_path(kind, day)
@@ -142,15 +150,15 @@ def _cache_read(kind: str, day: str, key: str):
     rows = blob.get(key)
     if rows is None:
         return None
-    if not _rows_ok(rows):
+    if not _rows_ok(rows, cols):
         _CACHE_STATS["rejected"] += 1
         return None
     _CACHE_STATS["hit"] += 1
-    return [[r[0], float(r[1]), float(r[2]), float(r[3]), float(r[4])] for r in rows]
+    return [[r[0]] + [float(x) for x in r[1:5]] + ([int(r[5])] if cols == 6 else []) for r in rows]
 
 
-def _cache_write(kind: str, day: str, key: str, rows: list) -> None:
-    if CACHE_OFF or not _cache_is_past(day) or not rows or not _rows_ok(rows):
+def _cache_write(kind: str, day: str, key: str, rows: list, cols: int = 5) -> None:
+    if CACHE_OFF or not _cache_is_past(day) or not rows or not _rows_ok(rows, cols):
         return                                            # never cache empty, never cache today
     path = _cache_path(kind, day)
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -166,6 +174,52 @@ def _cache_write(kind: str, day: str, key: str, rows: list) -> None:
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(blob, f, separators=(",", ":"))
     os.replace(tmp, path)                                 # atomic: no half-written file
+    _CACHE_STATS["write"] += 1
+
+
+def _meta_ok(value) -> bool:
+    """A cached contract list: non-empty, every entry naming its instrument and a positive lot."""
+    return (isinstance(value, list) and bool(value) and all(
+        isinstance(c, dict) and c.get("instrument_key") and isinstance(c.get("lot_size"), int) and c["lot_size"] > 0
+        for c in value))
+
+
+def _meta_read(kind: str, name: str, key: str):
+    """Instrument facts that can no longer change (an EXPIRED contract), same rules as the candles:
+    only a past `name` (a date), validated on every read, dropped and re-fetched when it fails."""
+    if CACHE_OFF or not _cache_is_past(name):
+        return None
+    path = _cache_path(kind, name)
+    try:
+        with open(path, encoding="utf-8") as f:
+            value = json.load(f).get(key)
+    except (OSError, ValueError):
+        return None
+    if value is None:
+        return None
+    if not _meta_ok(value):
+        _CACHE_STATS["rejected"] += 1
+        return None
+    _CACHE_STATS["hit"] += 1
+    return value
+
+
+def _meta_write(kind: str, name: str, key: str, value) -> None:
+    if CACHE_OFF or not _cache_is_past(name) or not _meta_ok(value):
+        return
+    path = _cache_path(kind, name)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    blob = {}
+    if os.path.exists(path):
+        try:
+            with open(path, encoding="utf-8") as f:
+                blob = json.load(f)
+        except (OSError, ValueError):
+            blob = {}
+    blob[key] = value
+    with open(path + ".tmp", "w", encoding="utf-8") as f:
+        json.dump(blob, f, separators=(",", ":"))
+    os.replace(path + ".tmp", path)
     _CACHE_STATS["write"] += 1
 
 
@@ -242,7 +296,16 @@ class Upstox:
             await self._client.aclose()
 
     async def get(self, url: str, params: dict | None = None, *, retries: int = 8) -> dict:
-        """GET with the bearer token; retries 429 and 5xx with backoff.
+        """GET with the bearer token; retries 429 and 5xx with backoff (see `_request`)."""
+        return await self._request("GET", url, params=params, retries=retries)
+
+    async def post(self, url: str, body: dict, *, retries: int = 8) -> dict:
+        """POST a JSON body with the bearer token - the margin calculator is a POST."""
+        return await self._request("POST", url, body=body, retries=retries)
+
+    async def _request(self, method: str, url: str, params: dict | None = None, body: dict | None = None,
+                       *, retries: int = 8) -> dict:
+        """One Upstox call; retries 429 and 5xx with backoff.
 
 Pacing happens in `_slot` before the
         call goes out; this handles the case where it was not enough.  A 429 means a whole
@@ -255,7 +318,7 @@ Pacing happens in `_slot` before the
         for attempt in range(retries + 1):
             await self._slot()
             try:
-                r = await self._client.get(url, params=params, headers={
+                r = await self._client.request(method, url, params=params, json=body, headers={
                     "Accept": "application/json", "Authorization": f"Bearer {self.token}"})
             except httpx.RequestError as exc:
                 if attempt == retries:
@@ -405,6 +468,61 @@ Pacing happens in `_slot` before the
                         "expiry": ek, "strike": float(strike), "option_type": option_type}
         return None
 
+    async def listed_strikes(self, underlying_key: str, expiry: date, option_type: str) -> list[float]:
+        """Every strike Upstox lists for (expiry, CE|PE), ascending.  Stock options are NOT evenly
+        spaced (RELIANCE: 10 near the money, 20 further out; INFY 20 and 40), so 'N strikes in the
+        money' on a stock must step through THIS list, never ATM +/- N x one step (RULE 8).
+        Reads the same contract pool as `resolve_option`, so it costs no extra call."""
+        await self.resolve_option(underlying_key, expiry, -1.0, option_type)      # fills the pool
+        ek = expiry.isoformat()
+        pool = (self._expired_contracts.get((underlying_key, ek))
+                or [c for c in self._expired_contracts.get((underlying_key, "live"), []) if str(c["expiry"])[:10] == ek])
+        return sorted({float(c["strike_price"]) for c in pool if c.get("instrument_type") == option_type})
+
+    async def future_contract(self, underlying_key: str, day: date) -> dict | None:
+        """The near-month FUTURES contract in force on `day`: the one with the nearest expiry on
+        or after it.  Returns {trading_symbol, instrument_key, lot_size, expiry} or None.
+
+        This is where a stock's F&O LOT SIZE comes from (RULE 8) - NSE revises it every few
+        months (HDFCBANK was 550 through the Jun-2026 series and 650 from Jul-2026), so a trade
+        sized "one lot" must read it per day, never from a constant.  Past contracts come from
+        /expired-instruments/future/contract, live ones from the instrument master."""
+        exps = self._expired_contracts.setdefault((underlying_key, "fut-expiries"), [])
+        if not exps:
+            try:
+                d = await self.get(f"{BASE_V2}/expired-instruments/expiries", {"instrument_key": underlying_key})
+                exps.extend(sorted(date.fromisoformat(s) for s in d.get("data") or []))
+            except RuntimeError as exc:
+                print(f"  ! expired expiries unavailable ({exc})")
+        live = [r for r in await self.instruments("NSE")
+                if r.get("segment") == "NSE_FO" and r.get("instrument_type") == "FUT"
+                and r.get("underlying_key") == underlying_key]
+        for r in live:                                     # expiry is epoch ms in the master
+            r["_exp"] = datetime.fromtimestamp(r["expiry"] / 1000, IST).date()
+        cands = sorted({e for e in exps if e >= day} | {r["_exp"] for r in live if r["_exp"] >= day})
+        if not cands:
+            return None
+        e = cands[0]
+        for r in live:
+            if r["_exp"] == e:
+                return {"trading_symbol": r["trading_symbol"], "instrument_key": r["instrument_key"],
+                        "lot_size": int(r.get("lot_size") or 0), "expiry": e.isoformat()}
+        ck = (underlying_key, "fut", e.isoformat())
+        if ck not in self._expired_contracts:
+            # an EXPIRED contract never changes, so it is kept on disk (rule 15: past only, never empty)
+            hit = _meta_read("fut", e.isoformat(), underlying_key)
+            if hit is None:
+                d = await self.get(f"{BASE_V2}/expired-instruments/future/contract",
+                                   {"instrument_key": underlying_key, "expiry_date": e.isoformat()})
+                hit = [{"trading_symbol": c.get("trading_symbol"), "instrument_key": c.get("instrument_key"),
+                        "lot_size": int(c.get("lot_size") or 0)} for c in d.get("data") or []]
+                _meta_write("fut", e.isoformat(), underlying_key, hit)
+            self._expired_contracts[ck] = hit
+        for c in self._expired_contracts[ck]:
+            return {"trading_symbol": c["trading_symbol"], "instrument_key": c["instrument_key"],
+                    "lot_size": int(c.get("lot_size") or 0), "expiry": e.isoformat()}
+        return None
+
     # -----------------------------------------------------------------------
     # 4  candles
     # -----------------------------------------------------------------------
@@ -434,6 +552,70 @@ Pacing happens in `_slot` before the
                 if c and frm.isoformat() <= c["timestamp"][:10] <= to.isoformat():
                     out[c["timestamp"]] = c
         return [out[k] for k in sorted(out)]
+
+    async def minute_sessions(self, instrument_key: str, frm: date, to: date,
+                              volume: bool = False) -> dict[str, list[list]]:
+        """1-minute bars of a stock or an index by session, {day: [[HH:MM, o, h, l, c], ...]}, frm..to.
+        volume=True adds the minute's traded volume as a sixth column (cached separately, kind 'eq1mv'),
+        for anything that needs it - a VWAP, relative volume.
+
+        For books that read many stocks over a long window: refetching them on every run costs
+        hundreds of calls against a limit of 880 per half hour.  Whole calendar months are fetched
+        (the API's own chunk), and a month that has ENDED is kept in the candle cache (kind 'eq1m',
+        one file per session - rule 15) together with the list of sessions it held, so a holiday
+        is known to be a holiday rather than a hole to refetch.  The current month is always
+        fetched.  A remembered session that cannot be read back, or fails validation, sends the
+        whole month back to the API.  Volume and OI are not kept - use candles() for those."""
+        today = datetime.now(IST).date()
+        kind, cols = ("eq1mv", 6) if volume else ("eq1m", 5)
+        safe = re.sub(r"[^A-Za-z0-9]+", "_", instrument_key)
+        man_path = os.path.join(CACHE_DIR, f"v{CACHE_VERSION}", f"{kind}_months", f"{safe}.json")
+        manifest: dict[str, list[str]] = {}
+        if not CACHE_OFF and os.path.exists(man_path):
+            try:
+                with open(man_path, encoding="utf-8") as f:
+                    manifest = json.load(f)
+            except (OSError, ValueError):
+                manifest = {}
+        changed = False
+        out: dict[str, list[list]] = {}
+        m = date(frm.year, frm.month, 1)
+        while m <= to:
+            m_end = date(m.year + (m.month == 12), m.month % 12 + 1, 1) - timedelta(days=1)
+            ym = m.strftime("%Y-%m")
+            got: dict[str, list[list]] | None = None
+            if not CACHE_OFF and m_end < today and ym in manifest:
+                got = {}
+                for d in manifest[ym]:
+                    rows = _cache_read(kind, d, instrument_key, cols)
+                    if rows is None:
+                        got = None
+                        break
+                    got[d] = rows
+            if got is None:
+                _CACHE_STATS["miss"] += 1
+                cs = await self.candles(instrument_key, "1m", m, m_end if m_end < today else min(m_end, to))
+                if volume:
+                    got = {}
+                    for c in cs:
+                        got.setdefault(c["timestamp"][:10], []).append(
+                            [c["timestamp"][11:16], c["open"], c["high"], c["low"], c["close"], int(c["volume"])])
+                    got = {d: sorted(r) for d, r in sorted(got.items())}
+                else:
+                    got = sessions_from(cs)
+                if m_end < today and got and all(_rows_ok(r, cols) for r in got.values()):
+                    for d, rows in got.items():
+                        _cache_write(kind, d, instrument_key, rows, cols)
+                    manifest[ym] = sorted(got)
+                    changed = True
+            out.update({d: r for d, r in got.items() if frm.isoformat() <= d <= to.isoformat()})
+            m = m_end + timedelta(days=1)
+        if changed and not CACHE_OFF:
+            os.makedirs(os.path.dirname(man_path), exist_ok=True)
+            with open(man_path + ".tmp", "w", encoding="utf-8") as f:
+                json.dump(manifest, f, separators=(",", ":"))
+            os.replace(man_path + ".tmp", man_path)
+        return dict(sorted(out.items()))
 
     async def option_candles(self, contract: dict, day: date, interval_minutes: int = 1) -> list[list]:
         """One session of an option contract as [[HH:MM, o, h, l, c], ...] ([] if it did not trade).
@@ -633,21 +815,57 @@ def coverage(sessions: dict[str, list], frm: date, to: date, rows_per_session: i
 
 
 # ---------------------------------------------------------------------------
-# 6  costs - options, rates in force from 2024-10-01 (change here when the schedule changes)
+# 6  costs and categories - READ FROM THE BROKER
+#
+# Every strategy belongs to one CATEGORY (intraday stocks, index options, stock options).  The
+# category fixes where its script and report live, how many units a trade is, how it is charged
+# and what capital it ties up.  The rates below were read from Upstox's own charges API
+# (/v2/charges/brokerage, this account) on 2026-09-24 and are re-checked against it on every run
+# by `broker_check()`; regulatory rates carry the date they took effect, so a trade is charged
+# what was in force on ITS day.  Change a rate here, with its date and source, never in a script.
 # ---------------------------------------------------------------------------
-BROKERAGE_PER_ORDER = 20.0          # Upstox flat F&O
-STT_SELL_RATE = 0.001               # on the sell-side premium turnover
-EXCHANGE_RATE = 0.0003503           # NSE options, on total premium turnover
-SEBI_RATE = 10.0 / 1e7              # Rs 10 per crore
-STAMP_BUY_RATE = 0.00003            # on the buy-side turnover
-GST_RATE = 0.18                     # on brokerage + exchange + SEBI
+BROKER_READ_ON = "2026-09-24"
+# Brokerage is the ACCOUNT's plan, not a market fact, so it is applied to every date: Upstox
+# Plus charges Rs 30 per executed order (the standard plan is Rs 20).  Read from the broker API.
+BROKERAGE_PER_ORDER = 30.0
+EQ_INTRADAY_BROKERAGE_CAP = 0.001   # intraday equity: Rs 30 or 0.1% of the order, whichever is lower
+SEBI_RATE = 10.0 / 1e7              # Rs 10 per crore, every segment
+GST_RATE = 0.18                     # on brokerage + exchange transaction + IPFT + SEBI
+STAMP_BUY_RATE = 0.00003            # 0.003% of the buy leg: options and intraday equity alike
+# Exchange transaction charges as the broker bills them INCLUDE the NSE IPFT levy.
+OPT_EXCHANGE_RATE = 0.0003503       # NSE options, on premium turnover (from 2024-10-01)
+OPT_IPFT_RATE = 0.5 / 1e5           # Rs 0.50 per lakh of premium
+EQ_EXCHANGE_RATE = 0.0000297        # NSE cash market (from 2024-10-01)
+EQ_IPFT_RATE = 10.0 / 1e7           # Rs 10 per crore
+EQ_INTRADAY_STT = 0.00025           # 0.025% of the sell leg
+# STT on the SALE of an option, on the premium: 0.1% from 2024-10-01, 0.15% from 2026-04-01
+# (Union Budget 2026).  (effective date, rate), oldest first.
+OPT_STT_SCHEDULE = ((date(2024, 10, 1), 0.001), (date(2026, 4, 1), 0.0015))
+EXCHANGE_RATE = OPT_EXCHANGE_RATE   # older name, kept for scripts that read it
 
 
-def option_costs(buy_turnover: float, sell_turnover: float, orders: int = 2) -> dict:
-    """Charges on one completed option trade from the rupee turnover of each leg."""
+def _on(day) -> date:
+    if day is None:
+        return datetime.now(IST).date()
+    return day if isinstance(day, date) else date.fromisoformat(str(day)[:10])
+
+
+def option_stt_rate(day=None) -> float:
+    """STT on an option sale in force on `day` (today when None).  Before the first entry the
+    first rate is used - the schedule is only kept from 2024-10-01, where option data starts."""
+    d, rate = _on(day), OPT_STT_SCHEDULE[0][1]
+    for since, r in OPT_STT_SCHEDULE:
+        if d >= since:
+            rate = r
+    return rate
+
+
+def option_costs(buy_turnover: float, sell_turnover: float, orders: int = 2, day=None) -> dict:
+    """Charges on one completed option trade (index or stock options - NSE charges them alike)
+    from the rupee premium turnover of each leg, at the rates in force on `day`."""
     brokerage = BROKERAGE_PER_ORDER * orders
-    stt = STT_SELL_RATE * sell_turnover
-    exch = EXCHANGE_RATE * (buy_turnover + sell_turnover)
+    stt = option_stt_rate(day) * sell_turnover
+    exch = (OPT_EXCHANGE_RATE + OPT_IPFT_RATE) * (buy_turnover + sell_turnover)
     sebi = SEBI_RATE * (buy_turnover + sell_turnover)
     stamp = STAMP_BUY_RATE * buy_turnover
     gst = GST_RATE * (brokerage + exch + sebi)
@@ -655,10 +873,255 @@ def option_costs(buy_turnover: float, sell_turnover: float, orders: int = 2) -> 
             "gst": gst, "total": round(brokerage + stt + exch + sebi + stamp + gst, 2)}
 
 
-def option_round_trip(side: str, entry_px: float, exit_px: float, qty: int) -> float:
+def option_round_trip(side: str, entry_px: float, exit_px: float, qty: int, day=None) -> float:
     """Total costs of one option trade.  side LONG = bought then sold, SHORT = sold then bought."""
     e, x = entry_px * qty, exit_px * qty
-    return option_costs(e, x)["total"] if side == "LONG" else option_costs(x, e)["total"]
+    return option_costs(e, x, day=day)["total"] if side == "LONG" else option_costs(x, e, day=day)["total"]
+
+
+def equity_intraday_costs(buy_turnover: float, sell_turnover: float, orders: int = 2, day=None) -> dict:
+    """Charges on one completed intraday (MIS) cash-equity trade from the rupee turnover of each
+    leg.  Brokerage is per order: Rs 30 or 0.1% of that order, whichever is lower."""
+    per_leg = [min(BROKERAGE_PER_ORDER, EQ_INTRADAY_BROKERAGE_CAP * v) for v in (buy_turnover, sell_turnover)]
+    brokerage = sum(per_leg) * orders / 2
+    stt = EQ_INTRADAY_STT * sell_turnover
+    exch = (EQ_EXCHANGE_RATE + EQ_IPFT_RATE) * (buy_turnover + sell_turnover)
+    sebi = SEBI_RATE * (buy_turnover + sell_turnover)
+    stamp = STAMP_BUY_RATE * buy_turnover
+    gst = GST_RATE * (brokerage + exch + sebi)
+    return {"brokerage": brokerage, "stt": stt, "exchange": exch, "sebi": sebi, "stamp": stamp,
+            "gst": gst, "total": round(brokerage + stt + exch + sebi + stamp + gst, 2)}
+
+
+def equity_round_trip(side: str, entry_px: float, exit_px: float, qty: int, day=None) -> float:
+    """Total costs of one intraday equity trade.  side LONG = bought then sold, SHORT = sold then
+    bought back (the sell leg, which carries STT, is then the entry)."""
+    e, x = entry_px * qty, exit_px * qty
+    return (equity_intraday_costs(e, x, day=day)["total"] if side == "LONG"
+            else equity_intraday_costs(x, e, day=day)["total"])
+
+
+# The three categories.  `folder` is the sub-folder of analysis/scripts/ AND analysis/report/;
+# a script declares CATEGORY = "<key>" and puts it in meta["category"].
+CATEGORIES = {
+    "stock_intraday": {
+        "label": "Intraday stocks - cash equity, MIS",
+        "kind": "equity", "segment": "NSE_EQ", "product": "I",
+        "units": "ONE SHARE per trade at the stock's full price - no lots, no leverage (the user, 2026-09-28)",
+        "costs": "equity_round_trip: brokerage Rs 30 or 0.1% per order (lower), STT 0.025% on the sell leg, "
+                 "NSE 0.00297% + IPFT Rs 10/cr, stamp 0.003% on the buy leg, SEBI Rs 10/cr, GST 18%",
+        "capital": "not reported: the broker gives no historical MIS margin, so the report is in POINTS "
+                   "per share (no rupee P&L, costs, margin or leverage).  broker_margin_ratio still gives "
+                   "today's margin for sizing a live trade",
+        "holding": "same session only: MIS is squared off by the broker before the close",
+        "report_unit": "points",
+    },
+    "index_options": {
+        "label": "Index options - NIFTY, BANKNIFTY ...",
+        "kind": "option", "segment": "NSE_FO", "product": "D",
+        "units": "lots x the resolved contract's lot_size (the size in force for that expiry)",
+        "costs": "option_round_trip: brokerage Rs 30 per order, STT on the sale 0.1% of premium "
+                 "(0.15% from 2026-04-01), NSE 0.03503% + IPFT Rs 0.50/lakh, stamp 0.003% on the buy leg, "
+                 "SEBI Rs 10/cr, GST 18%",
+        "capital": "bought: premium x qty.  Sold: the broker's SPAN + exposure margin for the lot "
+                   "(broker_margin), an estimate at today's margin",
+        "holding": "intraday or overnight (NRML); a bought option is not held through its expiry day",
+        "report_unit": "rupees",
+    },
+    "stock_options": {
+        "label": "Stock options - RELIANCE, HDFCBANK ...",
+        "kind": "option", "segment": "NSE_FO", "product": "D",
+        "units": "lots x the resolved contract's lot_size (stock lots are revised by NSE; read per contract)",
+        "costs": "option_round_trip - NSE charges stock options exactly as index options (same schedule). "
+                 "Physical settlement: an ITM stock option held into expiry is DELIVERED - exit before it",
+        "capital": "bought: premium x qty.  Sold: the broker's SPAN + exposure margin (broker_margin)",
+        "holding": "intraday or overnight (NRML); never into expiry (physical settlement)",
+        "report_unit": "rupees",
+    },
+}
+
+
+def category_of(key: str) -> dict:
+    if key not in CATEGORIES:
+        raise ValueError(f"category must be one of {list(CATEGORIES)}, got {key!r}")
+    return CATEGORIES[key]
+
+
+def trade_costs(category: str, side: str, entry_px: float, exit_px: float, qty: int, day=None) -> float:
+    """Round-trip costs of one trade in `category`, at the rates in force on `day`."""
+    c = category_of(category)
+    fn = equity_round_trip if c["kind"] == "equity" else option_round_trip
+    return fn(side, entry_px, exit_px, qty, day=day)
+
+
+async def broker_charges(up: "Upstox", instrument_key: str, qty: int, price: float, side: str,
+                         product: str) -> float:
+    """What the BROKER says one order costs (Upstox /v2/charges/brokerage), in rupees."""
+    d = await up.get(f"{BASE_V2}/charges/brokerage", {"instrument_token": instrument_key, "quantity": qty,
+                                                      "product": product, "transaction_type": side,
+                                                      "price": price})
+    return float(((d.get("data") or {}).get("charges") or {}).get("total") or 0.0)
+
+
+async def broker_check(up: "Upstox", category: str, instrument_key: str, qty: int, price: float) -> str:
+    """Price one round trip (buy and sell at `price`) with the model AND with the broker's own
+    calculator, today, and say whether they agree.  Every script calls it once and prints the
+    line; a disagreement means a rate in section 6 is stale - fix it there, with its date."""
+    c = category_of(category)
+    try:
+        broker = (await broker_charges(up, instrument_key, qty, price, "BUY", c["product"])
+                  + await broker_charges(up, instrument_key, qty, price, "SELL", c["product"]))
+    except (RuntimeError, PermissionError) as exc:
+        return f"broker check SKIPPED for {category}: {exc}"
+    model = trade_costs(category, "LONG", price, price, qty)
+    ok = abs(model - broker) <= max(0.5, 0.01 * broker)
+    return (f"broker check {category}: {qty} @ {price:g} round trip - model Rs {model:.2f}, "
+            f"Upstox Rs {broker:.2f} - {'AGREE' if ok else 'DISAGREE: update the rates in py_funcs section 6'}")
+
+
+async def broker_margin(up: "Upstox", instrument_key: str, qty: int, price: float, side: str,
+                        product: str) -> float:
+    """The broker's required margin for one order today (Upstox /v2/charges/margin), rupees."""
+    d = await up.post(f"{BASE_V2}/charges/margin", {"instruments": [
+        {"instrument_key": instrument_key, "quantity": qty, "transaction_type": side, "product": product,
+         "price": price}]})
+    return float((d.get("data") or {}).get("required_margin") or 0.0)
+
+
+async def broker_margin_ratio(up: "Upstox", instrument_key: str, qty: int, price: float,
+                              product: str = "I") -> float:
+    """Margin / position value for a cash-equity order today (MIS: product 'I').  Capital for an
+    intraday-stock trade is its position x this ratio; say in meta['limits'] it is today's ratio."""
+    m = await broker_margin(up, instrument_key, qty, price, "BUY", product)
+    return m / (qty * price)
+
+
+# ---------------------------------------------------------------------------
+# 6c  corporate events from NSE (not an Upstox fact: Upstox has no results calendar)
+# ---------------------------------------------------------------------------
+NSE_HOME = "https://www.nseindia.com/"
+NSE_API = "https://www.nseindia.com/api/"
+NSE_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+          "Chrome/124 Safari/537.36")
+
+
+async def nse_results_stamps(symbol: str, frm: date, to: date) -> list[datetime] | None:
+    """When a company's quarterly RESULTS became public, as IST datetimes (naive), oldest first.
+
+    Source: NSE corporate announcements ('Outcome of Board Meeting' / 'Financial Result Updates'
+    that mention financial results), plus the financial-results feed's broadcast times, plus
+    scheduled results board meetings with no disclosure found (assumed 18:00, after the close).
+    Several filings of one quarter (standalone, then consolidated a day later) collapse to the
+    first.  Returns None when NSE cannot be reached - a caller must then say the event tag is
+    unknown rather than treat every day as event-free (RULE 6).  Nothing is written to disk."""
+    f, t = frm.strftime("%d-%m-%Y"), to.strftime("%d-%m-%Y")
+    hdr = {"User-Agent": NSE_UA, "Referer": NSE_HOME, "Accept": "application/json"}
+    try:
+        async with httpx.AsyncClient(timeout=30.0, headers={"User-Agent": NSE_UA}, follow_redirects=True) as c:
+            await c.get(NSE_HOME)                                        # sets the session cookies
+            q = f"index=equities&symbol={quote(symbol)}"
+            ann = (await c.get(f"{NSE_API}corporate-announcements?{q}&from_date={f}&to_date={t}", headers=hdr)).json()
+            fr = (await c.get(f"{NSE_API}corporates-financial-results?{q}&period=Quarterly", headers=hdr)).json()
+            bm = (await c.get(f"{NSE_API}corporate-board-meetings?{q}&from_date={f}&to_date={t}", headers=hdr)).json()
+    except (httpx.HTTPError, ValueError) as exc:
+        print(f"  ! NSE results calendar unavailable for {symbol} ({exc})")
+        return None
+    stamps: list[datetime] = []
+    for r in ann if isinstance(ann, list) else []:
+        text = f"{r.get('desc') or ''} {r.get('attchmntText') or ''}".lower()
+        if r.get("desc") in ("Outcome of Board Meeting", "Financial Result Updates") and "financial result" in text:
+            stamps.append(datetime.strptime(r["an_dt"], "%d-%b-%Y %H:%M:%S"))
+    for r in fr if isinstance(fr, list) else []:
+        if r.get("broadCastDate"):
+            stamps.append(datetime.strptime(r["broadCastDate"], "%d-%b-%Y %H:%M:%S"))
+    out: list[datetime] = []
+    for s in sorted(stamps):
+        if not out or (s - out[-1]).days > 4:
+            out.append(s)
+    known = {s.date() for s in out}
+    for r in bm if isinstance(bm, list) else []:
+        if "result" in f"{r.get('bm_purpose', '')} {r.get('bm_desc', '')}".lower():
+            d = datetime.strptime(r["bm_date"], "%d-%b-%Y")
+            if d.date() not in known and not any(abs((d.date() - k).days) <= 4 for k in known):
+                out.append(d.replace(hour=18))
+                known.add(d.date())
+    return sorted(s for s in out if frm <= s.date() <= to)
+
+
+async def nse_exdividend_days(symbol: str, frm: date, to: date) -> set[str] | None:
+    """Ex-dividend dates ("YYYY-MM-DD") from NSE corporate actions.  On an ex-date the open gaps
+    down by the dividend mechanically - not a market move - so a gap rule should know about it.
+    None when NSE cannot be reached (say so; never treat it as 'no dividends')."""
+    f, t = frm.strftime("%d-%m-%Y"), to.strftime("%d-%m-%Y")
+    hdr = {"User-Agent": NSE_UA, "Referer": NSE_HOME, "Accept": "application/json"}
+    try:
+        async with httpx.AsyncClient(timeout=30.0, headers={"User-Agent": NSE_UA}, follow_redirects=True) as c:
+            await c.get(NSE_HOME)
+            rows = (await c.get(f"{NSE_API}corporates-corporateActions?index=equities&symbol={quote(symbol)}"
+                                f"&from_date={f}&to_date={t}", headers=hdr)).json()
+    except (httpx.HTTPError, ValueError) as exc:
+        print(f"  ! NSE corporate actions unavailable for {symbol} ({exc})")
+        return None
+    out = set()
+    for r in rows if isinstance(rows, list) else []:
+        if "dividend" in str(r.get("subject", "")).lower() and r.get("exDate") not in (None, "", "-"):
+            out.add(datetime.strptime(r["exDate"], "%d-%b-%Y").date().isoformat())
+    return out
+
+
+YAHOO_CHART = "https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
+
+
+async def yahoo_daily(ticker: str, frm: date, to: date) -> list[list] | None:
+    """Daily bars of a market Upstox does not carry (Asian and US indices, commodities, FX) from
+    Yahoo Finance's chart API: [[YYYY-MM-DD, open, high, low, close], ...] oldest first.
+
+    The date is the EXCHANGE's own calendar day (Tokyo's session of 2026-03-02 is '2026-03-02',
+    and it opens at 05:30 IST - before NSE's pre-open), so a caller pairing it with an NSE session
+    must decide which of its prices were known at that minute.  Bars without a close are dropped;
+    nothing is filled.  Returns None when Yahoo cannot be reached - the caller must then say the
+    factor is unknown (RULE 6), never treat it as flat.  Nothing is written to disk."""
+    p1 = int(datetime(frm.year, frm.month, frm.day, tzinfo=timezone.utc).timestamp())
+    p2 = int((datetime(to.year, to.month, to.day, tzinfo=timezone.utc) + timedelta(days=1)).timestamp())
+    try:
+        async with httpx.AsyncClient(timeout=30.0, headers={"User-Agent": NSE_UA}, follow_redirects=True) as c:
+            r = await c.get(YAHOO_CHART.format(ticker=quote(ticker, safe="")),
+                            params={"period1": p1, "period2": p2, "interval": "1d", "includePrePost": "false"})
+            r.raise_for_status()
+            res = r.json()["chart"]["result"][0]
+    except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError) as exc:
+        print(f"  ! Yahoo daily bars unavailable for {ticker} ({exc})")
+        return None
+    off = int(res.get("meta", {}).get("gmtoffset") or 0)
+    q = (res.get("indicators", {}).get("quote") or [{}])[0]
+    out = []
+    for i, ts in enumerate(res.get("timestamp") or []):
+        o, h, l, c_ = ((q.get(k) or [])[i] if i < len(q.get(k) or []) else None
+                       for k in ("open", "high", "low", "close"))
+        if None in (o, h, l, c_):
+            continue
+        day = datetime.fromtimestamp(ts + off, timezone.utc).date().isoformat()
+        if frm.isoformat() <= day <= to.isoformat():
+            out.append([day, float(o), float(h), float(l), float(c_)])
+    return out
+
+
+def results_reaction_days(stamps: list[datetime], sessions: list[str]) -> dict[str, str]:
+    """{session: 'results day 1' | 'results day 2'} - the first session that trades with the
+    results known, and the one after it.  A disclosure during market hours makes the NEXT
+    session day 1 (the rest of that afternoon is not an opening-auction question)."""
+    days = sorted(sessions)
+    out: dict[str, str] = {}
+    for s in stamps:
+        d, hm = s.date().isoformat(), s.hour * 60 + s.minute
+        first = next((x for x in days if x >= d), None) if hm < 9 * 60 + 15 else next((x for x in days if x > d), None)
+        if first is None:
+            continue
+        out[first] = "results day 1"
+        i = days.index(first)
+        if i + 1 < len(days):
+            out.setdefault(days[i + 1], "results day 2")
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -693,6 +1156,43 @@ def worst_fills(side: str, entry_bar: list, exit_bar: list) -> tuple[float, floa
     if side == "LONG":
         return entry_bar[2], exit_bar[3]
     return entry_bar[3], exit_bar[2]
+
+
+def worst_fill_breaches(trades: list[dict], index_sessions: dict, own: dict | None = None) -> list[str]:
+    """RULE 1 FOR INTRADAY STOCKS, made permanent by the user on 2026-09-28: every trade is filled at
+    the WORST price of its candle - a buy (long entry, short exit) at the candle's HIGH, a sell (short
+    entry, long exit) at its LOW - with no exception (no pre-open auction price) and no comparison.
+    The entry candle is the one after the signal candle, the exit candle the one after the exit
+    signal (rules 2-3); a scheduled time exit fills in its own candle.  Returns one line per trade
+    that breaks it; build_payload refuses a stock_intraday report that has any."""
+    bad = []
+    for t in trades:
+        src = (own or {}).get(t["symbol"]) or index_sessions
+        e = _bar_at(src.get(t["day"]), t["entry_time"])
+        x = _bar_at(src.get(t["exit_day"]), t["exit_time"])
+        if not e or not x:
+            bad.append(f"{t['day']} {t['symbol']}: no {t['entry_time'] if not e else t['exit_time']} candle to check the fill")
+            continue
+        want_in, want_out = worst_fills(t["side"], e, x)
+        if abs(t["entry_px"] - round(want_in, 2)) > 0.006 or abs(t["exit_px"] - round(want_out, 2)) > 0.006:
+            bad.append(f"{t['day']} {t['symbol']} {t['side']}: in {t['entry_px']} at {t['entry_time']} (worst "
+                       f"{want_in:.2f}), out {t['exit_px']} at {t['exit_time']} (worst {want_out:.2f})")
+    return bad
+
+
+def preopen_fill(rows_1m: list[list]) -> float | None:
+    """RULE 1 - THE NAMED EXCEPTION (agreed 2026-09-24) - NOT FOR INTRADAY STOCKS: on 2026-09-28 the user
+    made the worst price the only fill for stock_intraday (entry and exit), and build_payload refuses a
+    stock report filled at this price.  An order placed in the NSE pre-open session (09:00-09:08,
+    equities) is matched in the call auction and fills at the EQUILIBRIUM price, which is the
+    session's official open - the OPEN of the 09:15 bar.  Returns None when the 09:15 bar is missing
+    (rule 6: no bar, no trade)."""
+    for r in rows_1m:
+        if r[0] == "09:15":
+            return r[1]
+        if r[0] > "09:15":
+            return None
+    return None
 
 
 def scan_exit(bars: list[list], side: str, entry_key: str, stop: float | None = None,
@@ -802,6 +1302,24 @@ def bucket(x: float | None, edges: list[float], labels: list[str]) -> str:
 # ---------------------------------------------------------------------------
 # 7  trades
 # ---------------------------------------------------------------------------
+def trade_economics(side: str, entry_px: float, exit_px: float, qty: int, net: float,
+                    capital: float | None) -> dict:
+    """What one trade did in the units a trader reads it in.
+
+    pts       price points per unit IN THE TRADE'S FAVOUR (a short that falls 5 is +5).  For a stock
+              these are the stock's own points; for an option, premium points.
+    move_pct  pts / entry, %.
+    notional  entry x qty: the position's value (for a bought option, the premium paid).
+    leverage  notional / capital - for an MIS stock trade, position / margin (5x at 20% margin).
+    rom       net / capital, %: return on the margin (or premium) the trade tied up."""
+    sgn = 1 if side == "LONG" else -1
+    pts = round(sgn * (exit_px - entry_px), 2)
+    notional = round(entry_px * qty, 2)
+    return {"pts": pts, "move_pct": pts / entry_px * 100 if entry_px else None, "notional": notional,
+            "leverage": notional / capital if capital else None,
+            "rom": net / capital * 100 if capital else None}
+
+
 def make_trade(*, day: str, side: str, symbol: str, entry_time: str, entry_px: float,
                exit_time: str, exit_px: float, qty: int, exit_day: str | None = None,
                exit_reason: str = "", kind: str = "option", costs: float | None = None,
@@ -821,8 +1339,9 @@ def make_trade(*, day: str, side: str, symbol: str, entry_time: str, entry_px: f
     expiry    the option's expiry date "YYYY-MM-DD" (`contract["expiry"]`); REQUIRED for options.
               The report derives DTE (calendar days from the trade day to expiry) from it and
               adds a DTE breakdown.
-    costs     rupees; None + kind 'option' -> the standard option schedule; otherwise pass
-              it (0.0 is allowed, deliberately).
+    costs     rupees; None -> the broker-read schedule (section 6) in force on `day`:
+              kind 'option' -> option_round_trip, kind 'equity' -> equity_round_trip (intraday
+              MIS).  Any other kind must pass it (0.0 is allowed, deliberately).
     capital   rupees tied up (bought option: premium x qty; sold: margin).
     stop/target  PRICES of the traded instrument, drawn on the chart.
     entry_spot/exit_spot  the underlying index/stock price at entry and exit (the report shows
@@ -850,9 +1369,12 @@ def make_trade(*, day: str, side: str, symbol: str, entry_time: str, entry_px: f
     dte = (date.fromisoformat(expiry) - date.fromisoformat(day)).days if expiry else None
     prem_pts = round(exit_px, 2) - round(entry_px, 2)   # the traded price's own move, signed, from the prices shown
     if costs is None:
-        if kind != "option":
-            raise ValueError("pass costs= for a non-option trade (0.0 if you really mean none)")
-        costs = option_round_trip(side, entry_px, exit_px, qty)
+        if kind == "option":
+            costs = option_round_trip(side, entry_px, exit_px, qty, day=day)
+        elif kind == "equity":
+            costs = equity_round_trip(side, entry_px, exit_px, qty, day=day)
+        else:
+            raise ValueError(f"pass costs= for a {kind!r} trade (0.0 if you really mean none)")
     return {"day": day, "exit_day": exit_day or day, "side": side, "symbol": symbol, "kind": kind,
             "entry_time": entry_time, "entry_px": round(entry_px, 2),
             "exit_time": exit_time, "exit_px": round(exit_px, 2), "qty": qty,
@@ -861,6 +1383,7 @@ def make_trade(*, day: str, side: str, symbol: str, entry_time: str, entry_px: f
             "capital": None if capital is None else round(capital, 2),
             "option_type": option_type, "expiry": expiry, "dte": dte,
             "prem_pts": round(prem_pts, 2), "prem_pct": prem_pts / round(entry_px, 2) * 100 if entry_px else None,
+            **trade_economics(side, entry_px, exit_px, qty, gross - costs, capital),
             "entry_spot": entry_spot, "exit_spot": exit_spot, "stop": stop, "target": target,
             "mfe": mfe, "mae": mae, "variant": {k: str(v) for k, v in (variant or {}).items()},
             "tags": {k: str(v) for k, v in (tags or {}).items()}, "levels": levels or [], "note": note}
@@ -1030,10 +1553,18 @@ def narrow(settings: list[dict] | None, args) -> list[dict]:
     return out
 
 
+def script_category() -> str | None:
+    """The category of the running script, from its folder: analysis/scripts/<category>/<slug>.py."""
+    here = os.path.basename(os.path.dirname(os.path.abspath(sys.argv[0] or "")))
+    return here if here in CATEGORIES else None
+
+
 def rerun_command(slug: str, settings: list[dict] | None, frm, to) -> str:
     """The exact command that reproduces this report - shown in the panel, so a setting that
     needs new data is one paste away instead of a guess."""
-    parts = [PYTHON_HINT, f"analysis/scripts/{slug}.py", f"--from {frm}", f"--to {to}"]
+    cat = script_category()
+    where = f"analysis/scripts/{cat}/{slug}.py" if cat else f"analysis/scripts/{slug}.py"
+    parts = [PYTHON_HINT, where, f"--from {frm}", f"--to {to}"]
     for s in settings or []:
         if s.get("derived"):        # inferred from variants, so the script has no such flag
             continue
@@ -1175,6 +1706,9 @@ def _book(trs: list[dict]) -> dict:
     avg_loss = sum(L) / len(L) if L else None
     caps = [t["capital"] for t in o if t.get("capital") is not None]
     cap_avg = sum(caps) / len(caps) if caps else None
+    mfes = [t["mfe"] for t in o if t.get("mfe") is not None]
+    maes = [t["mae"] for t in o if t.get("mae") is not None]
+    moves = [t["move_pct"] for t in o if t.get("move_pct") is not None]
     hold = [(datetime.fromisoformat(f"{t['exit_day']}T{t['exit_time']}")
              - datetime.fromisoformat(f"{t['day']}T{t['entry_time']}")).total_seconds() / 60 for t in o]
     r.update({"avg_win": avg_win, "avg_loss": avg_loss,
@@ -1182,6 +1716,9 @@ def _book(trs: list[dict]) -> dict:
               "max_dd": mdd, "dd_from": mdd_from, "dd_to": mdd_to, "win_streak": mw, "loss_streak": ml,
               "t": statistics.fmean(net) / (sd / math.sqrt(n)) if sd else None,
               "cap_avg": cap_avg, "roc": r["net"] / cap_avg * 100 if cap_avg else None,
+              "mfe_avg": sum(mfes) / len(mfes) if mfes else None,
+              "mae_avg": sum(maes) / len(maes) if maes else None,
+              "move_avg": sum(moves) / len(moves) if moves else None,
               "hold_min": sum(hold) / n if n else None, "sessions": len({t["day"] for t in o})})
     return r
 
@@ -1293,10 +1830,10 @@ def _stability(trs: list[dict], break_date: str | None = None) -> list[dict]:
     return rows
 
 
+# Two scenarios only: the rule, and the bar close as the one comparison.
 FILL_MODES = [
-    ("worst", "worst - buy the bar's HIGH, sell its LOW"),
-    ("mid", "midpoint of the bar"),
-    ("close", "the bar's close - NOT achievable, for comparison only"),
+    ("worst", "worst price of the minute - buy at its high, sell at its low"),
+    ("close", "closing price of the minute - for comparison only, not a real fill"),
 ]
 
 
@@ -1308,7 +1845,8 @@ def _bar_at(rows: list[list], hhmm: str) -> list | None:
 
 
 def _price_fills(trades: list[dict], index: dict, option_sessions: dict | None) -> int:
-    """Re-price every trade at the midpoint and at the close of the SAME bars it already used.
+    """Re-price every trade at the CLOSE of the SAME bars it already used - the one comparison
+    beside the worst fill (the rule).  Nothing else is computed.
 
     The fill convention is the single biggest lever on an option backtest and it is usually
     invisible: a rule can read as -Rs 89k at the worst fill and +Rs 91k at the close, on
@@ -1316,12 +1854,12 @@ def _price_fills(trades: list[dict], index: dict, option_sessions: dict | None) 
     source reports made it a dropdown, so the template does too - for every strategy, with no
     extra fetching, because both prices are already in the bar.
 
-    `worst` stays the default and the rule (RUN.md rule 1).  The others are labelled as what
-    they are: a sensitivity check, not a result you could have traded."""
+    `worst` stays the default and the rule (RUN.md rule 1).  The close is labelled as what it
+    is: a sensitivity check, not a result you could have traded."""
     opt = option_sessions or {}
     done = 0
     for t in trades:
-        src = opt.get(t["symbol"]) if t.get("kind") == "option" else None
+        src = opt.get(t["symbol"])          # the traded instrument's own bars: an option, or one stock of a book
         if src is None:
             src = index
         e = _bar_at((src or {}).get(t["day"]), t["entry_time"])
@@ -1331,17 +1869,21 @@ def _price_fills(trades: list[dict], index: dict, option_sessions: dict | None) 
         sgn = 1 if t["side"] == "LONG" else -1
         out = {"worst": {"entry_px": t["entry_px"], "exit_px": t["exit_px"], "gross": t["gross"],
                          "costs": t["costs"], "net": t["net"]}}
-        for mode, ep, xp in (("mid", (e[2] + e[3]) / 2, (x[2] + x[3]) / 2), ("close", e[4], x[4])):
+        for mode, ep, xp in (("close", e[4], x[4]),):
             ep, xp = round(ep, 2), round(xp, 2)
             gross = round(sgn * (xp - ep) * t["qty"], 2)
-            costs = (round(option_round_trip(t["side"], ep, xp, t["qty"]), 2)
-                     if t.get("kind") == "option" else t["costs"])
+            costs = (round(option_round_trip(t["side"], ep, xp, t["qty"], day=t["day"]), 2)
+                     if t.get("kind") == "option" else
+                     round(equity_round_trip(t["side"], ep, xp, t["qty"], day=t["day"]), 2)
+                     if t.get("kind") == "equity" else t["costs"])
             out[mode] = {"entry_px": ep, "exit_px": xp, "gross": gross, "costs": costs,
                          "net": round(gross - costs, 2),
                          "prem_pts": round(xp - ep, 2),
-                         "prem_pct": (xp - ep) / ep * 100 if ep else None}
+                         "prem_pct": (xp - ep) / ep * 100 if ep else None,
+                         **trade_economics(t["side"], ep, xp, t["qty"], round(gross - costs, 2), t.get("capital"))}
         out["worst"]["prem_pts"] = t["prem_pts"]
         out["worst"]["prem_pct"] = t["prem_pct"]
+        out["worst"].update({k: t.get(k) for k in ("pts", "move_pct", "notional", "leverage", "rom")})
         t["fills"] = out
         done += 1
     return done
@@ -1467,17 +2009,45 @@ def _derive_settings(trades: list[dict]) -> list[dict]:
     return out
 
 
+def points_view(t: dict) -> dict:
+    """The same trade read in POINTS PER SHARE, for a report whose category has report_unit
+    'points' (intraday stocks: the broker gives no historical MIS margin, so rupees, costs,
+    margin and leverage are left out).  gross = net = the points in the trade's favour and
+    costs = 0, so every statistic of the book - win rate, profit factor, drawdown, t-stat - is
+    computed in points by the same code.  A win is a trade that gained points; the costs are
+    not in it.  The fill-sensitivity prices are converted the same way."""
+    v = dict(t)
+    for k in ("capital", "notional", "leverage", "rom", "prem_pts", "prem_pct"):
+        v[k] = None
+    v.update({"gross": t["pts"], "net": t["pts"], "costs": 0.0, "qty": 1})
+    if t.get("fills"):
+        v["fills"] = {m: {"entry_px": f["entry_px"], "exit_px": f["exit_px"], "gross": f["pts"], "net": f["pts"],
+                          "costs": 0.0, "pts": f["pts"], "move_pct": f.get("move_pct")}
+                      for m, f in t["fills"].items()}
+    return v
+
+
 def build_payload(meta: dict, trades: list[dict], index_sessions: dict[str, list[list]],
                   option_sessions: dict[str, dict[str, list[list]]] | None = None,
                   groups: list[dict] | None = None, settings: list[dict] | None = None,
-                  chart: str = "default", sessions_log: list[dict] | None = None) -> dict:
+                  chart: str = "default", sessions_log: list[dict] | None = None,
+                  worst_only: bool = False) -> dict:
     """Assemble what the HTML reads.
+
+    worst_only  True = the report is the WORST price only (buy at the candle's HIGH, sell at its
+              LOW), with no middle / close comparison - what stock_intraday always is.  Every
+              trade whose candles are embedded is re-checked and the report is refused if one
+              was filled better; trades of settings whose candles are not embedded (chart
+              'default' keeps only the rule's own) must be checked by the script itself.
 
     meta      title, subtitle, instrument, from, to, lot_size, fill_rule, cost_model,
               params {name: value}, rule_steps [str], limits [str], coverage (from `coverage()`).
     trades    from make_trade().
     index_sessions   {day: rows}, full sessions; only the days trades touch are embedded.
-    option_sessions  {symbol: {day: rows}} for the option chart and the bar-by-bar table.
+    option_sessions  {symbol: {day: rows}} - the TRADED instrument's own bars, for its chart, the
+              bar-by-bar table and the fill comparison: an option contract, or, for a book that
+              trades several stocks, each stock (index_sessions is then the market index, drawn
+              under the stock for context, and each trade's 'underlying move' is its own stock's).
     groups    the user's custom group-bys: [{"name": "SMA10 at entry", "keys": ["sma10"]},
               {"name": "SMA10 x RSI", "keys": ["sma10", "rsi"]}]; keys are trade tag names.
     settings  the control panel, from `setting()`.  Omit it and every variant key becomes an
@@ -1509,53 +2079,102 @@ def build_payload(meta: dict, trades: list[dict], index_sessions: dict[str, list
     for w in check_settings(settings, trades):
         print("WARNING  " + w)
     # every session a trade lives through: entry day, exit day, and any session between them
-    need = {d for t in trades for d in index_sessions if t["day"] <= d <= t["exit_day"]}
-    need |= {d for t in trades for d in (t["day"], t["exit_day"])}      # validate_payload reports a missing one
+    def lives(t: dict) -> set:
+        if t["day"] == t["exit_day"]:
+            return {t["day"]}
+        return {d for d in index_sessions if t["day"] <= d <= t["exit_day"]} | {t["day"], t["exit_day"]}
+    need = set().union(*(lives(t) for t in trades)) if trades else set()     # validate_payload reports a missing one
     index = {d: _round_rows(r) for d, r in index_sessions.items() if d in need}
-    for t in trades:                                  # the index move during the trade
+    own = option_sessions or {}
+    for t in trades:
+        # the underlying's move during the trade: the index - or, for one stock of a book of several,
+        # that stock itself (its own bars came in option_sessions; the index is then only context)
+        src = own.get(t["symbol"]) if t.get("kind") != "option" else None
         for k, day, hhmm in (("entry_spot", t["day"], t["entry_time"]), ("exit_spot", t["exit_day"], t["exit_time"])):
             if t.get(k) is None:
-                b = bar_at(index.get(day, []), hhmm, tolerance=3, direction=-1)
+                b = bar_at((src if src is not None else index).get(day, []), hhmm, tolerance=3, direction=-1)
                 t[k] = b[4] if b else None
         es, xs = t["entry_spot"], t["exit_spot"]
         t["spot_pts"] = None if es is None or xs is None else xs - es
         t["spot_pct"] = None if not es or xs is None else (xs - es) / es * 100
-    # option candles: by default only for the trades the rule's own settings produce
-    chart_syms = None
+    # the traded instrument's candles: by default only for the trades the rule's own settings produce
+    chart_syms = rule_keys = None
     if chart == "default" and declared and spec:
         dflt = {s["key"]: s["default"] for s in spec}
         fopt = {s["key"]: next(o for o in s["options"] if o["value"] == s["default"])
                 for s in spec if s["mode"] == "filter"}
-        chart_syms = {t["symbol"] for t in trades
-                      if all(t["variant"].get(k) == v for k, v in dflt.items() if k not in fopt)
-                      and all(_admits(t, o) for o in fopt.values())}
+        ruled = [t for t in trades if all(t["variant"].get(k) == v for k, v in dflt.items() if k not in fopt)
+                 and all(_admits(t, o) for o in fopt.values())]
+        chart_syms = {t["symbol"] for t in ruled}
+        rule_keys = {(t["symbol"], d) for t in ruled for d in lives(t)}
     elif chart not in ("default", "all"):
         raise ValueError(f"chart must be 'default' or 'all', got {chart!r}")
+    opt_syms = {t["symbol"] for t in trades if t.get("kind") == "option"}
+    all_keys = {(t["symbol"], d) for t in trades for d in lives(t)}
     opt: dict[str, dict] = {}
-    for sym, days in (option_sessions or {}).items():
+    for sym, days in own.items():
         if chart_syms is not None and sym not in chart_syms:
             continue
-        keep = {d: _round_rows(r) for d, r in days.items() if d in need and r}
+        if sym in opt_syms:
+            want = need
+        else:       # one stock of a book: only the sessions its own trades live through
+            want = {d for s, d in (rule_keys if rule_keys is not None else all_keys) if s == sym}
+        keep = {d: _round_rows(r) for d, r in days.items() if d in want and r}
         if keep:
             opt[sym] = keep
     trades = sorted(trades, key=lambda t: (t["day"], t["entry_time"], t["symbol"]))
-    priced = _price_fills(trades, index, option_sessions)
+    meta = dict(meta)
+    # the category decides the folder, the units, the costs and the capital - and the cost model
+    # the report prints is the category's broker-read one, never a line a script wrote by hand
+    cat = meta.get("category") or script_category()
+    if cat is None:
+        raise ValueError("meta['category'] is missing and the script is not in analysis/scripts/<category>/ - "
+                         f"set CATEGORY to one of {list(CATEGORIES)}")
+    if cat == "stock_intraday" or worst_only:
+        # RULE 1 for intraday stocks (the user, 2026-09-28), and for any report built with
+        # worst_only=True: the WORST price only, both legs, no exception and no comparison - a
+        # report is refused if any trade was filled better
+        # an option contract can be the rule's rung one night and another rung the next; only the
+        # nights whose candles are embedded can be re-checked here - the script checks the rest
+        chk = trades if cat == "stock_intraday" else [
+            t for t in trades if t["day"] in (own.get(t["symbol"]) or {}) and t["exit_day"] in (own.get(t["symbol"]) or {})]
+        bad = worst_fill_breaches(chk, index_sessions, own)
+        if bad:
+            raise ValueError(f"{len(bad)} trade(s) not filled at the worst price of their candle "
+                             "(buy = the candle's HIGH, sell = its LOW):\n  " + "\n  ".join(bad[:15]))
+        if worst_only and cat != "stock_intraday":
+            print(f"worst fill checked on {len(chk)} of {len(trades)} trades here (the rest by the script)")
+        priced = 0
+    else:
+        priced = _price_fills(trades, index, option_sessions)
     for t in trades:
         t["filters"] = {"side": t["side"], **t["variant"]}      # kept for older readers
     standard = (STANDARD_GROUPS + ([OPTION_GROUP] if any(t.get("option_type") for t in trades) else [])
                 + ([DTE_GROUP] if any(t.get("dte") is not None for t in trades) else []))
-    meta = dict(meta)
+    spec_c = category_of(cat)
+    here = script_category()
+    if here is not None and here != cat:
+        raise ValueError(f"meta['category'] is {cat!r} but the script lives in scripts/{here}/")
+    meta["category"] = cat
+    meta["category_label"] = spec_c["label"]
+    meta["cost_model"] = f"{spec_c['costs']}. Rates read from the Upstox charges API on {BROKER_READ_ON}."
+    if spec_c.get("report_unit") == "points":
+        trades = [points_view(t) for t in trades]
+        meta["cost_model"] = None           # nothing in a points report is charged
+        meta["lot_size"] = None
+    meta["unit"] = spec_c.get("report_unit", "rupees")
     meta.setdefault("generated", datetime.now(IST).strftime("%Y-%m-%d %H:%M IST"))
     meta["settings"] = spec
     meta["sides"] = _sides(trades)
     meta["fill_modes"] = [{"value": k, "label": v} for k, v in FILL_MODES] if priced == len(trades) and trades else []
-    if trades and priced != len(trades):
+    if trades and priced != len(trades) and cat != "stock_intraday" and not worst_only:
         print(f"WARNING  fill comparison off: only {priced} of {len(trades)} trades had both bars "
               f"in the embedded candles")
     meta["group_defs"] = {"standard": standard, "custom": groups}
     meta["groups"] = standard + [g["name"] for g in groups]
     meta["chart_scope"] = ("every setting" if chart_syms is None else
-                           "the rule's own settings only - other settings show metrics but no option chart")
+                           "the rule's own settings only - other settings show metrics but no chart of the "
+                           "instrument traded")
     log = sorted(sessions_log or [], key=lambda r: r["day"])
     counts: dict[str, int] = {k: 0 for k in STATUSES}
     for r in log:
@@ -1619,7 +2238,7 @@ def _clean(o):
 
 
 def write_report(payload: dict, name: str, template: str = SAMPLE_HTML) -> str:
-    """Put `payload` into the template and write analysis/report/<name>.html.  Returns the path.
+    """Put `payload` into the template and write analysis/report/<category>/<name>.html.  Returns the path.
     The template is a normal HTML file whose data sits between /*DATA_START*/ and /*DATA_END*/;
     the same function rewrites sample.html itself when asked to."""
     with open(template, encoding="utf-8") as f:
@@ -1633,8 +2252,15 @@ def write_report(payload: dict, name: str, template: str = SAMPLE_HTML) -> str:
     title = payload["meta"].get("title")
     if title:
         html = re.sub(r"<title>.*?</title>", lambda _m: f"<title>{_esc(title)}</title>", html, count=1, flags=re.S)
-    os.makedirs(REPORT_DIR, exist_ok=True)
-    path = os.path.join(REPORT_DIR, f"{name}.html") if os.path.dirname(name) == "" else name
+    if os.path.dirname(name) == "":
+        cat = m.get("category")
+        if cat not in CATEGORIES:
+            raise ValueError(f"payload meta['category'] must be one of {list(CATEGORIES)} (build_payload sets it)")
+        folder = os.path.join(REPORT_DIR, cat)
+        os.makedirs(folder, exist_ok=True)
+        path = os.path.join(folder, f"{name}.html")
+    else:
+        path = name
     with open(path, "w", encoding="utf-8", newline="\n") as f:
         f.write(html)
     mb = len(blob) / 1e6
@@ -1654,6 +2280,11 @@ def console_summary(trades: list[dict]) -> str:
     sensible.  The report is the authority."""
     if not trades:
         return "0 trades"
+    if all(t.get("kind") == "equity" for t in trades):
+        b = _book([points_view(t) for t in trades])
+        pf = f"{b['pf']:.2f}" if b["pf"] is not None else "n/a"
+        return (f"{b['n']} trades, {b['wins']} wins ({b['win']:.1f}%), {b['net']:+,.2f} points per share, "
+                f"{b['mean']:+.2f} a trade, profit factor {pf}, max drawdown {b['max_dd']:,.2f} points")
     b = _book(trades)
     pf = f"{b['pf']:.2f}" if b["pf"] is not None else "n/a"
     return (f"{b['n']} trades, {b['wins']} wins ({b['win']:.1f}%), net Rs {b['net']:,.0f}, "

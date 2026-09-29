@@ -25,14 +25,9 @@ WHERE THE CODE IS
 | --- | --- | --- |
 | Opening-range reversal | v1 v2 v3 v4 | `backend/scripts/reversal_v*.py` |
 | NES supply and demand | v1 v2 v3 v4 | `backend/scripts/nes_supply_demand_v*.py` |
-| EOD trend signal | v1 v2 v3 | `backend/scripts/eod_trend_signal_v*.py` |
-| Fib retracement | v1 v2 | `backend/scripts/fib_retracement_v*.py` |
+| EOD trend signal (overnight hold) | v1 v2 v3 v4 | `backend/scripts/eod_trend_signal_v*.py`; current versions `analysis/scripts/index_options/onh_v*.py` |
 | Value-area break and retest | v1 v2 | `backend/scripts/va_retest_v*.py` |
 | Value-area re-entry | v1 | `backend/scripts/va_reentry_v1.py` |
-| Gap-up breakout | v1 | `backend/scripts/gapup_breakout_v1.py` |
-| Gap-down reversal | v1 | `backend/scripts/gapdown_reversal_v1.py` |
-| Gap breakout, both sides | v1 | `backend/scripts/gap_breakout_v1.py` |
-| First hour favour | v1 | `backend/scripts/first_hour_favor_v1.py` |
 | Overnight straddle jump | v1 | `backend/scripts/analyse_overnight_jump.py` |
 
 A NOTE ON THE OLDER HAND-WRITTEN REVERSAL NOTES. The two reversal rules written out by hand earlier were labelled v1 and v2, but they are the code's v2 and v3: that hand-written "v1" already drops the outside-the-range test, which is the one thing the code's v1 is built around. This file follows the code.
@@ -432,132 +427,89 @@ Step 12 - There is no stop and no target. The premium paid is the stop.
 
 Step 13 - Buy at the entry minute's high and sell at the exit minute's low.
 
-### v3 - v2 plus the time-value condition
+### v3 - v2 plus the 5-day trend condition (replaced the time-value condition on 2026-09-29)
 
 WHAT CHANGED FROM v2
-* One new condition, and it decides whether a night is traded at all: never pay for too much time value. It removes about 44% of the nights v2 takes - 209 of the 476 nights v2 would have traded - which is why this is a version and not a revision. (37% is the older 60-point limit, which removed 176.)
-* It is a RATIO, not a number of points. Sixty points of time value on a 360 premium is 17% of what you pay; the same sixty points on a 150 premium is 40%. An absolute limit means a different thing at every strike and in every volatility regime.
-* The ratio is a strict subset of the older 60-point limit: 33 nights the point limit took and the ratio does not won 75.8% and still lost money net. The point limit made the worst drawdown deeper than trading every night; the ratio makes it shallower.
-* The ratio also makes the strike ladder coherent. Out of the money there is no intrinsic value at all, so time value is 100% of the premium and no strike at or beyond the money can ever pass. The old point limit let cheap far out-of-the-money contracts through merely because they were cheap.
-* Everything else is v2 as it stands: the same direction rule, the same strike, the same entry minute, the same exit scan, the same fills.
-* One reporting departure from the convention above: v3's report defaults to the whole period real option prices exist for, 2024-10-01 onward, not the last six months, because this is the rule being taken live and it was asked to stand on real premiums over their full history.
+* One new condition decides whether a night is traded at all: the day's direction must agree with the 5-day trend. An up day is traded only when NIFTY is also higher than five sessions ago, a down day only when it is lower. Nights that fight the week are skipped.
+* It REPLACES the time-value condition this version used to carry (kept below, and in the report's panel, switched off). On real premiums from Oct 2024 to Sep 2026 the trend condition traded 283 of 483 nights (about 2.7 a week, never more than 8 days without a trade) with 70% won and a profit factor of 1.33; the time-value condition traded 273 nights with a profit factor of 1.28 and went 50 days without a trade in Mar-May 2026. It also balances the sides: 121 calls and 162 puts, against the time-value condition's 66 and 207.
+* How it was found: a scratchpad study replayed this exit on NIFTY in both directions for every night from Feb 2022 to Sep 2026. Of 74 direction rules, only two beat "the day's direction on every night" in 2022-24, 2025 and 2026 alike; this was the one with more profit. It never picks the opposite side to the day - no signal did that reliably. Apr-Dec 2025 lost for every rule tested, this one included.
+* Everything else is v2 as it stands: the same direction rule, the same strike, the same entry minute, the same exit scan.
+* Worst fill only: every buy at the minute's high and every sell at the minute's low. The report carries no middle or close comparison, and the script stops if any trade is filled better.
 
 Step 1 - After the 15:14 candle, take the session's own bar: the 09:15 open and the 15:14 close.
 
 Step 2 - Close above the open means BUY a call. Close below means SELL, meaning buy a put. Equal, or any candle missing, means no trade.
 
-Step 3 - Take the strike six strikes in the money: on a BUY the call 300 points below, on a SELL the put 300 points above, where the reference is the 15:20 index rounded to the nearest 50. Expiry is the nearest weekly after tomorrow.
+Step 3 - The 5-day trend is today's 15:14 close against the 15:14 close five complete sessions earlier. If it points the same way as the day, go on. If it points the other way, or is exactly flat, do not trade tonight.
 
-Step 4 - At 15:19, read that contract's price and work out how much of it is NOT intrinsic value. Intrinsic value is the distance from the strike to the index, about 300 points. Time value is the 15:19 price minus that. The share is the time value divided by the 15:19 price.
+Step 4 - Take the strike six strikes in the money: on a BUY the call 300 points below, on a SELL the put 300 points above, where the reference is the 15:19 index close rounded to the nearest 50. Expiry is the nearest at least one day after tomorrow.
 
-Step 5 - If that share is MORE than 15% of the premium, do not trade tonight. On a 340 premium that limit is about 51 points; on a 400 premium it is 60. The limit moves with the price, because the same number of points is a very different bet at a different premium.
+Step 5 - Buy in the 15:20 minute at that minute's HIGH, and work out the line: what I paid plus the round-trip costs.
 
-Step 6 - Read it at 15:19, one minute before the entry, so the decision is made from a price that has already printed.
+Step 6 - From 09:30 tomorrow, after each one-minute candle, ask whether the LOW of that minute was above the line. Yes: sell in the next minute, at that minute's LOW. No: wait.
 
-Step 7 - Otherwise buy in the 15:20 minute, and work out the line: what I paid plus the round-trip costs.
+Step 7 - If nothing qualifies by 15:14, sell in the 15:14 minute at its LOW.
 
-Step 8 - From 09:30 tomorrow, after each one-minute candle, ask whether the LOW of that minute was above the line. Yes, sell now, at that low. No, wait.
+Step 8 - There is no stop and no target.
 
-Step 9 - If nothing qualifies by 15:14, sell in the 15:14 minute.
+THE EARLIER v3 CONDITION (time value), kept for the record and as a switch in the report
 
-Step 10 - There is no stop and no target. Every stop level tested, on the premium and on the index, lowered the win rate, the net and the profit factor, and none of them reduced the worst night.
+* One condition decided whether a night was traded at all: never pay for too much time value. It removes about 44% of the nights v2 takes - 209 of the 476 nights v2 would have traded - which is why this is a version and not a revision. (37% is the older 60-point limit, which removed 176.)
+* It is a RATIO, not a number of points. Sixty points of time value on a 360 premium is 17% of what you pay; the same sixty points on a 150 premium is 40%. An absolute limit means a different thing at every strike and in every volatility regime.
+* The ratio is a strict subset of the older 60-point limit: 33 nights the point limit took and the ratio does not won 75.8% and still lost money net. The point limit made the worst drawdown deeper than trading every night; the ratio makes it shallower.
+* The ratio also makes the strike ladder coherent. Out of the money there is no intrinsic value at all, so time value is 100% of the premium and no strike at or beyond the money can ever pass. The old point limit let cheap far out-of-the-money contracts through merely because they were cheap.
+* Everything else is v2 as it stands: the same direction rule, the same strike, the same entry minute, the same exit scan, the same fills.
+* One reporting departure from the convention above: v3's report defaulted to the whole period real option prices exist for, 2024-10-01 onward, not the last six months, because this is the rule being taken live and it was asked to stand on real premiums over their full history.
 
-Step 11 - No profit target either. The exit already is one, and because it waits for a whole minute to clear the line, its winners come in at a median +6.5% of premium with 28% of them above +20% - and those carry 77% of all the winning rupees. A resting limit caps exactly those.
+The earlier condition's steps, in place of Step 3 above:
 
-Step 12 - Buy at the entry minute's high, sell at the exit minute's low.
+Step A - At 15:19, read that contract's price and work out how much of it is NOT intrinsic value. Intrinsic value is the distance from the strike to the index, about 300 points. Time value is the 15:19 price minus that. The share is the time value divided by the 15:19 price.
 
----
+Step B - If that share is MORE than 15% of the premium, do not trade tonight. On a 340 premium that limit is about 51 points; on a 400 premium it is 60. The limit moves with the price, because the same number of points is a very different bet at a different premium.
 
-## 4. Fib retracement
+Step C - Read it at 15:19, one minute before the entry, so the decision is made from a price that has already printed.
 
-Draw the fib on a confirmed swing leg and trade the return into the 0.618 to 0.786 band.
+Why no stop and no target (true of both conditions): every stop level tested, on the premium and on the index, lowered the win rate, the net and the profit factor, and none of them reduced the worst night. The exit already is a target, and because it waits for a whole minute to clear the line, its winners come in at a median +6.5% of premium with 28% of them above +20% - and those carry 77% of all the winning rupees. A resting limit caps exactly those.
 
-### v1 - the rule as specified, with the choices it left open
+### v4 - the day's direction, traded on a playbook of six scenarios
 
-Step 1 - A swing high is a candle whose high is higher than the 8 highs before it and the 8 highs after it, and a swing low is the mirror. A swing is not confirmed until 8 candles have closed after it, so the fib cannot be drawn until then.
+WHAT CHANGED FROM v3
+* Which nights are traded. v3 traded only when the day agreed with the 5-day trend. v4 trades when ANY of six scenarios fires - the trend is now one scenario among six, and each needs a second condition that confirms it.
+* How the scenarios were found: every night of one year (29 Sep 2025 - 25 Sep 2026, real premiums, worst fill) was described by simple factors known by 15:19, 556 one- and two-factor scenarios were measured, and only those that were chosen on Oct-Mar AND still held on Apr-Sep were kept.
+* Stress test on the year BEFORE (Oct 2024 - Sep 2025), which the choice never saw: v4 made 149 trades, 68% won, profit factor 1.28, +0.73L against every night's 1.07 and +0.34L and v3's 1.09 and +0.28L. On its own year it made 140 trades, 76% won, profit factor 2.74, +3.69L against v3's 143 trades, 72%, 1.46, +1.56L. Most of that lead is the year's own fit: resampled 10,000 times the unseen year still loses 16% of the time, and two extra points of slippage per side erase its profit.
+* Two changes came out of the stress test, each allowed only because it did not cut the trade count: the late pull-back is read over the last 15 minutes (the first design used 30; 15 improved both years), and scenario F was added (it paid in both years).
+* The direction is unchanged: the day's own direction. No signal tested picked the opposite side reliably.
+* Worst fill only: every buy at the minute's high and every sell at the minute's low. The report carries no middle or close comparison, and the script stops if any trade is filled better.
 
-Step 2 - Comparisons are strict on both sides: an equal neighbouring high kills a pivot.
+Step 1 - After the 15:14 candle, take the session's own bar: the 09:15 open and the 15:14 close. Close above the open is an up day (the trade is a call), below is a down day (a put). Equal, or any candle missing, means no trade.
 
-Step 3 - Draw the fib on the leg: swing low to swing high for a LONG, swing high to swing low for a SHORT.
+Step 2 - Work out five facts from candles complete by 15:14. The day's move is the distance from the 09:15 open to the 15:14 close as a percentage of the open. The range is today's high minus low from 09:15 to 15:14, divided by the average full-day high minus low of the previous 20 complete sessions; between 0.8 and 1.2 is a NORMAL range. The close location is where the 15:14 close sits in that range counted in the day's direction (1 = the high on an up day, the low on a down day). The 5-day trend is today's 15:14 close against the 15:14 close five complete sessions earlier. The late pull-back is true when the 15:14 close is not beyond the 14:59 close in the day's direction.
 
-Step 4 - The 0.618 to 0.786 band of that leg is the reversal zone, in both directions. 0.618 is the near edge, the one price coming back off the swing reaches first.
+Step 3 - Take the strike six strikes in the money: on an up day the call 300 points below, on a down day the put 300 points above, where the reference is the 15:19 index close rounded to the nearest 50. Expiry is the nearest at least one day after tomorrow. At 15:19 read that contract's price; its time-value share is the price minus the intrinsic value (strike to index), divided by the price.
 
-Step 5 - The entry is the near edge, 0.618.
+Step 4 - Scenario A: the 5-day trend points the same way as the day, and the range is normal.
 
-Step 6 - How the zone is entered - the retest reading, which is the default. Price has to reach the zone at all; then a candle has to CLOSE back beyond the near edge, which is the rejection; then the NEXT candle to reach that edge is the entry. One candle can do both the reaching and the rejecting - a dip in and a close back out is the classic rejection - but the rejection candle itself can never be the entry.
+Step 5 - Scenario B: the close location is 0.8 or more (the close is in the day's strongest 20%), and the range is normal.
 
-Step 7 - At any point, a close beyond the FAR edge kills the leg: price has retraced more than 78.6% of it and the fib no longer holds.
+Step 6 - Scenario C: the day's move is under 0.3% (a small day), and the range is normal.
 
-Step 8 - The other reading, computed beside it, is a plain touch: a resting order at 0.618 with no confirmation of any kind. It is the literal wording of the spec and it has a problem the retest does not - a retracement fast enough to cross the whole band inside one minute fills at or beyond its own stop, and that is 18% to 31% of candidates depending on the timeframe. Under the retest it is zero, because the rejection close puts price back outside the band before the return.
+Step 7 - Scenario D: a small day, and the late pull-back is true.
 
-Step 9 - The stop is 5 points beyond the 0.786 level.
+Step 8 - Scenario E: the late pull-back is true, and the time-value share is at most 15%.
 
-Step 10 - Risk is the entry minus the stop for a long. That is the band's width - 0.168 of the leg - plus the 5 points, so a 100-point leg gives a roughly 22-point stop. Below 1 point of risk there is no trade.
+Step 9 - Scenario F: a small day, and the close location is at least 0.5 and under 0.8 (the close sits in the middle of the day's range).
 
-Step 11 - The target is 1:2, and 1:3 and 1:4 are scored off the same entries.
+Step 10 - If none of A to F is true, do not trade tonight. If any is true, buy the contract from Step 3 in the 15:20 minute at that minute's HIGH, and work out the line: what I paid plus the round-trip costs.
 
-Step 12 - A swing is blind for the 8 bars it takes to confirm, and on 61% of legs price has ALREADY reached the 0.618 level during those bars. Take the first touch at or after the moment the zone becomes drawable, second visits included. Never look at an unconfirmed swing.
+Step 11 - From 09:30 tomorrow, after each one-minute candle, ask whether the LOW of that minute was above the line. Yes: sell in the next minute, at that minute's LOW. No: wait.
 
-Step 13 - Every leg stays live from the moment it can be drawn until it is entered or the session ends.
+Step 12 - If nothing qualifies by 15:14, sell in the 15:14 minute at its LOW.
 
-Step 14 - One position at a time, re-entering whenever a leg arms and the book is flat.
-
-Step 15 - Square off at 15:15.
-
-Step 16 - The rule runs on 1, 3 and 5-minute candles, opening on 5-minute. A pivot of 8 needs 17 bars to exist, so 15-minute is a rounding error, 60-minute cannot produce a single swing, and daily legs all span sessions.
-
-Two corrections were made to the spec as written, both deliberate. The formula next to step 1's prose uses the same "less than" for a swing HIGH as for a swing low, which read literally is a lowest-high detector, so both are read as "greater than". And "the past 8 and the next 8" is taken symmetrically, 8 and 8, because long and short are exact mirrors here.
-
-### v2 - the same rule at the parameters the stability grid picked
-
-WHAT CHANGED FROM v1
-* No logic changes at all. This version is v1's code with different defaults, so the two can never drift apart.
-* The swing pivot moves from 8 bars either side to 7. That is the ONLY parameter that changed.
-* Timeframe opens on 5-minute, entry mode on retest, one position at a time, target 1:2 - all of which v1 already offered.
-* Why pivot 7: it produces the most trades of any configuration that cleared the acceptance bar - 117 against the next best 99 - and pivots 7, 8 and 9 are all acceptable while overlapping each other's trades by only a quarter to a half, so they are substantially different trades reaching the same conclusion.
-* Configurations with bigger mean returns were NOT chosen: they sit in parts of the grid that are speckled rather than connected, and picking the largest number off a noisy surface is the thing this exercise exists to avoid.
-* This is NOT an out-of-sample result. Pivot 7 was chosen by looking at a grid that included the second half of the sample.
-* The honest summary of v1 and v2 together: the rule is not demonstrated. The edge disappears when the entry level moves 0.032 of a leg or the timeframe moves one step, and neither of those is a parameter anyone could claim to know in advance.
-
-Step 1 - A swing high is a candle whose high is higher than the 7 highs before it and the 7 highs after it, and a swing low is the mirror; a swing is confirmed only once 7 candles have closed after it.
-
-Step 2 - Comparisons are strict on both sides: an equal neighbouring high kills a pivot.
-
-Step 3 - Draw the fib on the leg: swing low to swing high for a LONG, swing high to swing low for a SHORT.
-
-Step 4 - The 0.618 to 0.786 band of that leg is the reversal zone, in both directions. 0.618 is the near edge, the one price coming back off the swing reaches first.
-
-Step 5 - The entry is the near edge, 0.618.
-
-Step 6 - How the zone is entered - the retest reading, which is what this version trades. Price has to reach the zone at all; then a candle has to CLOSE back beyond the near edge, which is the rejection; then the NEXT candle to reach that edge is the entry. One candle can do both the reaching and the rejecting - a dip in and a close back out is the classic rejection - but the rejection candle itself can never be the entry.
-
-Step 7 - At any point, a close beyond the FAR edge kills the leg: price has retraced more than 78.6% of it and the fib no longer holds.
-
-Step 8 - The other reading, computed beside it, is a plain touch: a resting order at 0.618 with no confirmation of any kind. It is the literal wording of the spec and it has a problem the retest does not - a retracement fast enough to cross the whole band inside one minute fills at or beyond its own stop, and that is 18% to 31% of candidates depending on the timeframe. Under the retest it is zero, because the rejection close puts price back outside the band before the return.
-
-Step 9 - The stop is 5 points beyond the 0.786 level.
-
-Step 10 - Risk is the entry minus the stop for a long. That is the band's width - 0.168 of the leg - plus the 5 points, so a 100-point leg gives a roughly 22-point stop. Below 1 point of risk there is no trade.
-
-Step 11 - The target is 1:2, and 1:3 and 1:4 are scored off the same entries.
-
-Step 12 - A swing is blind for the 7 bars it takes to confirm, and price has often ALREADY reached the 0.618 level during those bars. Take the first touch at or after the moment the zone becomes drawable, second visits included. Never look at an unconfirmed swing.
-
-Step 13 - Every leg stays live from the moment it can be drawn until it is entered or the session ends.
-
-Step 14 - One position at a time, re-entering whenever a leg arms and the book is flat.
-
-Step 15 - Square off at 15:15.
-
-Step 16 - The rule runs on 1, 3 and 5-minute candles and this version opens on 5-minute. A pivot of 7 needs 15 bars to exist, so 15-minute yields a handful of legs at most, 60-minute cannot produce a single swing, and daily legs all span sessions.
-
-The same two corrections to the spec apply as in v1: the swing-high formula's "less than" is read as "greater than", because taken literally it is a lowest-high detector, and the window is taken symmetrically - here 7 bars either side - because long and short are exact mirrors.
-
-Note on the file name: `fib_retracement_v2.py` still calls itself v3 inside and writes `fib_retracement_v3_report.html`, while the report on disk is `fib_retracement_v2_report.html`. The naming needs tidying; the rule above is what it runs.
+Step 13 - There is no stop and no target.
 
 ---
 
-## 5. Value-area break and retest
+## 4. Value-area break and retest
 
 Profile yesterday, extend the three lines into today, and trade the band break that holds when price comes back to it.
 
@@ -630,7 +582,7 @@ Step 12 - Square off at 15:15.
 
 ---
 
-## 6. Value-area re-entry
+## 5. Value-area re-entry
 
 The mirror of the break and retest: price tries to leave value, fails, and comes back in.
 
@@ -663,125 +615,7 @@ WHAT THIS MEASURED, AND WHY IT IS HERE
 
 ---
 
-## 7. Gap-up breakout
-
-Step 1 - Work out the gap: today's open minus the previous session's close, divided by that close, as a percentage.
-
-Step 2 - The previous close is the previous session's last traded print, its 15:29 candle - the close a chart shows. The official close from the daily candles is a different number: over six months they differed on 98 of 124 sessions, by up to 85.70 points, which moves 8 days across the gap threshold. Both readings are carried on every day row, so a day sitting on the line stays visible instead of silently vanishing.
-
-Step 3 - Trade the day only if that gap is +0.30% or more.
-
-Step 4 - The opening range is the first 15-minute candle, 09:15 to 09:29. Take its high.
-
-Step 5 - Scan the 15-minute candles from 09:30 to 11:00. The first one whose CLOSE is above that high is the breakout candle.
-
-Step 6 - The entry is the OPEN of the next 15-minute candle, long.
-
-Step 7 - The stop is the LOW of the breakout candle - the candle that closed above the level, not the entry candle.
-
-Step 8 - The stop as written is close-confirmed: the position is closed only when a later candle CLOSES below that low, and the fill is that candle's close. That is a confirmed stop, but the fill is wherever the candle happened to close, so the loss is NOT capped at 1R - one session filled 47 points below the level, a loss of 1.73R.
-
-Step 9 - The other reading is a resting stop order at that low, filled the moment price trades there. Every loss is then exactly 1R, but a trade that only wicks through the level is stopped out instead of surviving. Both readings are computed on identical entries.
-
-Step 10 - Risk is the entry minus the stop, and the target is the entry plus the risk times 2; also score 3, 4 and 5.
-
-Step 11 - The target is filled the moment price trades at or through it.
-
-Step 12 - Check both exits on 1-minute candles, so a target touched inside a candle is taken before that candle's close can trigger the stop. When one minute both touches the target and breaks the stop, the stop is taken first.
-
-Step 13 - Square off anything still open at 15:15.
-
----
-
-## 8. Gap-down reversal
-
-The same shape as the gap-up breakout, but taken against the gap: the market opens down and then breaks the first 15 minutes' HIGH.
-
-Step 1 - Work out the gap down: the previous session's close minus today's open, divided by that close, as a percentage. The previous close is the previous session's last traded print, the 15:29 candle, and the official daily close is carried beside it.
-
-Step 2 - Trade the day only if that gap down is 0.30% or more.
-
-Step 3 - The opening range is the first 15-minute candle, 09:15 to 09:29. Take its HIGH.
-
-Step 4 - Scan the 15-minute candles from 09:30 to 11:00. The first one whose CLOSE is above that high is the reversal candle.
-
-Step 5 - The entry is the OPEN of the next 15-minute candle, long.
-
-Step 6 - THE STOP IS THE LOW OF THE ENTRY CANDLE ITSELF, not the candle that closed above the level. That is the difference from the gap-up rule, and it has a consequence.
-
-Step 7 - Because the stop is the entry candle's low, and the target is derived from it, NEITHER level exists until the entry candle has closed. The entry is still that candle's open, exactly as specified, but both levels only start being checked from the open of the candle after it. Nothing is evaluated inside the entry candle. That is the only reading that does not need the entry candle's low before the entry candle has finished printing.
-
-Step 8 - The stop as written is close-confirmed: closed only when a later candle CLOSES below that low, filled at that close, so the loss is not capped at 1R. A resting stop order at the level is computed beside it.
-
-Step 9 - Risk is the entry minus the stop, and the target is the entry plus the risk times 2; also score 3, 4 and 5.
-
-Step 10 - Check both exits on 1-minute candles. A target touched inside a candle is taken before that candle's close can trigger the stop, and when one minute does both, the stop is taken first.
-
-Step 11 - Square off anything still open at 15:15.
-
----
-
-## 9. Gap breakout, both sides
-
-One strategy, two mirror directions. A session can only be one of the two - the open is either above or below the previous close - so the two sides never overlap, and "both" is simply every signal the rule produces.
-
-Step 1 - Work out the gap: today's open minus the previous session's close, divided by that close, as a percentage. The previous close is the previous session's last traded print, its 15:29 candle, with the official daily close carried beside it on every row.
-
-Step 2 - A gap of +0.30% or more arms the LONG side. A gap of -0.30% or more arms the SHORT side. Anything in between is not traded.
-
-Step 3 - The opening range is the first 15-minute candle, 09:15 to 09:29. The long side works off its HIGH, the short side off its LOW.
-
-Step 4 - Scan the 15-minute candles from 09:30 to 11:00. On the long side, the first candle to CLOSE ABOVE the level is the trigger; on the short side, the first to CLOSE BELOW it.
-
-Step 5 - The entry is the OPEN of the next 15-minute candle: buy on the long side, sell on the short side.
-
-Step 6 - The stop is the trigger candle's LOW on the long side and its HIGH on the short side.
-
-Step 7 - The stop as written is close-confirmed - the position is closed only when a later candle CLOSES beyond that level and the fill is that close, so the loss is not capped at 1R. A resting order at the level is computed beside it, where every loss is exactly 1R but a trade that only wicks through is stopped instead of surviving.
-
-Step 8 - Risk is the distance from the entry to the stop, and the target is the entry plus (long) or minus (short) the risk times 2; also score 3, 4 and 5.
-
-Step 9 - Targets are a touch, checked on 1-minute candles, so a target reached inside a candle is taken before that candle's close can trigger the stop. When one minute both touches the target and breaks the stop, the stop is taken first.
-
-Step 10 - Square off anything still open at 15:15.
-
----
-
-## 10. First hour favour
-
-The first hour's colour picks the side; a later candle closing beyond the first hour's range is the trigger.
-
-Step 1 - The first hour is 09:15 to 10:14. If it closes GREEN - the close above the open - arm a LONG. If it closes RED, arm a SHORT. A first hour that closes exactly at its open arms nothing and the day is skipped.
-
-Step 2 - Take the first hour's HIGH and LOW.
-
-Step 3 - Scan forward from 10:15 for the first candle whose CLOSE is ABOVE the first hour's high on a long, or BELOW its low on a short. That is the trigger candle. It is a scan, not only the one candle immediately after the first hour.
-
-Step 4 - Stop scanning at 14:00. A breakout later than that is not taken.
-
-Step 5 - The entry is the OPEN of the candle after the trigger candle.
-
-Step 6 - The stop is the trigger candle's LOW on a long and its HIGH on a short.
-
-Step 7 - The stop as written is close-confirmed: the position is closed only when a later candle CLOSES beyond that level, and the fill is that candle's close. That does NOT cap the loss at 1R - the fill lands wherever the candle closed, and how far past the level it landed is recorded as slippage. A resting order at the level is computed beside it.
-
-Step 8 - Risk is the distance from the entry to the stop, and the target is the entry plus (long) or minus (short) the risk times 2; also score 1, 3, 4 and 5.
-
-Step 9 - Run the whole rule on 1, 3, 5 and 15-minute candles, opening on 15-minute. The first hour is 09:15 to 10:14 on every one of them; what changes is the candle that triggers and the candle that confirms the stop. The stop is confirmed on the SAME timeframe as the breakout, so each timeframe is a complete standalone strategy rather than four entries into one exit rule. Buckets are anchored at 09:15, so the 15-minute grid is 10:15, 10:30 and so on.
-
-Step 10 - Square off anything still open at 15:25.
-
-Step 11 - Decide everything on spot first - the first hour, the breakout, the stop and the target - and only then resolve the option those signals imply, so that an option can never move a level or change which trades exist. A green first hour buys the CE, a red one the PE.
-
-WHAT THE FIRST RUN FOUND
-* Every timeframe, every side, every R:R from 1 to 5 and both stop readings lose money. Nothing here is tradeable as written.
-* On SPOT the rule is a coin flip, not a disaster: the 2R target is hit on 32% to 46% of trades against a break-even of about 33%.
-* The option leg is what kills it, and specifically the fill.
-* The long side is negative on all four timeframes and the short side positive on all four, but the monthly cells behind that are 1 to 11 trades and flip sign month to month - and the window is a falling market, which would produce the same asymmetry with no edge at all.
-
----
-
-## 11. Overnight straddle jump
+## 6. Overnight straddle jump
 
 Buy both sides near the close, sell them the next morning, and measure what the overnight move is worth at every minute of the first two hours. This one is a measurement rather than a rule with a stop: it produces a distribution, not a single exit.
 

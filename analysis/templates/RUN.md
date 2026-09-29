@@ -8,9 +8,75 @@
 
 This folder is self-contained: nothing here depends on anything outside `analysis/`, and nothing may be added that does.
 
-**Output:** `analysis/scripts/<slug>.py`, which when run writes `analysis/report/<slug>.html`.
+**Output:** `analysis/scripts/<category>/<slug>.py`, which when run writes `analysis/report/<category>/<slug>.html`.
 
 Nothing is cached: every run fetches what it needs from Upstox.
+
+## Categories — pick one before anything else
+
+Every strategy belongs to exactly one category. The category fixes the folder, what one unit of a trade is, how it is charged and what capital it ties up. It is declared once, in `py_funcs.CATEGORIES`. A script sets `CATEGORY = "<key>"` and puts it in `meta["category"]`. `build_payload` refuses a category that disagrees with the script's folder, and writes the category's cost model into the report itself.
+
+| category | folder | traded | one unit | costs (`trade_costs`) | capital | holding |
+|---|---|---|---|---|---|---|
+| **stock_intraday** | `scripts/stock_intraday/`, `report/stock_intraday/` | cash equity, product MIS (`I`) | **one share** at the stock's full price — no lots, no leverage (the user, 2026-09-28) | `equity_round_trip`: brokerage ₹30 or 0.1% per order (lower), STT 0.025% on the sell leg, NSE 0.00297% + IPFT ₹10/cr, stamp 0.003% on the buy leg, SEBI, GST 18% | **not reported** — the broker gives no historical MIS margin, so the report is in points per share (`report_unit: "points"`), one stock or several; `broker_margin_ratio` still sizes a live trade | same session only |
+| **index_options** | `scripts/index_options/`, `report/index_options/` | NIFTY / BANKNIFTY ... options | lots × the resolved contract's `lot_size` | `option_round_trip`: brokerage ₹30 per order, STT on the sale 0.1% of premium (**0.15% from 2026-04-01**), NSE 0.03503% + IPFT ₹0.50/lakh, stamp 0.003% on the buy leg, SEBI, GST 18% | bought: premium × qty; sold: the broker's SPAN + exposure margin (`broker_margin`) | intraday or overnight; not through expiry day |
+| **stock_options** | `scripts/stock_options/`, `report/stock_options/` | stock options | lots × the resolved contract's `lot_size` | `option_round_trip` (NSE charges stock and index options alike) | as index options | never into expiry: stock options are physically settled |
+
+**How each category reads in the report.** Each category has a `report_unit`.
+- **`stock_intraday` → points.** Upstox gives no historical MIS margin, so an intraday-stock report has no rupees at all: no P&L, costs, quantity, margin or leverage. `build_payload` turns every trade into points per share with `points_view` (gross = net = points in the trade's favour, costs = 0). The same code then computes the whole book in points: win rate, profit factor, drawdown, t-stat, breakdowns, stability and combinations.
+  - What the report shows: total points, points per trade, average move % (points ÷ entry, comparable across price levels), average win and loss, payoff, best and worst trade, drawdown, streaks, and average MFE / MAE with "capture" (points ÷ average MFE, how much of the favourable move the exit kept).
+  - The equity curve plots cumulative points or cumulative move %.
+  - A win is a trade that gained points; costs are not deducted in the report. A rule may still use costs in its own logic (an exit line), and the script prints `broker_check` to the console.
+  - `console_summary` prints points for cash-equity trades.
+- **A book of several stocks (added 2026-09-28)** stays in points per share, like every intraday-stock report — the user reads trades in the stock's own price, never in bps. A point on a ₹7,000 stock is a smaller move than on a ₹250 one, so say so in `meta["limits"]` and point the reader at *average move %*.
+  - Pass each stock's own 1-minute sessions as `option_sessions={symbol: {day: rows}}` and the market index as `index_sessions`. The page charts every trade on **its own stock** (fills, stop/target, `levels`) with the index under it for context, the cross-check walks the stock's bars, the close-fill comparison re-prices from them, the trades table gets a *stock* column, and "the benchmark" is the stock's own move. With `chart="default"` a stock's candles are embedded only for the sessions the rule's own trades use. Set `meta["index_label"]` (e.g. "NIFTY 50") to name the context chart. First user: `scripts/stock_intraday/late_gap_fill_v5.py` (also the first to use `minute_sessions(..., volume=True)` for a VWAP).
+- **Options → rupees.** Options reports keep rupee P&L net of costs, with premium and underlying columns.
+- The page decides from `meta.unit`, and its self-check covers the MFE, MAE and move totals.
+
+### Stock options — the standard (checked against Upstox 2026-09-24)
+
+A stock option is charged exactly like an index option (the charges API returns identical numbers for a ₹20,000 premium round trip on NIFTY, RELIANCE, HDFCBANK, ICICIBANK, INFY and SBIN), but the contract is different. A rule written for NIFTY is carried over only through these points:
+
+| | NIFTY | stock options | what a `stock_options` script must do |
+|---|---|---|---|
+| Expiries | weekly and monthly | **monthly only** (last Tuesday) | "nearest weekly" becomes the nearest monthly; take it from `expiry_calendar(stock_key)` |
+| Strike spacing | even (50) | **uneven**: RELIANCE/ICICIBANK/SBIN 10 then 20, HDFCBANK 10/20/40, INFY 20/40 | "N strikes ITM/OTM" steps through `up.listed_strikes(key, expiry, type)`; never `strike_offset` with one step |
+| ATM | spot rounded to the step | the **listed** strike nearest the spot | `min(listed, key=abs(k - spot))` |
+| Lot size | 65 | 400–750 and revised by NSE | `qty` from the resolved contract, per trade (rule 8) |
+| Liquidity | every minute trades | **deep ITM and far strikes skip minutes** (2–33 of ~175 nights per stock for 6-ITM) | a missing entry/exit minute skips the night and is listed (rule 6); report the skip count in `meta.limits` |
+| Settlement | cash | **physical**: an ITM option held into expiry is delivered | expiry at least one day after the exit day; an overnight hold never crosses it |
+| Underlying chart | one index | one stock per report | one report per stock: `<slug>_<stock>.html`, the stock's own sessions as `index_sessions` |
+| Evidence | — | a NIFTY-born rule is **in-sample for NIFTY, out-of-sample for stocks** | say so in `meta.limits`; judge it per stock and per half of the window, never on the pooled total |
+
+What the first carry-over showed (ONH v1/v2/v3, Jan–Sep 2026, 1 lot, worst fills, broker costs): v1 lost on all five stocks (its 15:29 and 09:15 minutes are the widest of the day); v2 and v3 were positive on four of five (SBIN lost); v3's time-value check made the result steadier across halves, v2's total was larger but carried by single stocks and months.
+
+**One version per stock is kept** — the best by win rate, then number of trades, then profit factor: RELIANCE → `scripts/stock_options/onh_v2.py`; HDFCBANK, ICICIBANK, INFY, SBIN → `onh_v3.py`. Each script's `STOCKS` holds only the stocks it won; v1 was deleted (best on none).
+
+**Open issue — zero-volume minutes.** Upstox returns a candle for a minute with no trade (open = high = low = close, volume 0). About 80% of the 6-strikes-ITM entry minutes are such bars, so the worst-fill rule cannot protect against them: those fills are the last traded price, not a tradeable one. `option_candles` drops the volume column today; until a zero-volume minute is treated as "no trade" (rule 6) and the strike is chosen by depth in % of spot with a liquidity check, the stock v2/v3 results are provisional.
+
+**Read from the broker.** The rates were read from the Upstox charges API (`/v2/charges/brokerage`, this account) on the date in `BROKER_READ_ON`. Brokerage is the account's plan, Upstox Plus at ₹30 per order (the standard plan is ₹20), so it applies to every date. Regulatory rates carry their effective dates, so a trade is charged what was in force on its own day. Every script calls `broker_check(up, CATEGORY, key, qty, price)` once and prints the line; `DISAGREE` means a rate in py_funcs section 6 is stale. Fix it there, with its date and source, never in a script. Margins come from the margin API (`broker_margin`, `broker_margin_ratio`) and are today's numbers, so say so in `meta.limits`.
+
+### Intraday stocks — how every strategy is backtested from now on (the user's standing rules, 2026-09-28)
+
+These hold for every `stock_intraday` script. They are not settings; a strategy cannot switch them off. Where a line below disagrees with an older note elsewhere in this file, this section wins.
+
+| # | What | The rule | Enforced by |
+|---|------|----------|-------------|
+| 1 | **Size** | **One share** per trade at the stock's full price. No F&O lots, no leverage, no margin — anywhere, including cost lines and console summaries. `qty=1` in `make_trade`; never call `up.future_contract` in a stock script. | the script (`QTY = 1`) |
+| 2 | **Entry price** | **Worst price only.** The signal candle must be complete; the trade happens in the **next 1-minute candle**: a **BUY at its HIGH**, a **SELL at its LOW**. A signal known before the open (a gap, yesterday's facts) enters in the 09:15 candle at its high / low. There is **no pre-open auction price** (`preopen_fill` is for options only). | `build_payload` → `worst_fill_breaches` refuses the report |
+| 3 | **Exit price** | **Worst price only.** A target / stop / exit line touched inside a completed minute exits in the **next minute**: a long is sold at that minute's **LOW**, a short is bought back at its **HIGH**. A scheduled time exit (e.g. 14:45, 15:14) fills in its own minute at the same worst side. Exits are checked from the minute **after** the entry minute. | `scan_exit`, `worst_fill_breaches` |
+| 4 | **No comparison fills** | No candle-close re-pricing, no "fill" dropdown: a stock report shows the worst case only. | `build_payload` (no `_price_fills` for `stock_intraday`) |
+| 5 | **Units** | **Points = rupees for that one share**, in the trade's favour (a short that falls ₹5 is +5), plus *average move %* to compare stocks. **Never bps.** A book of several stocks is still points; say in `meta.limits` that a point on a ₹250 stock is a bigger move than on a ₹7,000 one. | `points_view` |
+| 6 | **Costs** | Not deducted in the report (a win = a trade that gained points). If a console line or the answer to the user shows costs, it is for **one share**: brokerage is ₹30 or 0.1% per order, whichever is lower, so one share pays about **0.27% of the price per round trip** (₹2.71 on a ₹1,000 share) — say so plainly, because it eats most small intraday edges. | the script / the answer |
+| 7 | **Holding** | Same session only (MIS). Every exit is at or before 15:14 unless the rule says otherwise. | the script |
+| 8 | **Data** | 1-minute candles via `up.minute_sessions(key, frm, to)` (cached closed months; `volume=True` when a VWAP or relative volume is needed); "yesterday's close / high / low" from the **daily candle** (the official close); results days and ex-dividend days from NSE (`nse_results_stamps`, `nse_exdividend_days`). Only complete 375-candle sessions trade (a Muhurat or short session is `no data`); a corporate action that makes a price jump (a demerger, a split) is skipped and named in `meta.limits`. | `coverage`, `session_row` |
+| 9 | **Several stocks** | Pass each stock's own candles as `option_sessions={symbol: {day: rows}}`, the market index as `index_sessions`, and `meta["index_label"]`; the page charts each trade on its own stock. | `build_payload`, `sample.html` |
+| 10 | **Words** | Plain trader's words in titles, rule steps, settings, tags and notes; amounts in rupees / points or % of the price; a worked number in the rule steps. | review |
+| 11 | **Honesty** | Pick the rule's values on the first part of the window and read the rest (`meta["break_date"]`); state in `meta.limits` what was chosen with hindsight, how many ideas were tried, and whether the trades cluster on a few days — run the **day-level check** (days that made money, the median day, the result without the best 5 days) and print it. | `meta` |
+| 12 | **Timeframes** | Bigger candles may decide the **entry** — a 5-minute or 15-minute signal candle (aligned to 09:15), the first hourly candle, the daily chart (yesterday and earlier) — using **completed candles only**. Every **fill** stays on the **1-minute candle** of rules 2–3 (the user, 2026-09-29: "the worst case rule checks in the 1 min only; the higher time frames are only for the entry models"). | the script, `worst_fill_breaches` |
+| 13 | **Trade count** | The rule must make **at least 120 trades in the one-year window** (the user's minimum). A filter that lifts the win rate but drops the rule below 120 is a setting, not the rule. | the script / the answer |
+
+**Why the time of day matters under rules 2–3.** The worst price costs about one candle's width per round trip, and the width changes through the day (median of the 50 NIFTY stocks, 2025-09..2026-09): **09:15 ≈ 0.67%** of the price, 09:20 ≈ 0.19%, 09:30 ≈ 0.14%, **10:15–14:30 ≈ 0.07–0.09%**, the 15:00 closing window ≈ 0.14%. A strategy that trades the opening minute gives most of its move away; the current strategy (`late_gap_fill_v5`) waits until 10:30 for exactly this reason.
 
 ---
 
@@ -20,19 +86,19 @@ These hold for every strategy, whatever the prompt says. They are enforced by fu
 
 | # | Rule | Why | Enforced by |
 |---|------|-----|-------------|
-| 1 | **Every BUY fills at the bar's HIGH, every SELL at the bar's LOW** — entry and exit alike. This is **the rule, the default, and the only convention a result may be quoted at**. The report also re-prices the same trades at the bar midpoint and close as a labelled **sensitivity check** — never a result. | No fill may be better than a real one could have been. But when the convention moves the answer more than the rule does, hiding it is its own dishonesty: across twelve strategies the worst-to-close swing ran Rs 73k to Rs 5.5 lakh and flipped **nine of twelve from loss to profit**. | `worst_fills(...)`, `_price_fills` |
+| 1 | **Every BUY fills at the bar's HIGH, every SELL at the bar's LOW** — entry and exit alike: a long buys at the HIGH and sells at the LOW; a short sells at the LOW and buys back at the HIGH. For options, the same applies to the premium bars of whichever contract (CE or PE) is traded. This is **the rule, the default, and the only convention a result may be quoted at**. The report also re-prices the same trades at the **bar close**, in and out, as a labelled **sensitivity check** — never a result. Worst and close are the only two scenarios computed. **One named exception (agreed 2026-09-24):** an equity entry order placed in the NSE **pre-open session (09:00–09:08)** is matched in the call auction and fills at the official open, i.e. the 09:15 bar's OPEN — `preopen_fill()`. It applies to that entry only; every exit and every order after the open stays on the worst fill. A strategy that uses it says so in `meta.limits` and offers the rule-1 entry beside it in the panel. **INTRADAY STOCKS — WORST PRICE ONLY, permanently (the user, 2026-09-28):** a buy signal buys at the HIGH of the candle after the signal and exits at the LOW of the candle after the exit signal; a sell signal sells at the LOW of the next candle and exits at the HIGH of the candle after the exit signal. For `stock_intraday` there is **no** pre-open exception and **no** bar-close comparison: `build_payload` computes neither and **refuses** a report with any trade not filled at its candle's worst price (`worst_fill_breaches`). The exception and the close comparison remain for options only. | No fill may be better than a real one could have been. But when the convention moves the answer more than the rule does, hiding it is its own dishonesty: across twelve strategies the worst-to-close swing ran Rs 73k to Rs 5.5 lakh and flipped **nine of twelve from loss to profit**. The pre-open auction is not a better-than-real fill: every pre-open order at the equilibrium price trades AT it. | `worst_fills(...)`, `worst_fill_breaches(...)` (stocks), `_price_fills` (options), `preopen_fill(...)` (options only) |
 | 2 | **A signal from a candle is acted on in the next candle.** The signal candle must be *complete*; the trade (entry or exit) happens in the **next 1-minute bar** — whatever the signal timeframe. A 1m signal → the next 1m bar. A 5m candle starting 09:15 completes at 09:20 → the 1m bar starting 09:20. | The decision cannot use a price that had not yet finished forming. | `bar_after_candle(rows_1m, candle_start, tf)` |
 | 3 | **Stops and targets are signals too.** A stop/target touched inside a completed bar exits in the *next* 1-minute bar (rule 1 prices apply). If one bar touches both, the **stop is assumed first**. A scheduled time exit (e.g. 15:14) fills in that bar itself. | Same reason as rule 2; the tie-break is the conservative one. | `scan_exit(bars, side, entry_key, stop, target, force_key)` |
 | 4 | **Only completed candles are read.** Indicators, levels and tags for a decision use candles up to and including the signal candle, never later ones. | Look-ahead makes every backtest look better than it is. | index `i` = signal candle in `sma/ema/rsi/atr`, `crossed_above/below` |
-| 5 | **Wins are counted net of costs.** Every trade carries its brokerage, STT, exchange, SEBI, stamp and GST; a trade that only covers costs is a loss. Never guess a rate for a non-option instrument — ask. | Gross profit that costs eat is not profit. | `make_trade` (options: `option_costs`); `costs=` required otherwise |
+| 5 | **Wins are counted net of costs.** Every trade carries its brokerage, STT, exchange, SEBI, stamp and GST; a trade that only covers costs is a loss. **Exception:** a points report (`stock_intraday`) has no costs in it, and its win is a trade that gained points; it says so on the page. The rates are the CATEGORY's, read from the broker and dated (see *Categories*); a new instrument type gets a new category with broker-read rates. Never guess a rate — ask. | Gross profit that costs eat is not profit. | `make_trade` (`kind='option'` → `option_round_trip`, `kind='equity'` → `equity_round_trip`, both on the trade's day); `trade_costs(category, ...)`; `broker_check` |
 | 6 | **Bad data means no trade, said out loud — in the report, not only the console.** A missing, duplicated or invalid candle, a short session, a missing option bar, or a missing contract → skip that day and log it. Never fill from a later bar, from a close, or invent a high or low. | A gap filled with a guess is a fake fill, and a skip nobody sees is a silent one. | `bar_after_candle(strict=True)`, `coverage()`, `session_row(..., "no data")`; print every skip too |
 | 7 | **Use complete sessions only.** A full NIFTY session is 375 one-minute bars (09:15–15:29). Today's session is not used until it is over (after 15:45). | A half-day bar is not the day's bar. | `coverage(..., rows_per_session=375)` |
-| 8 | **Instrument facts come from Upstox, never from memory.** Strike step, lot size, expiries, instrument keys. Take `qty` from the *resolved contract's* `lot_size`, per trade — never a constant. (Checked live: NIFTY was 25 in Dec 2024, 75 in Nov 2025, 65 now; the contract Upstox returns for a past expiry carries the size in force then. `capital` scales with it.) | Hardcoded facts go stale silently. | `find_instrument`, `option_chain_info`, `expiry_calendar`, `resolve_option` |
+| 8 | **Instrument facts come from Upstox, never from memory.** Strike step, lot size, expiries, instrument keys. Take `qty` from the *resolved contract's* `lot_size`, per trade — never a constant. An intraday-stock trade is **one share** — never a lot (the user, 2026-09-28). (Checked live: NIFTY was 25 in Dec 2024, 75 in Nov 2025, 65 now; the contract Upstox returns for a past expiry carries the size in force then. `capital` scales with it.) | Hardcoded facts go stale silently. | `find_instrument`, `option_chain_info`, `expiry_calendar`, `resolve_option`, `future_contract` |
 | 9 | **One position at a time** unless the prompt says otherwise. | Overlapping trades double-count the same capital. | strategy loop |
 | 10 | **A bought option is not held through its expiry day.** Default expiry: the nearest one at least 1 day after the exit day, unless the prompt says otherwise. | Expiry-day premiums collapse; the numbers stop being comparable. | `next_expiry(expiries, day, min_days_after)` |
 | 11 | **Selection is disclosed.** If the script picks parameters by looking at the same window it reports, say in `meta.limits` that the result is in-sample. Every compared value goes in the control panel, not only the winner, and the rule's own value is the panel's default. | The best cell of a grid is mostly noise. | `setting()`, `variant=` on trades |
 | 12 | **Tags describe the moment they are measured.** A tag for an entry condition is computed from candles complete at the entry signal; an exit tag from candles complete at the exit signal. | Same as rule 4, for the group-by columns. | strategy code |
-| 13 | **Capital is stated with its source.** Bought option: premium × qty. Sold option: a margin estimate — say it is an estimate in `meta.limits`. | Return-on-capital is meaningless without it. | `make_trade(capital=)` |
+| 13 | **Capital is stated with its source.** Bought option: premium × qty. Sold option: the broker's margin (`broker_margin`). Intraday stock: not reported — a points report (see *Categories*), because the broker has no historical MIS margin. A broker margin is today's number, so say so in `meta.limits` wherever one is used. | Return-on-capital is meaningless without it. | `make_trade(capital=)` |
 | 14 | **Times are exchange time (IST) as `HH:MM`.** | Mixed time zones corrupt every join. | `sessions_from` |
 | 15 | **Only CLOSED sessions are cached, and nothing is written outside `analysis/scripts/`, `analysis/report/` and `analysis/cache/`.** The window grows through the current date (rule 16), while a session that has already ended can never change and its bars are safe to keep. Never cached: today or later, and never an empty result — "no bars" and "the request failed" look identical from outside, so an empty answer is always re-fetched. Every read is validated (timestamps unique and ascending, OHLC consistent, all positive) and a failing entry is dropped and re-fetched, never repaired. Nothing is interpolated, filled forward or reconstructed: a gap stays a gap. `PYFUNCS_NO_CACHE=1` bypasses it; `verify_cache()` re-fetches a sample and compares bar for bar. | A validated, past-only cache cannot go stale, and re-fetching identical bars cost about an hour per full pass. | `_cache_read/_cache_write`, `verify_cache` |
 | 16 | **The window is `START_DATE` .. `END_DATE` in `py_funcs.py`, and nowhere else.** `START_DATE` is fixed at 2026-01-01 and `END_DATE` is the current IST date when the script starts. No script defines its own defaults — a local copy shadows the shared values and can silently run a different period. Existing HTML reports are snapshots and must be re-run to include new sessions. Audit *every* date default in a script, not only `--from`. A different window (a holdout or per-year table) is opted into by the user and labelled as outside the shared window; `check_window` permits at least the full shared window. | Keeping the start fixed prevents old sessions from silently falling out, while the moving end automatically includes newly available sessions. Every strategy still uses identical boundaries when run on the same date. | `START_DATE`, `END_DATE`, `check_window()` |
@@ -64,7 +130,7 @@ Read the user's prompt against the checklist below. Mark each item **clear**, **
 | 4 | **Signal rule** | exact inputs (which candle, which price), the comparison, every threshold as a **number**, and every indicator with its parameters | "strong", "near", "breakout" with no number or definition |
 | 5 | **Decision time** | when the decision is taken (at the close of which candle) — rule 2 fixes the fill | At what time / on which candle? |
 | 6 | **Direction mapping** | what each signal does (up → buy CE? sell PE? long index?) | Which side for each signal? |
-| 7 | **Traded instrument** | index / futures / equity / option | What is traded? |
+| 7 | **Traded instrument / category** | the category: `stock_intraday`, `index_options` or `stock_options` (see *Categories*) | What is traded? |
 | 8 | **Option specifics** *(if option)* | buy or sell · strike rule (ATM, N steps ITM/OTM) · expiry rule · lots | Strike? Expiry? Lots? |
 | 9 | **Entry** | the signal that triggers it (fill is fixed by rules 1–2) | Any entry condition beyond the signal? |
 | 10 | **Exit** | every way out with numbers: target, stop, time, signal; the first minute an exit may fire; stop/target basis (premium %, points, index level) | Stop? Target? Time exit? |
@@ -100,7 +166,7 @@ tag, or the column reads "CE" / "PE" and says less than it could.
 | Item | Default |
 |------|---------|
 | Settings | none beyond the rule; the panel then shows only the window |
-| Costs | `option_costs` for options; otherwise ask |
+| Costs | the category's schedule (`trade_costs`); a new instrument type needs a new category — ask |
 | Lots | 1 lot; `qty = lots × lot_size` from the resolved contract |
 | Missing data | skip, list in the console and in the answer to the user |
 | Positions | one at a time |
@@ -239,15 +305,17 @@ into `meta["rejected"]` and shows up as *What was tested and left out*.
 
 Before coding, state in a few lines: data to fetch, the loop over days, the signal, how each trade is built, the tags/filters/groups, and the output. If `py_funcs.py` lacks something (e.g. futures costs), add it there as a general function — never bury it in one strategy.
 
-### Step 3 — Write `analysis/scripts/<slug>.py`
+### Step 3 — Write `analysis/scripts/<category>/<slug>.py`
 
 * Docstring = the user's prompt, then the checklist answers and assumptions.
 * Start with:
   ```python
   import os, sys
-  sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "templates"))
+  sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "templates"))
   from py_funcs import *
+  CATEGORY = "index_options"     # stock_intraday | index_options | stock_options
   ```
+  and put `"category": CATEGORY` in `meta`. Leave `meta["cost_model"]` out: `build_payload` writes the category's own.
 * CLI: `--from`, `--to` (defaults from the prompt).
 * **All Upstox calls go through `py_funcs.Upstox`.**
 * Split the file: `fetch` (async) · `signal` (pure, completed candles only) · `simulate` (pure: bars → exit, via `bar_after_candle`, `worst_fills`, `scan_exit`) · `main`.
@@ -292,6 +360,7 @@ Before coding, state in a few lines: data to fetch, the loop over days, the sign
   where `groups = [{"name": "SMA10 cross at entry", "keys": ["sma10"]}, {"name": "SMA10 × RSI", "keys": ["sma10", "rsi"]}]` — each `keys` entry names a tag; several keys = a multi-indicator bucket.
   `chart="default"` embeds option candles only for the trades the rule's own settings produce — a 7-rung ladder would otherwise carry seven times the option data for charts nobody opens; other settings still get every metric, just no option chart. `chart="all"` embeds the lot; say so in `meta.limits`.
 * `meta`: `title`, `subtitle`, `instrument`, `from`, `to`, `lot_size`, `fill_rule`, `cost_model`, `params`, `rule_steps` (the rule in plain English, one string per step), `limits` (assumptions, "what this is not", the in-sample note from rule 11), `coverage` (from `coverage()`).
+* **Write for a trader, in the stock's price (the user's standing request, 2026-09-28).** Titles, rule steps, setting labels and options, tag values, group names, session notes and limits use plain words: "the average daily range of the last 14 days (ATR14)", not "ATR14" alone; "above yesterday's high", not "outside the range". Amounts are in the instrument's own price — rupees / points per share — or in % of the price when a share of the price is meant. **Never basis points.** One short sentence per rule step, with a worked number where it helps ("a ₹1,000 share gapping to ₹1,012 is a 1.2% gap").
 
 **What you get without coding any of it** — for the chosen settings and the chosen date range:
 overview (trades, win %, net, gross, costs, profit factor, expectancy, average win/loss, payoff, best/worst, max drawdown with dates, streaks, t-stat, capital, return on capital, hold time, sessions) · equity, drawdown and rolling-20 win-rate series · standard and custom group-by tables · stability (halves, thirds, quarters with date ranges; without the best/worst 10% of trades, rounded up).
@@ -328,6 +397,8 @@ numbers, so opening on the best never hides what the rule did.
 
 **Under it, the verdict** — one quotable paragraph for the settings and window on screen: sessions traded / declined / no signal / unusable, then trades, wins, win rate, gross less costs, net, profit factor, worst, drawdown, losing run, t-stat.
 
+**The page speaks plain words (2026-09-28, the user's request).** The sections below keep their code names here, but the page shows them as: *Every setting compared* (Every setting, side by side) · *What each filter does* (What each condition costs) · *The benchmark* (the control) · *Profit curve, drawdown and recent win rate* · *Every day* (Every session; the statuses read *traded / skipped by the rule / no setup / bad data* for traded / declined / no signal / no data) · *Minute-by-minute check* (the cross-check); MFE / MAE read *best point / worst point*. Keep new wording in the same register.
+
 **Then the sections**, in order: Overview (cards, led by the session counts) · **Every setting, side by side** · **What each condition costs** · Equity, drawdown, rolling win rate · Breakdowns · Stability · Trades and chart · **Every session** · the rule, parameters, limits and *what was tested and left out*.
 
 *What each condition costs* is the analysis a panel exists for. The panel shows the book **with**
@@ -347,7 +418,7 @@ A setting whose other values would need new data is declared `rerun=True`; the p
 ### Step 4 — Run
 
 ```
-analysis/.venv/Scripts/python.exe analysis/scripts/<slug>.py
+analysis/.venv/Scripts/python.exe analysis/scripts/<category>/<slug>.py
 ```
 
 (Windows, from the repository root.) A `PermissionError` about the token means: run `analysis/.venv/Scripts/python.exe analysis/connect_upstox.py`, log in, re-run.
@@ -419,7 +490,7 @@ move its row up.
 | | capital per trade, return on capital | — | free | `capital=` |
 | **I · honesty** | "what this is not" | 3+ | free | `meta["limits"]` |
 | | "what was tested and left out" | 1 | free | `meta["rejected"]` |
-| | **fill sensitivity** — the same trades at the worst fill, the bar midpoint and the bar close | 1 | free | `build_payload` re-prices them; `worst` stays the rule |
+| | **fill sensitivity** — the same trades at the worst fill and at the bar close (the only two scenarios computed) | 1 | free | options only; `build_payload` re-prices them; `worst` stays the rule. Intraday stocks: worst price only, no comparison |
 | | **the control** — what the underlying itself did over the same trades, as it moved and with the signal | 1 | free | `entry_spot`/`exit_spot`, which `build_payload` fills |
 | | cost sensitivity | — | free | gross, costs and net all shown |
 | **J · explaining** | the rule in plain English, step by step | most | free | `meta["rule_steps"]` |
@@ -458,12 +529,20 @@ move its row up.
 | Expiries incl. expired | `await up.expiry_calendar(key, frm, to)` |
 | Option contract (live or expired) | `await up.resolve_option(key, expiry, strike, "CE"/"PE")` |
 | Index/stock candles | `await up.candles(key, "1m"/"5m"/"15m"/"1d", frm, to)` → `sessions_from(...)` |
+| Stock/index 1-minute sessions, cached | `await up.minute_sessions(key, frm, to)` → `{day: rows}`; ended months come from `analysis/cache` (kind `eq1m` + a per-key month manifest), so a many-stock book costs its calls once |
+| Non-Upstox markets (Asia, US, commodities, FX) | `await yahoo_daily("^N225", frm, to)` → `[[day, o, h, l, c], ...]` in the exchange's own calendar, or `None` when Yahoo is unreachable (say so) |
+| Several stocks in one report | `option_sessions={symbol: {day: rows}}` + `meta["index_label"]`; still points per share (see *Categories*) |
 | Option bars for a day | `await up.option_candles(contract, day)` |
 | Strike maths | `atm_strike`, `strike_offset(spot, step, n, "CE", itm=True)`, `next_expiry` |
 | Bars | `bar_at`, `resample(rows, minutes)` |
 | **Rules** | `bar_after_candle`, `worst_fills`, `scan_exit`, `candle_done_at` |
 | Indicators | `sma`, `ema`, `rsi`, `atr`, `crossed_above`, `crossed_below`, `bucket` |
-| Costs | `option_costs`, `option_round_trip` |
+| Category facts | `CATEGORIES`, `category_of(key)`, `script_category()` |
+| Costs | `trade_costs(category, side, entry, exit, qty, day)`; underneath: `option_costs`, `option_round_trip`, `equity_intraday_costs`, `equity_round_trip` (all take `day=`) |
+| Broker check | `await broker_check(up, category, key, qty, price)` — model vs Upstox's own charges |
+| Broker margin | `await broker_margin(up, key, qty, price, side, product)`, `await broker_margin_ratio(up, key, qty, price)` |
+| Stock F&O lot size on a day (options work only — intraday stocks trade 1 share) | `await up.future_contract(stock_key, day)` → `lot_size` of the near-month future (an expired contract is cached, kind `fut`) |
+| Pre-open auction entry (rule 1 exception, **not for intraday stocks**) | `preopen_fill(rows_1m)` → the 09:15 bar's open |
 | Trades and report | `make_trade`, `excursion`, `build_payload`, `write_report`, `console_summary`, `coverage` |
 | Control panel | `setting`, `combos`, `default_combo`, `settings_cli`, `narrow`, `rerun_command` |
 | Session log | `session_row(day, status, note, **facts)` |
@@ -478,6 +557,6 @@ Upstox facts already handled inside: the v3 candle URL takes `to` before `from`;
 
 ## How `sample.html` is used on each run
 
-* `sample.html` is **never modified by a backtest**. `write_report()` reads it as text, replaces what sits between `/*DATA_START*/` and `/*DATA_END*/` with the run's data, and writes the result to `analysis/report/<name>.html`.
+* `sample.html` is **never modified by a backtest**. `write_report()` reads it as text, replaces what sits between `/*DATA_START*/` and `/*DATA_END*/` with the run's data, and writes the result to `analysis/report/<category>/<name>.html`.
 * Those markers are on the **last line** of the file, inside the final `<script>main(/*DATA_START*/{...}/*DATA_END*/);</script>`. Everything above it is the report code, wrapped in `function main(DATA) {...}`. **To change the report, edit the code above that last script and never touch the data line.** Keep exactly one pair of markers.
 * Whatever data the template holds (empty, or the synthetic demo) is what you see when you open `sample.html` directly. To refresh the demo after editing the template, call `write_report(payload, <path of sample.html>)` with any payload.
