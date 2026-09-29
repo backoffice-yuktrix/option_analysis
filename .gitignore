@@ -47,3 +47,5 @@ Thumbs.db
 
 # fetched candles for closed sessions - reproducible from Upstox, not source
 analysis/cache/
+analysis_rajkumarn/data/
+analysis_rajkumarn/candle_datas/
