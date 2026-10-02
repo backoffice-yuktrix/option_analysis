@@ -471,7 +471,7 @@ Step C - Read it at 15:19, one minute before the entry, so the decision is made 
 
 Why no stop and no target (true of both conditions): every stop level tested, on the premium and on the index, lowered the win rate, the net and the profit factor, and none of them reduced the worst night. The exit already is a target, and because it waits for a whole minute to clear the line, its winners come in at a median +6.5% of premium with 28% of them above +20% - and those carry 77% of all the winning rupees. A resting limit caps exactly those.
 
-### v4 - the day's direction, traded on a playbook of six scenarios
+### v4 - the day's direction, traded on six scenarios (A-F)
 
 WHAT CHANGED FROM v3
 * Which nights are traded. v3 traded only when the day agreed with the 5-day trend. v4 trades when ANY of six scenarios fires - the trend is now one scenario among six, and each needs a second condition that confirms it.

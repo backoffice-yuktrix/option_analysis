@@ -202,7 +202,7 @@ async def run(frm: date, to: date):
         "6-month sample so any choice made from it is in-sample.",
     ]
     async with Upstox() as up:
-        und = await up.find_instrument("NIFTY")
+        und = await up.find_instrument(instrument())
         key = und["instrument_key"]
         info = await up.option_chain_info(key)
         step = info["strike_step"]
@@ -322,4 +322,6 @@ def main():
 
 
 if __name__ == "__main__":
+    run_instruments(__file__)
+elif __name__ == "__instrument__":
     main()

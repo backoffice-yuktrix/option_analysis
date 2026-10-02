@@ -211,7 +211,7 @@ async def run(frm: date, to: date) -> None:
     today = date.today()
     fetch_to = min(to + timedelta(days=7), today - timedelta(days=1))    # next session for the last signal day
     async with Upstox() as up:
-        und = await up.find_instrument("NIFTY")
+        und = await up.find_instrument(instrument())
         ukey = und["instrument_key"]
         info = await up.option_chain_info(ukey)
         step = info["strike_step"]
@@ -364,4 +364,6 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    run_instruments(__file__)
+elif __name__ == "__instrument__":
     main()

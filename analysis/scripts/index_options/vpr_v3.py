@@ -75,11 +75,11 @@ from py_funcs import *  # noqa: F401,F403,E402
 SLUG = "vpr_v3"
 TFS = (3, 5)
 RRS = (2, 3, 4)
-STOP_BUFFER = 25.0
+STOP_BUFFER = 25.0 * price_scale()
 RETEST_MIN, RETEST_MAX = 4, 7
 SQUARE_OFF = "15:15"
 VA_SHARE = 0.70
-BIN = 1.0
+BIN = 1.0 * price_scale()
 SESSION_ROWS = 375
 
 # The axes the source (va_reentry_v1) compares and this script used to fix at one point each.
@@ -258,7 +258,7 @@ async def main(frm: date, to: date) -> None:
     opt_cache: dict[tuple, list] = {}
 
     async with Upstox() as up:
-        und = await up.find_instrument("NIFTY")
+        und = await up.find_instrument(instrument())
         key = und["instrument_key"]
         info = await up.option_chain_info(key)
         step = info["strike_step"]
@@ -376,10 +376,9 @@ async def main(frm: date, to: date) -> None:
                                             note=f"{tf}m {confirm}: arm {cs[sig['arm']][0]}, retest {c[0]} "
                                                  f"({sig['k']} candles later); stop {stop_mode}, eod {eod}; "
                                                  f"index ref {sim['ref']:.2f}, risk {sim['risk']:.2f}"))
-                                        if (tf == 3 and confirm == RULE["confirm"]
-                                                and stop_mode == RULE["stop_mode"]
-                                                and eod == RULE["eod"] and book == RULE["book"]):
-                                            opt_sessions.setdefault(contract["trading_symbol"], {})[d] = orows
+                                        # every trade's candles: the second (signal-candle) view re-prices them;
+                                        # build_payload(chart="default") embeds only the rule's own
+                                        opt_sessions.setdefault(contract["trading_symbol"], {})[d] = orows
                                         if book == "session":
                                             break
                                         busy_until = ex["bar"][0]
@@ -460,7 +459,7 @@ def sessions_from_window(sessions: dict, days: list[str]) -> dict:
     return {d: sessions[d] for d in days}
 
 
-if __name__ == "__main__":
+def cli() -> None:
     ap = argparse.ArgumentParser(description="VPR v3 value-area re-entry backtest")
     ap.add_argument("--from", dest="frm", default=START_DATE.isoformat())
     ap.add_argument("--to", dest="to", default=END_DATE.isoformat())
@@ -472,3 +471,9 @@ if __name__ == "__main__":
     print(f"axes: {len(combos(SETTINGS))} simulated combinations "
           f"(confirmation x timeframe x R:R x stop anchor x end-of-day x position rule)")
     asyncio.run(main(frm, to))
+
+
+if __name__ == "__main__":
+    run_instruments(__file__)
+elif __name__ == "__instrument__":
+    cli()

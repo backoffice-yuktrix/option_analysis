@@ -73,10 +73,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 from py_funcs import *  # noqa: F401,F403,E402
 
 REPORT = "vpr_v2"
-BIN = 1.0
+BIN = 1.0 * price_scale()
 VA_PCT = 0.70
 RETEST_MIN, RETEST_MAX = 4, 15
-STOP_PTS = 25.0
+STOP_PTS = 25.0 * price_scale()
 FORCE = "15:15"
 LAST_ENTRY = "15:15"
 RRS = [2, 3, 4]
@@ -281,7 +281,7 @@ def simulate_book(day: str, setups: list[dict], idx_rows: list[list], rr: int, b
 async def run(frm: date, to: date) -> None:
     skips: set[str] = set()
     async with Upstox() as up:
-        und = await up.find_instrument("NIFTY")
+        und = await up.find_instrument(instrument())
         ukey = und["instrument_key"]
         info = await up.option_chain_info(ukey)
         step = info["strike_step"]
@@ -428,4 +428,6 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    run_instruments(__file__)
+elif __name__ == "__instrument__":
     main()

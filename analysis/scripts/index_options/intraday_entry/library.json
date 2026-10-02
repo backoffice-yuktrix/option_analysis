@@ -1,0 +1,710 @@
+{
+ "candidates": [
+  {
+   "id": "repo_orr_outside_range",
+   "name": "Opening-range reversal, price outside the range (orr_v1)",
+   "family": "existing_repo",
+   "hypothesis": "A one-way morning drift that has left the opening range on one side without ever testing the other edge is a late, one-sided move; by late morning the participants who drove it are done and the index tends to retrace toward the range.",
+   "signal": "Index 1-minute candles of today only. Opening range: ORH = highest high, ORL = lowest low of the first OR 1-minute candles (OR = 5: candles stamped 09:15..09:19). One decision minute T = 11:30 (the candle stamped 11:30, complete). Window W = all 1-minute candles stamped from 09:15+OR (09:20) to T inclusive; if W has fewer than 20 candles, no trade. Fit an ordinary least-squares line through W's closes against the index 0..n-1. DOWN move = slope < 0 AND close(T) < close of W's first candle. UP move = slope > 0 AND close(T) > close of W's first candle. Otherwise no trade. Buy-CE signal: close(T) < ORL AND highest high in W <= ORH AND move is DOWN. Buy-PE signal: close(T) > ORH AND lowest low in W >= ORL AND move is UP. Evaluated only at T, so at most one signal per day; fill in the 1-minute bar T+1 (11:31). The original stop, target and 15:00 square-off are exit rules and are not part of this entry.",
+   "direction": "Fade. Morning move down and price below the range: buy CE. Morning move up and price above the range: buy PE.",
+   "params": [
+    {
+     "name": "decision_time",
+     "centre": "11:30",
+     "lower_neighbour": "11:15",
+     "upper_neighbour": "11:45",
+     "why_this_value": "the script's stated default decision time; the neighbours are two of the script's own alternative decision times"
+    },
+    {
+     "name": "opening_range_minutes",
+     "centre": "5",
+     "lower_neighbour": "3",
+     "upper_neighbour": "15",
+     "why_this_value": "the repo prompt's definition of the opening range; 15 minutes is the other common opening-range convention"
+    }
+   ],
+   "data_needed": "Index 1-minute candles of the trade day only (NIFTY and SENSEX each on their own candles).",
+   "expected_trades_per_week": "about 1 to 2"
+  },
+  {
+   "id": "repo_orr_edge_survived",
+   "name": "Opening-range reversal, surviving-edge rule (orr_v2 and orr_v4, same entry)",
+   "family": "existing_repo",
+   "hypothesis": "A one-way morning move that never breached the opposite edge of the opening range has had no two-sided auction; such moves are argued to turn around midday when the morning flow dries up.",
+   "signal": "Index 1-minute candles of today only. ORH / ORL = highest high / lowest low of the first OR 1-minute candles (OR = 5: 09:15..09:19). One decision minute T = 11:30 (candle stamped 11:30, complete). W = all 1-minute candles stamped 09:15+OR (09:20) to T inclusive; fewer than 20 candles means no trade. OLS line through W's closes against 0..n-1. DOWN move = slope < 0 AND close(T) < first close of W. UP move = slope > 0 AND close(T) > first close of W. Otherwise no trade. Buy-CE signal: highest high in W <= ORH AND move is DOWN. Otherwise buy-PE signal: lowest low in W >= ORL AND move is UP. Where close(T) sits relative to the range does not matter. No trade when both edges were broken, the move has no direction, or the surviving edge and the move disagree. Evaluated only at T, so at most one signal per day; fill in bar T+1 (11:31). orr_v4 differs only in its exit, which is not part of the entry.",
+   "direction": "Fade. Upper edge never broken and move down: buy CE. Lower edge never broken and move up: buy PE.",
+   "params": [
+    {
+     "name": "decision_time",
+     "centre": "11:30",
+     "lower_neighbour": "11:15",
+     "upper_neighbour": "11:45",
+     "why_this_value": "the script's stated default; neighbours are the script's own alternative decision times"
+    },
+    {
+     "name": "opening_range_minutes",
+     "centre": "5",
+     "lower_neighbour": "3",
+     "upper_neighbour": "15",
+     "why_this_value": "the repo prompt's definition; 15 minutes is the other common opening-range convention"
+    }
+   ],
+   "data_needed": "Index 1-minute candles of the trade day only.",
+   "expected_trades_per_week": "about 2 to 4"
+  },
+  {
+   "id": "repo_orr_exhaustion",
+   "name": "Opening-range reversal with three exhaustion tests (orr_v3)",
+   "family": "existing_repo",
+   "hypothesis": "A fade of a one-way morning should only be taken when the move itself looks spent - short-term momentum at an extreme and price stretched from the morning's own average - because a still-healthy trend is more likely to continue than to revert.",
+   "signal": "Index 1-minute candles of today only. Start from repo_orr_edge_survived with OR = 5 (09:15..09:19) and T = 11:30 fixed: W = candles stamped 09:20..11:30; CE candidate if highest high in W <= ORH and the OLS move is DOWN; else PE candidate if lowest low in W >= ORL and the OLS move is UP; else no trade. Then all three tests must pass at T. (1) RSI by plain averages on the last 15 closes of W (14 changes): avgGain = sum of rises / 14, avgLoss = sum of falls / 14, RSI = 100 - 100/(1 + avgGain/avgLoss); RSI = 100 if there are no falls. Need RSI <= 40 for CE, RSI >= 60 for PE. (2) Stretch: mean and population standard deviation (divide by n) of all closes in W; need (mean - close(T))/sd >= 1.0 for CE, (close(T) - mean)/sd >= 1.0 for PE; sd = 0 means no trade. (3) The candle stamped T itself must still move with the move being faded: close < open for CE, close > open for PE. Evaluated only at T, so at most one signal per day; fill in the 11:31 bar. The two switched-off filters in the script (maximum range width, minimum distance beyond the edge) stay off.",
+   "direction": "Fade. Exhausted down move: buy CE. Exhausted up move: buy PE.",
+   "params": [
+    {
+     "name": "rsi_distance_from_50 (CE needs RSI <= 50 - x, PE needs RSI >= 50 + x)",
+     "centre": "10",
+     "lower_neighbour": "5",
+     "upper_neighbour": "15",
+     "why_this_value": "the script's own value (levels 40 / 60), which the repo prompt file says was fitted on this data - a hypothesis, not a convention; the textbook level would be 20 (30 / 70)"
+    },
+    {
+     "name": "sd_stretch_min",
+     "centre": "1.0",
+     "lower_neighbour": "0.75",
+     "upper_neighbour": "1.25",
+     "why_this_value": "one standard deviation is the round-number convention and is also the script value"
+    }
+   ],
+   "data_needed": "Index 1-minute candles of the trade day only.",
+   "expected_trades_per_week": "under 1 (kept only because the user asked for every existing entry; see notes)"
+  },
+  {
+   "id": "repo_snd_sweep_microbreak",
+   "name": "Supply/demand zone return with sweep and micro break (snd_v1 / snd_v2 entry, without the v2 fitted filters)",
+   "family": "existing_repo",
+   "hypothesis": "The first break of structure of the day marks where aggressive orders overwhelmed the other side; when price returns to the origin candle of that break, resting orders there defend it, and a stop-hunt below a minor low followed by a close back above a minor high shows the defence has won.",
+   "signal": "3-minute index candles built from today's 1-minute candles, aligned to 09:15 (09:15-09:17, 09:18-09:20, ...); today's candles only. MAJOR swing high = candle j whose high is strictly above the highs of the 3 candles before and the 3 candles after it; it is confirmed once candle j+3 has completed. Major swing low is the mirror on lows. (a) Break candle i = the first candle of the day whose close is above the high of the most recent major swing high confirmed before candle i (bullish) or below the low of the most recent confirmed major swing low (bearish). Only this first break counts. (b) Zone = the latest opposite-coloured candle among candles i-3, i-2, i-1 (close < open for a bullish break, close > open for a bearish one); zone low / zone high = that candle's low / high; width = high - low. No such candle or width = 0: no trade today. (c) On every candle after i, in this order - death test: bullish case close < zone low - 4 x width, bearish case close > zone high + 4 x width, ends the day with no trade. (d) Touch = the first candle after i with low <= zone high AND high >= zone low. (e) From the touch candle onward (bullish case; mirror for bearish): MINOR swing low / high = a candle whose low / high is strictly beyond those of the N candles each side (N = 2), confirmed once N candles after it have completed. A candle that trades below the low of the most recent confirmed minor swing low and closes back above that low is a sweep (a newer sweep replaces an older one; a candle that is both a sweep and a micro break counts only as a sweep). After a sweep exists, the first LATER candle that closes above the high of the most recent confirmed minor swing high is the SIGNAL candle. The signal minute is the last 1-minute bar m of that 3-minute candle and must satisfy 09:19 <= m <= 14:29; fill in bar m+1. First signal of the day only. The original risk-smaller-than-1-point guard is tied to the original stop and is not applied; the snd_v2 filters (minimum sweep depth, 13:00 cutoff) were fitted on v1's trades and are not applied.",
+   "direction": "With the day's first break of structure. Bullish break (demand zone): buy CE. Bearish break (supply zone): buy PE.",
+   "params": [
+    {
+     "name": "major_swing_n (candles each side)",
+     "centre": "3",
+     "lower_neighbour": "2",
+     "upper_neighbour": "5",
+     "why_this_value": "the repo prompt's definition of a swing; common fractal lengths run 2 to 5"
+    },
+    {
+     "name": "minor_swing_n (candles each side)",
+     "centre": "2",
+     "lower_neighbour": "1",
+     "upper_neighbour": "3",
+     "why_this_value": "not given in the repo prompt: v1 assumed 1 and v2 assumed 2; 2 each side is the standard Williams fractal, and 1 (the v1 value) is tested as the neighbour"
+    }
+   ],
+   "data_needed": "Index 1-minute candles of the trade day only (resampled to 3-minute).",
+   "expected_trades_per_week": "about 1 to 2"
+  },
+  {
+   "id": "repo_snd_zone_touch",
+   "name": "Supply/demand zone return, the touch is the entry (snd_v3; the v4 prompt keeps this entry)",
+   "family": "existing_repo",
+   "hypothesis": "The origin candle of the day's first structural break is where the winning side's orders sat; the first return to that price is met by the same interest, so buying the return in the direction of the break gets trend direction at a pullback price.",
+   "signal": "3-minute index candles built from today's 1-minute candles, aligned to 09:15; today's candles only. Swing high = candle j whose high is strictly above the highs of the 3 candles before and the 3 after it, confirmed once candle j+3 has completed; swing low is the mirror. Break candle i = the first candle of the day whose close is above the high of the most recent swing high confirmed before i (bullish) or below the low of the most recent confirmed swing low (bearish); only the first break counts. Zone = the latest opposite-coloured candle among candles i-3, i-2, i-1 (close < open for bullish, close > open for bearish), zone low / high = its low / high, width = high - low; none or width = 0 means no trade today. On each candle after i, first the death test: bullish close < zone low - 4 x width, bearish close > zone high + 4 x width, ends the day with no trade. SIGNAL = the first later candle with low <= zone high AND high >= zone low, provided that candle STARTS before 13:00; a first touch by a candle starting at or after 13:00 ends the day with no trade. Signal minute m = last 1-minute bar of the touch candle (09:19 <= m <= 14:29); fill in bar m+1. First signal of the day only. The original risk-smaller-than-1-point guard is tied to the original stop and is not applied.",
+   "direction": "With the day's first break of structure. Demand-zone touch after a bullish break: buy CE. Supply-zone touch after a bearish break: buy PE.",
+   "params": [
+    {
+     "name": "swing_n (candles each side)",
+     "centre": "3",
+     "lower_neighbour": "2",
+     "upper_neighbour": "5",
+     "why_this_value": "the repo prompt's definition of a swing"
+    },
+    {
+     "name": "entry_cutoff (touch candle must start before)",
+     "centre": "13:00",
+     "lower_neighbour": "12:30",
+     "upper_neighbour": "13:30",
+     "why_this_value": "the script value, which the repo prompt file says was measured on this same sample - a hypothesis, not a convention"
+    }
+   ],
+   "data_needed": "Index 1-minute candles of the trade day only (resampled to 3-minute).",
+   "expected_trades_per_week": "about 3 to 4"
+  },
+  {
+   "id": "repo_vpr_break_retest",
+   "name": "Previous-day value-area break and held retest (vpr_v1 spec; vpr_v2 window as the upper neighbour)",
+   "family": "existing_repo",
+   "hypothesis": "Yesterday's value area is where most business was done; when price is accepted outside it and the band then holds as support or resistance on a pullback, the market has moved to a new value region and continuation is the path of least resistance.",
+   "signal": "Profile of the PREVIOUS session: build that session's 5-minute candles (aligned to 09:15, 75 candles from its 1-minute candles 09:15..15:29). Price rows are 1 index point wide (row r covers r to r+1). Each 5-minute candle adds one unit to every row from floor(low) to floor(high) inclusive. POC = the row with the most units (tie: the row nearest the session's (high+low)/2, then the lower row). Value area: start with the POC row; repeatedly compare the next row above the area with the next row below it and add the one with more units (tie: add both; one side exhausted: add the other) until the area holds at least 70% of all units. VAH = upper edge of the top row, VAL = lower edge of the bottom row, fixed all day. Today: 5-minute candles aligned to 09:15. Arming candle B: closes > VAH (arms UP) and is either today's first candle or the previous candle of today closed <= VAH; or closes < VAL (arms DOWN) and is either today's first candle or the previous candle of today closed >= VAL. Every such crossing arms. Retest candle R for an UP arm = the first candle that is k candles after B, k from 4 to 7 inclusive, with low <= VAH AND close > VAH; for a DOWN arm, high >= VAL AND close < VAL. A close back inside between B and R does not cancel. SIGNAL = the earliest retest candle R of the day across all arming candles, with its last 1-minute bar m satisfying 09:19 <= m <= 14:29; fill in bar m+1. First signal of the day only. The original 'placeable' test, the 25-point stop and v2's re-arming flow are exit or sizing rules and are not applied.",
+   "direction": "Continuation. Break above VAH that holds on retest: buy CE. Break below VAL that holds: buy PE.",
+   "params": [
+    {
+     "name": "retest_window_candles (k from..to after the break candle)",
+     "centre": "4..7",
+     "lower_neighbour": "3..6",
+     "upper_neighbour": "4..15",
+     "why_this_value": "4..7 is the rule as originally specified in the repo prompt; 4..15 is the v2 window, which the v2 script itself flags as tuned on this data"
+    },
+    {
+     "name": "value_area_share_pct",
+     "centre": "70",
+     "lower_neighbour": "65",
+     "upper_neighbour": "75",
+     "why_this_value": "70% is the market-profile convention (about one standard deviation of activity)"
+    }
+   ],
+   "data_needed": "Index 1-minute candles of the trade day and of the full previous session (time-weighted profile, no volume).",
+   "expected_trades_per_week": "about 1 to 2"
+  },
+  {
+   "id": "repo_vpr_reentry",
+   "name": "Previous-day value-area failed breakout / re-entry (vpr_v3)",
+   "family": "existing_repo",
+   "hypothesis": "When price trades outside yesterday's value area but cannot be accepted there and closes back inside, the breakout has failed; the band then acts as resistance or support from the inside and price tends to rotate back through value.",
+   "signal": "VAH and VAL from the previous session's profile exactly as defined in repo_vpr_break_retest (5-minute candles, 1-point rows, time-weighted, 70% value area, fixed all day). Today: 5-minute candles aligned to 09:15. Arming candle A (cannot be today's first candle): the previous candle of today closed > VAH and this candle closes < VAH (arms DOWN); or the previous candle closed < VAL and this candle closes > VAL (arms UP). Every such inward crossing arms. Retest candle R for a DOWN arm = the first candle that is k candles after A, k from 4 to 7 inclusive, with high >= VAH AND close < VAH; for an UP arm, low <= VAL AND close > VAL. Nothing between A and R cancels. SIGNAL = the earliest retest candle R of the day across all arming candles, with its last 1-minute bar m satisfying 09:19 <= m <= 14:29; fill in bar m+1. First signal of the day only. The original 25-point stop is an exit rule and is not applied.",
+   "direction": "Back into value. Failed break above VAH: buy PE. Failed break below VAL: buy CE.",
+   "params": [
+    {
+     "name": "retest_window_candles (k from..to after the arming candle)",
+     "centre": "4..7",
+     "lower_neighbour": "3..6",
+     "upper_neighbour": "4..10",
+     "why_this_value": "the repo prompt's value, mirrored from the break-and-retest rule's original specification"
+    },
+    {
+     "name": "value_area_share_pct",
+     "centre": "70",
+     "lower_neighbour": "65",
+     "upper_neighbour": "75",
+     "why_this_value": "the market-profile convention"
+    }
+   ],
+   "data_needed": "Index 1-minute candles of the trade day and of the full previous session.",
+   "expected_trades_per_week": "about 1"
+  },
+  {
+   "id": "repo_stretch_fade_1100",
+   "name": "5-day stretch fade at 11:00 (stretch_fade_v1)",
+   "family": "existing_repo",
+   "hypothesis": "When the index has run a large fraction of a typical daily range away from where it closed a week ago, short-horizon positioning is one-sided and the rest of the session tends to give part of the run back.",
+   "signal": "Daily values from the index 1-minute candles: for each completed session, high = highest high and low = lowest low of 09:15..15:29, close = house daily close (average of (h+l+c)/3 over the 1-minute candles 15:00..15:29). True range of a session = max(high - low, |high - previous session's house close|, |low - previous session's house close|). ADR = simple average of the true range of the 14 sessions before today. REF = house daily close of the session L = 5 sessions before today (yesterday is 1 session before). At the single decision minute 11:00 (candle stamped 11:00, complete): stretch = (close of the 11:00 candle - REF) / ADR. stretch > +0.75: DOWN signal. stretch < -0.75: UP signal. Otherwise no trade. One evaluation per day, so at most one signal; fill in the 11:01 bar. The original 6-strikes-in-the-money choice, the wait for a traded option minute and the 13:00 check are strike or exit rules and are not part of the entry.",
+   "direction": "Fade the 5-session move. Stretched up: buy PE. Stretched down: buy CE.",
+   "params": [
+    {
+     "name": "stretch_threshold_adr",
+     "centre": "0.75",
+     "lower_neighbour": "0.5",
+     "upper_neighbour": "1.0",
+     "why_this_value": "the script value, which its own docstring says was chosen looking at the whole sample - a hypothesis, not a convention; the neighbours are the script's own bucket edges"
+    },
+    {
+     "name": "lookback_sessions",
+     "centre": "5",
+     "lower_neighbour": "3",
+     "upper_neighbour": "7",
+     "why_this_value": "one trading week"
+    }
+   ],
+   "data_needed": "Index 1-minute candles of the trade day plus the previous 15 sessions (available from the 2025-11-24 warm-up).",
+   "expected_trades_per_week": "about 1 to 2"
+  },
+  {
+   "id": "repo_stretch_fade_line_reject",
+   "name": "Stretch fade on a confirmed rejection of the day's average line (stretch_fade_v3)",
+   "family": "existing_repo",
+   "hypothesis": "On a day when the index is stretched against its recent range, a retest of the session's average price that is rejected marks the point where intraday traders of the stretch give up, giving the multi-day mean-reversion trade a precise entry.",
+   "signal": "Daily high / low / house close and true range as defined in repo_stretch_fade_1100. Step A, gate at the 11:00 candle (complete): R = simple average true range of the 10 sessions before today; C = close of the 11:00 candle; s1 = (C - house close of the session 5 sessions before today) / R; s2 = (C - (highest high + lowest low of the 10 sessions before today) / 2) / R. PUT day if max(s1, s2) > 0.8 AND min(s1, s2) >= 0. CALL day if min(s1, s2) < -0.8 AND max(s1, s2) <= 0. Otherwise no trade today. Step B: LINE(t) = arithmetic mean of today's 1-minute closes from 09:15 through t. Touch minute u = the first 1-minute candle stamped 11:01 or later with high >= LINE(u) on a PUT day (low <= LINE(u) on a CALL day). Step C: 10-minute candles aligned to 09:15 (last minutes 09:24, 09:34, ...). Signal candle = the first 10-minute candle whose last minute m satisfies u <= m <= 12:30 and whose 1-minute close at m is < LINE(m) on a PUT day (> LINE(m) on a CALL day). Step D, confirmation at the same minute m: take the most recent 15-minute candle (aligned to 09:15) whose last minute is <= m; on a PUT day close(m) must be < (its high + its low)/2, on a CALL day close(m) must be > that midpoint. Only the day's FIRST signal candle is examined: confirmed means SIGNAL at m (fill in bar m+1), not confirmed means no trade today. The original fallback to a later signal when the option has no traded minute is not applied.",
+   "direction": "Fade the stretch. PUT day (stretched up) with a rejection from the line: buy PE. CALL day (stretched down): buy CE.",
+   "params": [
+    {
+     "name": "stretch_threshold",
+     "centre": "0.8",
+     "lower_neighbour": "0.6",
+     "upper_neighbour": "1.0",
+     "why_this_value": "the script value, which its docstring says came from a large settings search on this same data - a hypothesis, not a convention"
+    },
+    {
+     "name": "last_signal_time",
+     "centre": "12:30",
+     "lower_neighbour": "12:00",
+     "upper_neighbour": "13:00",
+     "why_this_value": "the script value; 13:00 is one of the script's own alternatives"
+    }
+   ],
+   "data_needed": "Index 1-minute candles of the trade day plus the previous 11 sessions.",
+   "expected_trades_per_week": "about 1 to 2"
+  },
+  {
+   "id": "repo_atr_trail_ema_cross",
+   "name": "EMA crossing the ATR Trailing Stops line, first midday cross (atr_trail_ema_v1 / v2 entry)",
+   "family": "existing_repo",
+   "hypothesis": "The ATR trailing-stop line flips side only after price has moved several average ranges, so a smoothed price crossing it marks a volatility-scaled change of trend; restricting to midday avoids the opening and closing periods where such crosses are mostly noise.",
+   "signal": "5-minute index candles, each session aligned to 09:15 (75 per session), kept as ONE continuous series across sessions from the first warm-up day 2025-11-24. True range of candle i = max(high - low, |high - close(i-1)|, |low - close(i-1)|) (first candle: high - low). ATR = Wilder average, period 21: first value = simple mean of the first 21 true ranges, then ATR(i) = (ATR(i-1) x 20 + TR(i)) / 21. Trailing line R (close-based, one candle lagged): offset(i) = ATR(i-1) x 3.0. Seed at the first candle where ATR(i-1) exists: R(i) = close(i-1) - offset(i). Afterwards: if close(i-1) > R(i-1) and close(i-2) > R(i-1): R(i) = max(R(i-1), close(i-1) - offset(i)); else if close(i-1) <= R(i-1) and close(i-2) <= R(i-1): R(i) = min(R(i-1), close(i-1) + offset(i)); else if close(i-1) > R(i-1): R(i) = close(i-1) - offset(i); else R(i) = close(i-1) + offset(i). EMA(i) = close(i) x 2/6 + EMA(i-1) x 4/6 (length 5), seeded with the first close of the series. UP cross at candle i: EMA(i) > R(i) AND EMA(i-1) <= R(i-1). DOWN cross: EMA(i) < R(i) AND EMA(i-1) >= R(i-1). SIGNAL = the FIRST cross of the day on a 5-minute candle whose last 1-minute bar m satisfies 11:29 <= m <= 13:24; fill in bar m+1 (11:30..13:25). Crosses outside that window neither fire nor cancel. First signal of the day only; the original stop-and-reverse (several trades a day, opposite cross as exit) is not applied.",
+   "direction": "Trend-following. EMA crosses above the line: buy CE. EMA crosses below the line: buy PE.",
+   "params": [
+    {
+     "name": "atr_multiplier",
+     "centre": "3.0",
+     "lower_neighbour": "2.0",
+     "upper_neighbour": "4.0",
+     "why_this_value": "the Upstox / ChartIQ default of the ATR Trailing Stops study (period 21, multiplier 3)"
+    },
+    {
+     "name": "entry_window (last minute of the signal candle, from..to)",
+     "centre": "11:29..13:24",
+     "lower_neighbour": "10:59..12:54",
+     "upper_neighbour": "11:59..13:54",
+     "why_this_value": "the script's window, which its own docstring says was added from research on this same data - a hypothesis, not a convention; the neighbours shift it half an hour each way"
+    }
+   ],
+   "data_needed": "Index 1-minute candles from 2025-11-24 (continuous indicator warm-up).",
+   "expected_trades_per_week": "about 2 to 3"
+  },
+  {
+   "id": "orb15_close_break",
+   "name": "15-minute opening range breakout (1-minute close)",
+   "family": "trend",
+   "hypothesis": "The first 15 minutes absorb the overnight order backlog and set the range early participants are positioned inside; stops of those who faded the open cluster just beyond its high and low, so a close outside the range triggers them and shows which side is being accepted.",
+   "signal": "Index 1-minute candles of today only. ORH / ORL = highest high / lowest low of the first N 1-minute candles (N = 15: candles stamped 09:15..09:29). SIGNAL = the FIRST completed 1-minute candle stamped t, with 09:15+N <= t <= 14:29 (09:30..14:29 for N = 15), whose close > ORH (UP) or whose close < ORL (DOWN). Fill in bar t+1. First signal of the day only; no such close by 14:29 means no trade.",
+   "direction": "First close above the opening-range high: buy CE. First close below the opening-range low: buy PE.",
+   "params": [
+    {
+     "name": "opening_range_minutes",
+     "centre": "15",
+     "lower_neighbour": "10",
+     "upper_neighbour": "30",
+     "why_this_value": "the 15-minute opening range is the standard ORB definition; 10 and 30 are the adjacent textbook settings"
+    }
+   ],
+   "data_needed": "Index 1-minute candles of the trade day only.",
+   "expected_trades_per_week": "about 4.5 to 5"
+  },
+  {
+   "id": "pdhl_break_5m",
+   "name": "Previous day high / low break (5-minute close)",
+   "family": "trend",
+   "hypothesis": "Yesterday's high and low are the most widely watched reference levels: swing stops and breakout entry orders rest just beyond them, so a close beyond the level means those orders have triggered and the market is accepting prices outside yesterday's whole range.",
+   "signal": "PDH / PDL = highest high / lowest low of the previous session's index 1-minute candles (09:15..15:29). Build today's B-minute candles from 1-minute candles, aligned to 09:15 (B = 5: 09:15-09:19, 09:20-09:24, ...). Only candles whose last 1-minute bar m satisfies 09:19 <= m <= 14:29 are examined. SIGNAL = the FIRST such candle whose close > PDH (UP) or whose close < PDL (DOWN); fill in bar m+1. Gap days are included (the 09:15-09:19 candle can fire, fill 09:20). First signal of the day only.",
+   "direction": "Close above the previous day's high: buy CE. Close below the previous day's low: buy PE.",
+   "params": [
+    {
+     "name": "confirmation_candle_minutes",
+     "centre": "5",
+     "lower_neighbour": "3",
+     "upper_neighbour": "15",
+     "why_this_value": "the 5-minute chart is the default intraday timeframe for confirming a level break by close; 3 and 15 are the adjacent standard timeframes"
+    }
+   ],
+   "data_needed": "Index 1-minute candles of the trade day and the previous session.",
+   "expected_trades_per_week": "about 2.5 to 3"
+  },
+  {
+   "id": "first_hour_close_location",
+   "name": "First-hour direction: close in the outer quarter of the first-hour range",
+   "family": "trend",
+   "hypothesis": "The first hour is when overnight news and institutional order flow are priced, and large orders are sliced through the whole day; a first hour that ends pinned at one edge of its own range shows the dominant side is still unfilled, while a mid-range finish shows two-sided trade.",
+   "signal": "Index 1-minute candles of today only. Window = the first W 1-minute candles (W = 60: stamped 09:15..10:14). H1 = highest high, L1 = lowest low, C1 = close of the window's last candle (10:14). If H1 = L1, no trade. p = (C1 - L1) / (H1 - L1). At the single decision minute (the window's last candle, complete): p >= 1 - F is UP, p <= F is DOWN, with F = 0.25; otherwise no trade. Fill in the next 1-minute bar (10:15). One evaluation per day, so at most one signal.",
+   "direction": "First hour closes in the top quarter of its own range: buy CE. In the bottom quarter: buy PE.",
+   "params": [
+    {
+     "name": "window_minutes",
+     "centre": "60",
+     "lower_neighbour": "45",
+     "upper_neighbour": "90",
+     "why_this_value": "the first hour is the Market Profile initial balance"
+    },
+    {
+     "name": "outer_fraction_of_range",
+     "centre": "0.25",
+     "lower_neighbour": "0.20",
+     "upper_neighbour": "0.33",
+     "why_this_value": "the quartile is the round fraction conventionally used for 'closed near the high / low'"
+    }
+   ],
+   "data_needed": "Index 1-minute candles of the trade day only.",
+   "expected_trades_per_week": "about 2.5 to 3"
+  },
+  {
+   "id": "afternoon_new_extreme",
+   "name": "Trend-day persistence: new session high / low after noon",
+   "family": "trend",
+   "hypothesis": "On ordinary range days the session extremes are set in the morning; a new session extreme after midday means range faders and short-gamma option writers are wrong late in the day with little time left, so their covering and hedging tends to carry the move into the close.",
+   "signal": "Index 1-minute candles of today only. For each completed candle stamped t from S = 12:00 to 14:29: SH = highest high of all candles stamped 09:15..t-1, SL = lowest low of the same candles. SIGNAL = the FIRST such candle whose close > SH (UP) or whose close < SL (DOWN). Fill in bar t+1 (12:01..14:30). First signal of the day only.",
+   "direction": "First post-noon close above the session high so far: buy CE. Below the session low so far: buy PE.",
+   "params": [
+    {
+     "name": "scan_start_time",
+     "centre": "12:00",
+     "lower_neighbour": "11:30",
+     "upper_neighbour": "12:30",
+     "why_this_value": "noon is the round boundary between the morning and afternoon session, close to the midpoint of the 375-minute session"
+    }
+   ],
+   "data_needed": "Index 1-minute candles of the trade day only.",
+   "expected_trades_per_week": "about 2.5 to 3.5"
+  },
+  {
+   "id": "ema20_pullback_5m",
+   "name": "Pullback to the 20-EMA on 5-minute candles, then continue",
+   "family": "trend",
+   "hypothesis": "In an established intraday trend, participants who missed the move wait for a retracement to the trend average to enter, and trapped counter-trend traders use the same dip to exit; a candle that touches the average after a clean run and still closes on the trend side shows the pullback was absorbed.",
+   "signal": "5-minute index candles, each session aligned to 09:15, kept as one continuous series from 2025-11-24. E(k) = exponential moving average of 5-minute closes, period P = 20 (alpha = 2/(P+1)), seeded with the first close of the series, value including candle k. UP signal at today's candle k when: (a) each of the Q = 6 candles immediately before it (k-Q..k-1) belongs to TODAY and has low(j) > E(j); (b) low(k) <= E(k); (c) close(k) > E(k). DOWN signal is the mirror: candles k-Q..k-1 are today's and each has high(j) < E(j); high(k) >= E(k); close(k) < E(k). SIGNAL = the FIRST candle of the day meeting either side, with its last 1-minute bar m <= 14:29 (earliest possible m is 09:49 for Q = 6); fill in bar m+1. First signal of the day only.",
+   "direction": "Held pullback after a clean run above the average: buy CE. Held pullback after a clean run below it: buy PE.",
+   "params": [
+    {
+     "name": "ema_period",
+     "centre": "20",
+     "lower_neighbour": "10",
+     "upper_neighbour": "30",
+     "why_this_value": "the 20-period average is the long-standing default trend average (the Bollinger mid-line)"
+    },
+    {
+     "name": "clean_run_candles",
+     "centre": "6",
+     "lower_neighbour": "4",
+     "upper_neighbour": "8",
+     "why_this_value": "6 five-minute candles is half an hour, the conventional unit for calling an intraday move established"
+    }
+   ],
+   "data_needed": "Index 1-minute candles from 2025-11-24 (continuous EMA).",
+   "expected_trades_per_week": "about 3 to 4"
+  },
+  {
+   "id": "avgprice_cross_hold",
+   "name": "Session average-price (VWAP proxy) cross-and-hold after the first hour",
+   "family": "trend",
+   "hypothesis": "The session's running average price approximates the average cost of everyone who traded today and is the benchmark execution desks trade against; when price crosses it after the first hour and stays across, the day's earlier positions are underwater in aggregate and control of the day has changed hands.",
+   "signal": "Index 1-minute candles of today only. A(t) = arithmetic mean of (high+low+close)/3 over all of today's candles stamped 09:15..t. side(t) = +1 if close(t) > A(t), -1 if close(t) < A(t), 0 if equal. SIGNAL = the FIRST candle stamped t <= 14:29 such that side(t-H+1), ..., side(t) (H = 15 consecutive candles) all equal the same s (+1 or -1), side(t-H) != s, and candle t-H is stamped at or after 09:15 + X - 1 minutes with X = 60 (10:14). Earliest signal candle is therefore 10:29, fill 10:30. Direction = s. Fill in bar t+1. First signal of the day only.",
+   "direction": "Price crosses above the session average and holds 15 minutes: buy CE. Crosses below and holds: buy PE.",
+   "params": [
+    {
+     "name": "hold_minutes",
+     "centre": "15",
+     "lower_neighbour": "10",
+     "upper_neighbour": "30",
+     "why_this_value": "15 minutes is one standard 15-minute chart candle, the usual unit for acceptance of a level"
+    },
+    {
+     "name": "exclude_first_minutes",
+     "centre": "60",
+     "lower_neighbour": "45",
+     "upper_neighbour": "90",
+     "why_this_value": "the first hour (initial balance) is conventionally left to form before the session average is treated as a benchmark"
+    }
+   ],
+   "data_needed": "Index 1-minute candles of the trade day only.",
+   "expected_trades_per_week": "about 3 to 4"
+  },
+  {
+   "id": "mr_session_mean_band_fade",
+   "name": "Stretch from the day's average price (2-sigma session band fade)",
+   "family": "mean_reversion",
+   "hypothesis": "The day's running average price is where most of the session's business was done; a sudden burst far outside the day's own distribution is usually short-dated option buying and stops hitting a thin book rather than new information, and liquidity providers lean against it.",
+   "signal": "Index 1-minute candles of today only. Evaluate only at the minutes t = 09:19, 09:24, 09:29, ... (every 5 minutes) with 09:15 + WARM - 1 <= t <= 14:29, WARM = 30 (first evaluation 09:44). M = arithmetic mean of all 1-minute closes stamped 09:15..t; SD = population standard deviation (divide by n) of the same closes; C = close of the candle stamped t. SD = 0: skip that minute. DOWN condition: C >= M + K x SD. UP condition: C <= M - K x SD. K = 2.0. SIGNAL = the FIRST evaluation minute of the day at which either condition holds; fill in bar t+1. First signal of the day only.",
+   "direction": "Fade. Close at or above mean + K sd: buy PE. Close at or below mean - K sd: buy CE.",
+   "params": [
+    {
+     "name": "K_band_width_sd",
+     "centre": "2.0",
+     "lower_neighbour": "1.5",
+     "upper_neighbour": "2.5",
+     "why_this_value": "2 standard deviations is the standard width of Bollinger and VWAP deviation bands"
+    },
+    {
+     "name": "WARM_minutes",
+     "centre": "30",
+     "lower_neighbour": "15",
+     "upper_neighbour": "60",
+     "why_this_value": "the first half hour is the conventional opening period; 15 (opening range) and 60 (initial balance) are the neighbouring conventions"
+    }
+   ],
+   "data_needed": "Index 1-minute candles of the trade day only.",
+   "expected_trades_per_week": "about 3 to 4"
+  },
+  {
+   "id": "mr_opening_range_failed_breakout",
+   "name": "Failed breakout of the 15-minute opening range",
+   "family": "mean_reversion",
+   "hypothesis": "The 15-minute opening range is the most widely watched breakout level, so breakout buyers and their stops cluster just outside it; when a close outside is followed quickly by a close back inside, those traders are trapped and their exits push the index toward the other end of the range.",
+   "signal": "Index 1-minute candles of today only. ORH / ORL = highest high / lowest low of the first N 1-minute candles (N = 15: 09:15..09:29). Then use 5-minute candles aligned to 09:15 that START at or after 09:15+N (09:30-09:34 onward for N = 15). Up-breakout candle = the first such candle of the day whose close > ORH; its last minute is b_up. Up-failure = the first later 5-minute candle with last minute t, b_up < t <= b_up + W minutes (W = 30), whose close < ORH. Down-breakout candle = the first 5-minute candle whose close < ORL, last minute b_dn; down-failure = the first later candle with b_dn < t <= b_dn + W whose close > ORL. Only the first breakout on each side is eligible; if it does not fail within W that side is finished for the day. SIGNAL = the earliest failure candle across both sides with t <= 14:29; fill in bar t+1. First signal of the day only.",
+   "direction": "Broke above the range, then closed back below ORH: buy PE. Broke below, then closed back above ORL: buy CE.",
+   "params": [
+    {
+     "name": "N_opening_range_minutes",
+     "centre": "15",
+     "lower_neighbour": "5",
+     "upper_neighbour": "30",
+     "why_this_value": "the 15-minute opening range is the standard definition; 5 and 30 are the other two common ones"
+    },
+    {
+     "name": "W_failure_window_minutes",
+     "centre": "30",
+     "lower_neighbour": "15",
+     "upper_neighbour": "60",
+     "why_this_value": "half an hour is a round conventional window for a breakout to prove itself"
+    }
+   ],
+   "data_needed": "Index 1-minute candles of the trade day only.",
+   "expected_trades_per_week": "about 2 to 2.5"
+  },
+  {
+   "id": "mr_prev_day_extreme_sweep",
+   "name": "Previous day's high / low sweep and reclaim",
+   "family": "mean_reversion",
+   "hypothesis": "Stops of yesterday's swing positions and breakout entries rest just beyond the previous day's high and low; large participants use that resting liquidity to fill orders the other way, so a breach that cannot hold leaves breakout traders trapped and price rotates back into yesterday's range.",
+   "signal": "PDH / PDL = highest high / lowest low of the previous session's index 1-minute candles (09:15..15:29). Today: b_up = stamp of the first 1-minute candle (from 09:15, so a gap open counts) whose high > PDH. Up-sweep = the first 5-minute candle (aligned to 09:15) with last minute t, b_up <= t <= b_up + W minutes (W = 60), whose close < PDH. b_dn = stamp of the first 1-minute candle whose low < PDL; down-sweep = the first 5-minute candle with b_dn <= t <= b_dn + W whose close > PDL. Only the first breach on each side is eligible. SIGNAL = the earliest such t across both sides with 09:19 <= t <= 14:29; fill in bar t+1. First signal of the day only.",
+   "direction": "Breach above PDH then a 5-minute close back below it: buy PE. Breach below PDL then a 5-minute close back above it: buy CE.",
+   "params": [
+    {
+     "name": "W_reclaim_window_minutes",
+     "centre": "60",
+     "lower_neighbour": "30",
+     "upper_neighbour": "120",
+     "why_this_value": "one hour is the round conventional limit for calling a breach a failed one rather than a later pullback"
+    }
+   ],
+   "data_needed": "Index 1-minute candles of the trade day and the previous session.",
+   "expected_trades_per_week": "about 2"
+  },
+  {
+   "id": "mr_rsi14_exhaustion_recross",
+   "name": "Exhaustion after a fast run (5-minute RSI 14 leaving the 70 / 30 zone)",
+   "family": "mean_reversion",
+   "hypothesis": "A one-way intraday run is fed by momentum chasers and hedging; when it stalls the last entrants hold the worst prices, and the first loss of momentum after an overbought or oversold reading marks them starting to exit, pulling the index back toward where the run began.",
+   "signal": "5-minute index candles of TODAY only, aligned to 09:15 (no carry-over from yesterday). RSI with period P = 14 on the 5-minute closes: changes d(i) = close(i) - close(i-1) from today's 2nd candle; the first average gain and average loss are the simple means of the first P gains / losses (first RSI at today's candle number P+1, last minute 10:29 for P = 14); afterwards Wilder smoothing avg = (previous avg x (P-1) + current) / P; RSI = 100 - 100/(1 + avgGain/avgLoss), RSI = 100 if avgLoss = 0. Levels: upper = 50 + D, lower = 50 - D, D = 20. DOWN signal at a candle whose RSI < upper while the previous candle's RSI >= upper. UP signal at a candle whose RSI > lower while the previous candle's RSI <= lower. SIGNAL = the FIRST candle of the day meeting either, with its last minute t <= 14:29 (earliest 10:34 for P = 14); fill in bar t+1. First signal of the day only.",
+   "direction": "RSI drops back below 70 after being at or above it: buy PE. RSI rises back above 30 after being at or below it: buy CE.",
+   "params": [
+    {
+     "name": "P_rsi_period",
+     "centre": "14",
+     "lower_neighbour": "10",
+     "upper_neighbour": "20",
+     "why_this_value": "14 is Wilder's original RSI period"
+    },
+    {
+     "name": "D_level_distance_from_50",
+     "centre": "20",
+     "lower_neighbour": "15",
+     "upper_neighbour": "25",
+     "why_this_value": "70 / 30 are Wilder's standard overbought / oversold levels"
+    }
+   ],
+   "data_needed": "Index 1-minute candles of the trade day only.",
+   "expected_trades_per_week": "about 3 to 4"
+  },
+  {
+   "id": "vol_narrow_ib_extension",
+   "name": "Narrow initial balance (first hour), then range extension",
+   "family": "volatility",
+   "hypothesis": "The first hour is where the day's short-term participants set the range; when that range is smaller than usual the longer-timeframe participant has not yet acted and the day's normal range still has to be made, so the first acceptance outside a narrow initial balance is that participant arriving while options are still priced off the quiet first hour.",
+   "signal": "Index 1-minute candles. Initial balance (IB) = highest high (IBH) and lowest low (IBL) of the first M 1-minute candles (M = 60: 09:15..10:14). WIDTH = IBH - IBL. AVG = simple mean of WIDTH (same M) over the 20 sessions before today. The day is eligible only if WIDTH < K x AVG with K = 1.0. On an eligible day use 5-minute candles aligned to 09:15 that START at or after 09:15+M (10:15-10:19 onward for M = 60) and whose last minute m <= 14:29. SIGNAL = the FIRST such candle whose close > IBH (UP) or whose close < IBL (DOWN); fill in bar m+1. First signal of the day only.",
+   "direction": "5-minute close above the initial-balance high: buy CE. Below the initial-balance low: buy PE.",
+   "params": [
+    {
+     "name": "M_initial_balance_minutes",
+     "centre": "60",
+     "lower_neighbour": "45",
+     "upper_neighbour": "75",
+     "why_this_value": "the first 60 minutes is the Market Profile definition of the initial balance"
+    },
+    {
+     "name": "K_width_vs_20_session_average",
+     "centre": "1.0",
+     "lower_neighbour": "0.9",
+     "upper_neighbour": "1.1",
+     "why_this_value": "1.0 is the plain 'narrower than average' line; the 20-session (one month) average is held fixed"
+    }
+   ],
+   "data_needed": "Index 1-minute candles of the trade day and the previous 20 sessions (available from the 2025-11-24 warm-up).",
+   "expected_trades_per_week": "about 2"
+  },
+  {
+   "id": "vol_vix_confirmed_or_break",
+   "name": "Opening-range break confirmed by India VIX rising on the day and since the open",
+   "family": "volatility",
+   "hypothesis": "India VIX rising while the index leaves its opening range means option buyers are paying up at the same moment as the move - it is being hedged and chased rather than sold into, the state in which writers are short gamma and hedge with the move; a break with VIX falling is the opposite state.",
+   "signal": "Index 1-minute candles and India VIX 1-minute candles (the same VIX series for both indices). ORH / ORL = highest high / lowest low of the index's first R 1-minute candles (R = 15: 09:15..09:29). VIX_PREV = house daily close of VIX for the previous session (average of (h+l+c)/3 over its VIX candles 15:00..15:29; if that window is empty, the last VIX close of that session). VIX_OR = VIX close of the last opening-range minute (09:29), or the latest VIX close earlier today if that candle is missing. For each completed 1-minute candle stamped t from 09:15+R to 14:29: VIX_t = VIX close at t (or the latest VIX close today at or before t; none means skip the minute). Gate: VIX_t > VIX_PREV AND VIX_t > VIX_OR. SIGNAL = the FIRST minute t where the gate holds AND the index close(t) > ORH (UP) or < ORL (DOWN). Fill in bar t+1. First signal of the day only.",
+   "direction": "Index close above the opening-range high with the VIX gate true: buy CE. Below the opening-range low with the gate true: buy PE (expected to produce more PE than CE signals because VIX usually rises on falls).",
+   "params": [
+    {
+     "name": "R_opening_range_minutes",
+     "centre": "15",
+     "lower_neighbour": "10",
+     "upper_neighbour": "30",
+     "why_this_value": "the 15-minute opening range is the standard convention; the VIX gate uses only 'above previous close' and 'above its opening-range close' and carries no tunable number"
+    }
+   ],
+   "data_needed": "Index 1-minute candles of the trade day; VIX 1-minute candles of the trade day and the previous session.",
+   "expected_trades_per_week": "about 2"
+  },
+  {
+   "id": "vol_wide_range_bar_follow",
+   "name": "Wide-range 5-minute bar follow-through",
+   "family": "volatility",
+   "hypothesis": "A 5-minute bar twice the size of recent bars that closes toward its extreme is the footprint of a large order or fresh information hitting thin liquidity; such orders are worked over many minutes and liquidity providers step back after being run over, so the next stretch tends to continue.",
+   "signal": "5-minute index candles, each session aligned to 09:15, kept as one continuous series across sessions. Range of a candle = high - low. For each of today's candles k whose last minute m satisfies 09:34 <= m <= 14:29 (the first three candles 09:15-09:29 are skipped): AVG = simple mean of the ranges of the N = 20 five-minute candles immediately before k (running back into the previous session when needed). UP condition: range(k) >= X x AVG with X = 2.0, AND close(k) > open(k), AND close(k) > (high(k) + low(k)) / 2. DOWN condition: range(k) >= X x AVG, AND close(k) < open(k), AND close(k) < (high(k) + low(k)) / 2. SIGNAL = the FIRST candle of the day meeting either; fill in bar m+1. First signal of the day only.",
+   "direction": "Wide-range bar that closes up and in its upper half: buy CE. One that closes down and in its lower half: buy PE.",
+   "params": [
+    {
+     "name": "X_range_multiple",
+     "centre": "2.0",
+     "lower_neighbour": "1.5",
+     "upper_neighbour": "2.5",
+     "why_this_value": "twice the average range is the usual textbook definition of a wide-range bar"
+    },
+    {
+     "name": "N_average_candles",
+     "centre": "20",
+     "lower_neighbour": "14",
+     "upper_neighbour": "30",
+     "why_this_value": "the 20-period average is the standard look-back; 14 is the ATR default"
+    }
+   ],
+   "data_needed": "Index 1-minute candles of the trade day and the previous session.",
+   "expected_trades_per_week": "about 3 to 4"
+  },
+  {
+   "id": "vol_lunch_lull_break",
+   "name": "Post-lunch expansion: break of the midday lull range",
+   "family": "volatility",
+   "hypothesis": "Intraday volatility is U-shaped: 11:30 to 13:30 is the quietest stretch, and activity returns from about 13:30 as Europe opens and intraday positions start to be unwound before square-off, forcing out whoever leaned against the lull's edges while option premium has decayed through the lull.",
+   "signal": "Index 1-minute candles of today only. Lull window = 1-minute candles stamped from T1 = 11:30 up to but excluding T2 = 13:30 (11:30..13:29). LH / LL = highest high / lowest low of that window. Use 5-minute candles aligned to 09:15 that START at or after T2 and whose last minute m <= 14:29 (for T2 = 13:30: last minutes 13:34..14:29). SIGNAL = the FIRST such candle whose close > LH (UP) or whose close < LL (DOWN); fill in bar m+1. First signal of the day only; no such close by 14:29 means no trade.",
+   "direction": "5-minute close above the midday range high: buy CE. Below the midday range low: buy PE.",
+   "params": [
+    {
+     "name": "T1_lull_start",
+     "centre": "11:30",
+     "lower_neighbour": "11:00",
+     "upper_neighbour": "12:00",
+     "why_this_value": "11:30 is the customary start of the lunch lull on NSE / BSE, a round half-hour mark"
+    },
+    {
+     "name": "T2_lull_end",
+     "centre": "13:30",
+     "lower_neighbour": "13:00",
+     "upper_neighbour": "14:00",
+     "why_this_value": "13:30 IST is the European cash open and the customary start of the afternoon session, a round half-hour mark"
+    }
+   ],
+   "data_needed": "Index 1-minute candles of the trade day only.",
+   "expected_trades_per_week": "about 3"
+  },
+  {
+   "id": "gap_fail_through_pc",
+   "name": "Failed gap: 15-minute close through the previous close",
+   "family": "context",
+   "hypothesis": "Everyone who bought a gap-up open or carried longs through it is under water once price is accepted back below yesterday's close, and the overnight news behind the gap has been rejected by the cash session; their liquidation pushes price on in the anti-gap direction (mirror for a gap down).",
+   "signal": "PC = house daily close of the previous session (average of (h+l+c)/3 over its 1-minute candles 15:00..15:29). O = open of today's 09:15 1-minute candle. G = O - PC; G = 0 means no trade. Build B-minute candles aligned to 09:15 (B = 15: 09:15-09:29, 09:30-09:44, ...). Only candles whose last minute t satisfies 09:19 <= t <= 14:29 are examined. SIGNAL = the FIRST such candle whose close is on the opposite side of PC from the open: G > 0 and close < PC (DOWN), or G < 0 and close > PC (UP). Fill in bar t+1. First signal of the day only.",
+   "direction": "Gap up, then a 15-minute close below the previous close: buy PE. Gap down, then a 15-minute close above it: buy CE.",
+   "params": [
+    {
+     "name": "bar_minutes",
+     "centre": "15",
+     "lower_neighbour": "5",
+     "upper_neighbour": "30",
+     "why_this_value": "the 15-minute candle is the standard intraday confirmation bar; 5 and 30 are the adjacent standard timeframes"
+    }
+   ],
+   "data_needed": "Index 1-minute candles of the trade day and the previous session.",
+   "expected_trades_per_week": "about 2.5"
+  },
+  {
+   "id": "spx_cue_confirmed",
+   "name": "Overnight S&P 500 cue confirmed by the first 15 minutes",
+   "family": "context",
+   "hypothesis": "Foreign portfolio flows into Indian index heavyweights are sized off the US session and executed through the Indian day, not only at the open; when the first 15 minutes extend in the US direction instead of fading it, local liquidity has not absorbed that flow and it keeps arriving.",
+   "signal": "S&P 500 daily rows: take the most recent row dated strictly BEFORE today's Indian date (never a row dated today). It is usable only if its date is on or after the date of the previous Indian session (otherwise the cue was already traded on: no trade). R = that row's close / the close of the S&P row before it - 1. R = 0 or a missing row means no trade. O = open of today's index 09:15 candle; C = close of the candle stamped 09:15 + N - 1 with N = 15 (09:29). SIGNAL at t = 09:29 (fill in the 09:30 bar) if R > 0 and C > O (UP), or R < 0 and C < O (DOWN). Otherwise no trade. One evaluation per day, so at most one signal.",
+   "direction": "US up overnight and the first 15 minutes up: buy CE. US down and the first 15 minutes down: buy PE.",
+   "params": [
+    {
+     "name": "confirm_minutes",
+     "centre": "15",
+     "lower_neighbour": "10",
+     "upper_neighbour": "30",
+     "why_this_value": "the 15-minute opening range convention; 10 and 30 are the other standard opening windows"
+    }
+   ],
+   "data_needed": "S&P 500 daily file (rows dated before the trade date only); index 1-minute candles of the trade day.",
+   "expected_trades_per_week": "about 2.5"
+  },
+  {
+   "id": "near_expiry_first_hour_drive",
+   "name": "Near-expiry first-hour drive (short-gamma days only)",
+   "family": "context",
+   "hypothesis": "In Indian weekly index options the net sellers are short gamma, and gamma is largest in the last sessions before expiry; their delta hedging buys strength and sells weakness, amplifying whatever direction the day has taken by the end of the first hour.",
+   "signal": "E = the expiry the house rule would trade today (nearest weekly expiry at least 1 day after today, read from the option file names). DTE = number of trading sessions after today up to and including E, counted from the session dates in the index candle file (dates only - no prices of later days are read). Trade only if DTE <= D with D = 3. PC = house daily close of the previous session (average of (h+l+c)/3 over 15:00..15:29). C = close of the index 1-minute candle stamped 09:15 + V - 1 with V = 60 (10:14). SIGNAL at that minute (fill in the next bar, 10:15): C > PC is UP, C < PC is DOWN, C = PC is no trade. One evaluation per day, so at most one signal.",
+   "direction": "First-hour close above the previous close on a near-expiry day: buy CE. Below it: buy PE.",
+   "params": [
+    {
+     "name": "dte_max_sessions",
+     "centre": "3",
+     "lower_neighbour": "2",
+     "upper_neighbour": "4",
+     "why_this_value": "the second half of a 5-session weekly cycle is the conventional expiry-week gamma zone"
+    },
+    {
+     "name": "eval_minutes",
+     "centre": "60",
+     "lower_neighbour": "30",
+     "upper_neighbour": "90",
+     "why_this_value": "the first trading hour is the standard initial-balance window"
+    }
+   ],
+   "data_needed": "Index 1-minute candles of the trade day and previous session; the list of weekly expiry dates from the option file names; the session calendar.",
+   "expected_trades_per_week": "about 3"
+  },
+  {
+   "id": "atm_oi_writer_skew",
+   "name": "First-hour at-the-money open-interest skew (follow the writers)",
+   "family": "context",
+   "hypothesis": "New open interest in index options is created mainly by well-capitalised writers selling to retail buyers; writers add puts where they are confident price will not fall and calls where they expect a cap, then defend those strikes with hedging flow, so the side that added more open interest around the money in the first hour shows where the stronger hands are positioned.",
+   "signal": "Contract = the expiry the house rule would trade today. K0 = listed strike nearest the close of the index 09:15 candle (step 50 NIFTY, 100 SENSEX; tie goes to the lower strike). Strike set S = K0 plus the J = 1 listed strikes directly above and directly below it, fixed for the day. OI_PE(m) / OI_CE(m) = sum over S of the open interest in each option's 1-minute candle at minute m (the latest candle of today at or before m). T = 09:15 + V - 1 with V = 60 (10:14). D = [OI_PE(T) - OI_PE(09:15)] - [OI_CE(T) - OI_CE(09:15)]. Skip the day if any CE or PE in S has no candle today at or before 09:15 or at or before T, or has zero open interest at either point. SIGNAL at T (fill in bar T+1, 10:15): D > 0 is UP, D < 0 is DOWN, D = 0 is no trade. One evaluation per day, so at most one signal.",
+   "direction": "Put open interest grew more than call open interest (put writing dominates): buy CE. Call open interest grew more: buy PE.",
+   "params": [
+    {
+     "name": "eval_minutes",
+     "centre": "60",
+     "lower_neighbour": "30",
+     "upper_neighbour": "90",
+     "why_this_value": "the first trading hour is the standard initial-balance window and gives the exchange's slow open-interest updates time to register"
+    },
+    {
+     "name": "strikes_each_side",
+     "centre": "1",
+     "lower_neighbour": "0",
+     "upper_neighbour": "2",
+     "why_this_value": "the at-the-money strike plus one each side is the conventional at-the-money zone in open-interest reading"
+    }
+   ],
+   "data_needed": "Index 1-minute candles (09:15 close for the strike); 1-minute CE and PE candles with open interest for the 3 (up to 5) strikes around the money of the traded weekly expiry.",
+   "expected_trades_per_week": "about 4.5 to 5"
+  }
+ ],
+ "dropped": [
+  {
+   "id": "mr_daily_rsi2_stretch_fade",
+   "reason": "Near-duplicate of repo_stretch_fade_1100: both fade a multi-day stretch at one fixed clock time with no intraday condition. The repo version is kept because the user asked for every existing entry in the comparison; keeping both would test the same idea twice."
+  },
+  {
+   "id": "mr_gap_fade_through_open",
+   "reason": "Merged into gap_fail_through_pc: both fade an opening gap on a candle close back through a reference price. The kept version uses the previous close and needs no gap-size threshold, so it has one parameter fewer and a higher expected signal rate (this one was 1.5 to 2 a week)."
+  },
+  {
+   "id": "vol_narrow_prevday_pdhl_break",
+   "reason": "Its signal is pdhl_break_5m with a narrow-previous-day filter, so its trades are a strict subset of a kept candidate. The 'quiet range, then expansion' idea is already represented by vol_narrow_ib_extension."
+  },
+  {
+   "id": "vol_hour_box_squeeze",
+   "reason": "Merged into vol_narrow_ib_extension: same idea (an unusually tight hour, then a 5-minute close outside it). The kept version uses the conventional initial balance and a 1.0-times-average line; this one's box limit of 0.25 of the daily ATR has no convention behind it."
+  },
+  {
+   "id": "gap_go_or15",
+   "reason": "Near-duplicate of orb15_close_break: identical trigger (1-minute close outside the 15-minute opening range), and its gap filter of 0.10 ATR passes about four days in five, so the trade list would be largely the same. Gap context is still covered by gap_fail_through_pc."
+  },
+  {
+   "id": "synthetic_basis_lead",
+   "reason": "Not measurable with the data on disk: the 1-minute closes of the CE, the PE and the index are last prints at different moments inside the minute, so the CE - PE + strike - index 'basis' is dominated by stale-print noise rather than a real forward premium. A 2-sigma print on a 20-sample window also occurs almost surely within the first few evaluated minutes, so the rule collapses into an entry near 09:35 in an arbitrary direction."
+  }
+ ],
+ "notes": "The library has 28 candidates: 10 existing repo entries, 6 trend, 4 mean reversion, 4 volatility and 4 context. Six proposals were dropped or merged. I looked at no price data, result or report and ran no code.\n\nConventions that apply to every signal:\n- NIFTY and SENSEX are each tested on their own index candles and trade their own options.\n- A candle \"stamped HH:MM\" is the 1-minute candle starting at HH:MM. It is complete at the end of that minute and acted on in the next 1-minute bar.\n- N-minute candles are built from 1-minute candles aligned to 09:15. The signal minute is the candle's last 1-minute bar.\n- The signal minute must fall between 09:19 and 14:29, so the fill lands between 09:20 and 14:30. A later signal is no trade.\n- Only the first signal of the day counts.\n- \"Previous session\" is the most recent earlier date in the index candle file.\n- Previous-day high and low come from that session's 1-minute candles 09:15..15:29.\n- Every \"previous close\" and \"daily close\" is the house daily close: the average of (h+l+c)/3 over 15:00..15:29. The two proposals that used the 15:29 candle's close were rewritten to this.\n- Daily true range is max(high - low, |high - previous house close|, |low - previous house close|).\n\nDecisions the next stage should know about:\n- **Repo entries with more than 2 parameters:** all were kept, because the user asked for every existing entry. Each has its extra settings frozen at the repo value inside the signal text, and only two are varied for the neighbour test.\n- **Repo entries tied to their own stop:** the \"risk under 1 point\" and \"placeable\" guards, stop-and-reverse, and next-signal fallbacks were removed. They belong to the original exits, and the comparison needs one common exit.\n- **Fidelity of repo signals:** I did not open the scripts. Four details are my own commitments and are stated in the signal text:\n  - swings are found on today's candles only;\n  - the touch candle may itself be the sweep candle;\n  - the value area grows one row at a time;\n  - the 15-minute confirmation candle is the latest one ending at or before the signal minute.\n  If a repo script has an importable signal function that differs on these, reuse the script's function and record the difference.\n- **Centres that are not conventions:** the docs of these repo entries say their numbers were fitted on this same data: repo_orr_exhaustion (RSI 40/60), repo_snd_zone_touch (13:00 cutoff), repo_stretch_fade_1100 (0.75), repo_stretch_fade_line_reject (0.8 and 12:30), repo_atr_trail_ema_cross (midday window) and the 4..15 neighbour of repo_vpr_break_retest. They start with an in-sample advantage, so their neighbour results matter more than their centre results.\n- **snd_v2 filters left out:** repo_snd_sweep_microbreak is tested without v2's sweep-depth and 13:00 filters, which were fitted on v1's trades.\n- **Low signal rate:** repo_orr_exhaustion is expected to fire under once a week. It is kept only because the user asked for all existing entries and should be reported as \"too few trades to judge\" if it falls below the minimum trade count. repo_vpr_reentry, at about one a week, is borderline.\n- **Multiple testing:** 28 candidates, two indices and up to 9 parameter cells each is a large number of looks at 143 sessions. The best raw result will look good by chance, so any winner must clear a shuffled or permutation baseline built over the whole library, and must hold at its neighbours.\n- **CE/PE balance:** all rules are mirrored. vol_vix_confirmed_or_break is expected to lean towards PE and atm_oi_writer_skew may lean one way; their null comparison should keep each rule's own CE/PE mix."
+}

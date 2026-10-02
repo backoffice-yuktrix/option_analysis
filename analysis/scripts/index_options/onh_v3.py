@@ -104,7 +104,7 @@ ENTRY_MIN = "15:20"
 READ_MIN = "15:19"
 SIGNAL_MIN = "15:14"
 TIME_EXIT = "15:14"
-STEP = 50.0
+STEP = strike_step()             # 50 on NIFTY, 100 on SENSEX - read from the contract list
 LOTS = 1
 # The three entry checks, side by side.  One time-value limit is three different questions, and
 # they do not agree; see the aspect catalogue in RUN.md.  All three are FILTERS: every night is
@@ -127,7 +127,7 @@ AGREES, AGAINST, NO_HIST = "agrees with the day", "against the day", "no history
 # Only the strike ladder costs requests, and Upstox meters per second, per minute and per half
 # hour, so the whole ladder over the standing window is about an hour of pacing.  Three rungs
 # around the rule is what a default run ships; --moneyness 0,2,4,6,8,10,12 buys the rest.
-DEFAULT_LADDER = "6,4,2,0,-2,-4,-6"
+DEFAULT_LADDER = ",".join(str(v) for v in STRIKE_LADDER)   # 6 ITM .. ATM (the user, 2026-09-30)
 
 # The rungs: 6 in the money, through at the money, to 6 out of the money.  A positive value is
 # strikes IN the money, a negative one OUT.
@@ -141,7 +141,7 @@ def rung_label(v: int) -> str:
     return "at the money" if v == 0 else f"{abs(v)} {'in' if v > 0 else 'out of'} the money"
 
 
-LADDER = [6, 5, 4, 3, 2, 1, 0, -1, -2, -3, -4, -5, -6]
+LADDER = list(STRIKE_LADDER)
 
 # The control panel.  Defaults = the rule as the prompt states it.
 SETTINGS = [
@@ -304,7 +304,7 @@ async def run(frm: date, to: date, settings: list[dict]):
     firsts = values_of(settings, "first_exit")
     chart_rung = default_combo(settings)["moneyness"]      # the only rung whose candles we keep
     async with Upstox() as up:
-        und = await up.find_instrument("NIFTY")
+        und = await up.find_instrument(instrument())
         key = und["instrument_key"]
         info = await up.option_chain_info(key)
         if info["strike_step"] != STEP:
@@ -422,7 +422,7 @@ async def run(frm: date, to: date, settings: list[dict]):
                 tv_tag = bucket(share * 100, [0, 5, 10, 15.0000001],
                                 ["below intrinsic", "0-5%", "5-10%", "10-15%", "above 15%"])
                 tvc = {"tv vs share": PASS_SHARE if share <= TV_MAX_SHARE else FAIL_SHARE,
-                          "tv vs points": PASS_PTS if tv_pts <= TV_MAX_POINTS else FAIL_PTS,
+                          "tv vs points": PASS_PTS if tv_pts <= TV_MAX_POINTS * price_scale() else FAIL_PTS,
                           "tv share value": f"{share:.6f}"}      # carrier for add_rank_tags
                 if steps == chart_rung:
                     seen = {
@@ -504,8 +504,8 @@ def main() -> None:
     a = ap.parse_args()
     if a.set_moneyness is None:
         a.set_moneyness = DEFAULT_LADDER
-        print(f"strike ladder defaulting to {DEFAULT_LADDER} (6 ITM to 6 OTM, every other rung); "
-              f"the full 13-rung ladder is --moneyness " + ",".join(str(v) for v in LADDER))
+        print(f"strike ladder defaulting to {DEFAULT_LADDER} (6 ITM to ATM); "
+              f"the full ladder is --moneyness " + ",".join(str(v) for v in LADDER))
     settings = narrow(SETTINGS, a)
     frm, to = date.fromisoformat(a.frm), date.fromisoformat(a.to)
     check_window(frm, to)
@@ -628,4 +628,6 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    run_instruments(__file__)
+elif __name__ == "__instrument__":
     main()

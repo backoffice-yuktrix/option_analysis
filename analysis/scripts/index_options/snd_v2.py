@@ -276,7 +276,7 @@ def find_setup(c: list[list], tf: int) -> dict:
             return {"skip": f"{direction} confirmation at {c[k][0]} rejected, day used up: " + "; ".join(why)}
         stop = min(zlo, sweep["extreme"]) if bull else max(zhi, sweep["extreme"])   # Step 13
         risk = abs(cl - stop)
-        if risk < MIN_RISK:
+        if risk < MIN_RISK * price_scale():
             return {"skip": f"{direction} confirmation at {c[k][0]}: risk {risk:.2f} < {MIN_RISK:g} point, "
                             f"day used up"}
         # what the source's other anchors and its liquidity target need, read from candles
@@ -318,7 +318,7 @@ def simulate(setup: dict, tf: int, rr: float, index_rows: list[list], opt_rows: 
     e = setup["entry_index"]
     stop = anchored_stop(setup, anchor)
     risk = abs(e - stop)
-    if risk < MIN_RISK:
+    if risk < MIN_RISK * price_scale():
         return f"{anchor} stop gives risk {risk:.2f} < {MIN_RISK:g} point"
     if target_mode == "liq":
         target = setup.get("liq")
@@ -376,7 +376,7 @@ async def main(frm: date, to: date) -> None:
     option_sessions: dict[str, dict[str, list]] = {}
     skips = 0
     async with Upstox() as up:
-        und = await up.find_instrument("NIFTY")
+        und = await up.find_instrument(instrument())
         key = und["instrument_key"]
         info = await up.option_chain_info(key)
         step = info["strike_step"]
@@ -506,7 +506,7 @@ async def main(frm: date, to: date) -> None:
     print(path)
 
 
-if __name__ == "__main__":
+def cli() -> None:
     yday = datetime.now(IST).date() - timedelta(days=1)
     ap = argparse.ArgumentParser(description="Supply and Demand v2 backtest")
     ap.add_argument("--from", dest="frm", type=date.fromisoformat, default=START_DATE)
@@ -517,3 +517,9 @@ if __name__ == "__main__":
     check_window(a.frm, a.to)
     print(f"axes: {len(combos(SETTINGS))} simulated combinations")
     asyncio.run(main(a.frm, a.to))
+
+
+if __name__ == "__main__":
+    run_instruments(__file__)
+elif __name__ == "__instrument__":
+    cli()

@@ -93,9 +93,9 @@ import argparse
 
 TFS = [3, 5]
 RRS = [2, 3, 4]
-ROW = 5.0
+ROW = 5.0 * price_scale()
 VA_FRAC = 0.70
-STOP_PTS = 25.0
+STOP_PTS = 25.0 * price_scale()
 RETEST_MIN, RETEST_MAX = 4, 7
 SQUARE_OFF = "15:15"
 LAST_ENTRY = "15:15"
@@ -300,7 +300,7 @@ async def run(frm: date, to: date, literal: bool):
     opt_sessions: dict[str, dict[str, list]] = {}
     lot = None
     async with Upstox() as up:
-        und = await up.find_instrument("NIFTY")
+        und = await up.find_instrument(instrument())
         key = und["instrument_key"]
         info = await up.option_chain_info(key)
         step = info["strike_step"]
@@ -433,4 +433,6 @@ def main():
 
 
 if __name__ == "__main__":
+    run_instruments(__file__)
+elif __name__ == "__instrument__":
     main()

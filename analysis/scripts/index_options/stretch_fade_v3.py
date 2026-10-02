@@ -69,7 +69,7 @@ LAST_MIN = "15:29"              # a working sell order waits at most until the l
 SETUP_TF = 10                   # the signal candle, minutes, aligned to 09:15
 CONFIRM_TFS = (5, 15, 30)       # candles whose middle may confirm the signal (15 = the rule)
 CONFIRM_RULE = 15
-STEP = 50.0
+STEP = strike_step()             # 50 on NIFTY, 100 on SENSEX - read from the contract list
 LOTS = 1
 RANGE_N = 10                    # sessions in the average daily range (true range)
 CLOSE_BACK = 5                  # reference 1: the official close this many sessions ago
@@ -153,7 +153,7 @@ SETTINGS = [
                      {"value": "1.5", "raw": 1.5, "label": "2 x the stop + 1.5 x the 1-minute range (the rule)"},
                      {"value": "2", "raw": 2.0, "label": "2 x the stop + 2 x the 1-minute range"}]),
     setting("moneyness", "Strike depth", kind="strike", default=6, rerun=True,
-            options=[{"value": v, "label": rung_label(v), "raw": v} for v in (6, 4)],
+            options=[{"value": v, "label": rung_label(v), "raw": v} for v in STRIKE_LADDER],
             help="--moneyness 6,4 prices the 4-ITM rung on the same days"),
 ]
 
@@ -331,7 +331,7 @@ async def run(frm: date, to: date, settings: list[dict]):
     chart_rung = rule["moneyness"]
     broker_line = None
     async with Upstox() as up:
-        key = (await up.find_instrument("NIFTY"))["instrument_key"]
+        key = (await up.find_instrument(instrument()))["instrument_key"]
         info = await up.option_chain_info(key)
         if info["strike_step"] != STEP:
             raise SystemExit(f"Upstox strike step is {info['strike_step']}, the rule assumes {STEP}.")
@@ -589,8 +589,8 @@ def main() -> None:
         "not the 64% shown.",
         f"HALVES: {SPLIT} is where the research split the year; it is also when STT on an option sale rose from 0.10% "
         f"to 0.15%, which the costs follow.",
-        f"WINDOW: the shared START_DATE {START_DATE} .. END_DATE; this report was run on the one-year study window "
-        f"2025-09-29 .. 2026-09-25. Daily candles from {DAILY_LOOKBACK_DAYS} calendar days before it are read for the "
+        f"WINDOW: the shared START_DATE {START_DATE} .. END_DATE; this report was run on "
+        f"{frm} .. {to}. Daily candles from {DAILY_LOOKBACK_DAYS} calendar days before it are read for the "
         f"range and the references, never traded.",
         "Capital = premium x qty. 'Entries until', 'Skip quiet days' and 'Which side' are exact filters (signals are "
         f"simulated to {CUT_MAX} and tagged); every other setting is simulated on its own.",
@@ -687,4 +687,6 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    run_instruments(__file__)
+elif __name__ == "__instrument__":
     main()

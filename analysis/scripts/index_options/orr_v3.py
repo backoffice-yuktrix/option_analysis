@@ -181,7 +181,7 @@ def simulate(idx_rows: list, opt_rows: list, sig: dict, decision: str, rr: int):
 # --------------------------------------------------------------------------- fetch + main
 async def main_async(frm: date, to: date) -> None:
     async with Upstox() as up:
-        und = await up.find_instrument("NIFTY")
+        und = await up.find_instrument(instrument())
         key = und["instrument_key"]
         info = await up.option_chain_info(key)
         step = info["strike_step"]
@@ -332,4 +332,6 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    run_instruments(__file__)
+elif __name__ == "__instrument__":
     main()

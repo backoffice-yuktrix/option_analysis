@@ -249,7 +249,7 @@ def find_setup(rows: list[list], tf: int) -> dict:
         return {"status": ("sweep seen but no micro break before 15:15" if sweep is not None else
                            "zone touched but no sweep before 15:15" if armed else
                            "zone never touched before 15:15")}
-    if risk < MIN_RISK:
+    if risk < MIN_RISK * price_scale():
         return {"status": f"risk {risk:.2f} pts < {MIN_RISK:g}: no trade, the day's slot is used"}
     # the alternatives the source compares need the micro-BOS extreme and the opposing
     # liquidity, both read from candles complete at the signal (rule 4)
@@ -308,7 +308,7 @@ def simulate(setup: dict, rr: float, mode: str, idx1: list[list], opt: list[list
     sgn = 1 if d == "long" else -1
     stop = anchored_stop(setup, anchor)
     risk = (setup["signal_close"] - stop) if d == "long" else (stop - setup["signal_close"])
-    if risk < MIN_RISK:
+    if risk < MIN_RISK * price_scale():
         return {"skip": f"{anchor} stop gives risk {risk:.2f} pts < {MIN_RISK:g}"}
     if target_mode == "liq":
         target = setup.get("liq")
@@ -386,7 +386,7 @@ async def main() -> None:
     skipped: list[str] = []
 
     async with Upstox() as up:
-        und = await up.find_instrument("NIFTY")
+        und = await up.find_instrument(instrument())
         ukey = und["instrument_key"]
         info = await up.option_chain_info(ukey)
         step = info["strike_step"]
@@ -507,4 +507,6 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
+    run_instruments(__file__)
+elif __name__ == "__instrument__":
     asyncio.run(main())

@@ -191,7 +191,7 @@ async def run(frm: date, to: date):
     skips: list[str] = []
     opt_sessions: dict[str, dict[str, list]] = {}
     async with Upstox() as up:
-        und = await up.find_instrument("NIFTY")
+        und = await up.find_instrument(instrument())
         key = und["instrument_key"]
         info = await up.option_chain_info(key)
         step = info["strike_step"]
@@ -321,4 +321,6 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    run_instruments(__file__)
+elif __name__ == "__instrument__":
     main()

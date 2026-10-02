@@ -190,7 +190,7 @@ def find_setup(c: list[list], tf: int) -> dict:
             entry_ref = C[k]
             stop = zl if side == "LONG" else zh
             risk = entry_ref - stop if side == "LONG" else stop - entry_ref
-            if risk < MIN_RISK:
+            if risk < MIN_RISK * price_scale():
                 return {"skip": f"touch at {c[k][0]}: risk {risk:.2f} pts < {MIN_RISK:g}, slot used"}
             # opposing liquidity, from candles complete before the touch candle + swings confirmed at its close
             ext = max(H[:k]) if side == "LONG" else min(L[:k])
@@ -262,7 +262,7 @@ async def main(frm: date, to: date) -> None:
     opt_cache: dict[tuple, list[list]] = {}
     contract_cache: dict[tuple, dict | None] = {}
     async with Upstox() as up:
-        und = await up.find_instrument("NIFTY")
+        und = await up.find_instrument(instrument())
         key = und["instrument_key"]
         info = await up.option_chain_info(key)
         step = info["strike_step"]
@@ -399,7 +399,7 @@ async def main(frm: date, to: date) -> None:
     print(path)
 
 
-if __name__ == "__main__":
+def cli() -> None:
     yesterday = datetime.now(IST).date() - timedelta(days=1)
     ap = argparse.ArgumentParser(description="Supply and Demand v3 backtest")
     ap.add_argument("--from", dest="frm", type=date.fromisoformat, default=START_DATE)
@@ -410,3 +410,9 @@ if __name__ == "__main__":
     check_window(a.frm, a.to)
     print(f"axes: {len(combos(SETTINGS))} simulated combinations")
     asyncio.run(main(a.frm, a.to))
+
+
+if __name__ == "__main__":
+    run_instruments(__file__)
+elif __name__ == "__instrument__":
+    cli()

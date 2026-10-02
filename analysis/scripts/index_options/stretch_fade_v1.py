@@ -47,7 +47,7 @@ CATEGORY = "index_options"
 SLUG = "stretch_fade_v1"
 SIGNAL_MIN = "11:00"            # the decision candle
 TIME_EXIT = "15:14"
-STEP = 50.0
+STEP = strike_step()             # 50 on NIFTY, 100 on SENSEX - read from the contract list
 LOTS = 1
 LOOKBACK = 5                    # sessions back for the stretch reference close
 RANGE_N = 14                    # sessions in the average daily range
@@ -56,7 +56,7 @@ FILL_WAIT = 2                   # a zero-volume minute is not a fill: wait up to
 DAILY_LOOKBACK_DAYS = 45        # calendar days of daily candles before --from (5 + 14 + 1 sessions and holidays)
 ROWS_PER_SESSION = 375
 SPLIT = "2026-04-01"            # option STT rose from 0.10% to 0.15% of the sale; also the study's halves
-DEFAULT_LADDER = "6,4,2,0"
+DEFAULT_LADDER = ",".join(str(v) for v in STRIKE_LADDER)   # 6 ITM .. ATM (the user, 2026-09-30)
 UP_DIR, DOWN_DIR = "5-day move up: buy PE", "5-day move down: buy CE"
 AT_LOSING, AT_WINNING, AT_NONE = "losing at the check", "winning at the check", "no check"
 SIZE_EDGES = [0.5, 0.75, 1.0, 1.25]
@@ -107,7 +107,7 @@ SETTINGS = [
                      {"value": "24", "label": "sells if it falls to 24 points above paid + charges", "raw": 24.0},
                      {"value": "hold", "label": "is held to 15:14 with no floor", "raw": "hold"}]),
     setting("moneyness", "Strike depth", kind="strike", default=6, rerun=True,
-            options=[{"value": v, "label": rung_label(v), "raw": v} for v in (6, 4, 2, 0)],
+            options=[{"value": v, "label": rung_label(v), "raw": v} for v in STRIKE_LADDER],
             help="every rung is priced on the same days; --moneyness narrows the ladder"),
 ]
 
@@ -209,7 +209,7 @@ def simulate_exit(rows: list[list], entry_bar: list, line: float, check: str | N
         got = first_sale(after, lambda lo: lo > line, REASON["rescue"], state)
         return got or time_exit(REASON["loser"], state)
     if floor != "hold":                                      # a winner keeps its floor
-        got = first_sale(after, lambda lo: lo <= line + floor, REASON["floor"], state)
+        got = first_sale(after, lambda lo: lo <= line + floor * price_scale(), REASON["floor"], state)
         if got:
             return got
     return time_exit(REASON["winner"], state)
@@ -231,7 +231,7 @@ async def run(frm: date, to: date, settings: list[dict]):
     chart_rung = rule["moneyness"]
     broker_line = None
     async with Upstox() as up:
-        und = await up.find_instrument("NIFTY")
+        und = await up.find_instrument(instrument())
         key = und["instrument_key"]
         info = await up.option_chain_info(key)
         if info["strike_step"] != STEP:
@@ -436,8 +436,8 @@ def main() -> None:
         f"{SPLIT} is also when STT on an option sale rose from 0.10% to 0.15%, which the costs follow.",
         "BIG DAYS CARRY IT: the trades still winning at the check and held to 15:14 make the profit; without the "
         "best 10 trades the study book was about -Rs 18k. Expect flat or losing months.",
-        f"WINDOW: the shared START_DATE {START_DATE} .. END_DATE; this report was run on 2025-09-29 .. 2026-09-25 "
-        f"(the one-year study window). Daily candles from {DAILY_LOOKBACK_DAYS} calendar days "
+        f"WINDOW: the shared START_DATE {START_DATE} .. END_DATE; this report was run on {frm} .. {to}."
+        f" Daily candles from {DAILY_LOOKBACK_DAYS} calendar days "
         f"before the window are read for the stretch and the range, never traded.",
         "Capital = premium x qty, so it differs by rung and return on capital is comparable across the ladder.",
     ]
@@ -514,4 +514,6 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    run_instruments(__file__)
+elif __name__ == "__instrument__":
     main()

@@ -97,7 +97,7 @@ EXIT_RULES = [
 EXIT_BY_KEY = {k: (st, lim, trig, thr) for k, _l, st, lim, trig, thr in EXIT_RULES}
 RULE_EXIT = "low-0930"
 # THE STRIKE LADDER - each rung is its own fetch, which is the only part that costs anything.
-RUNGS = [0, 2, 4, 6, 8]
+RUNGS = list(STRIKE_LADDER)            # 6 ITM .. ATM (the user, 2026-09-30)
 RULE_RUNG = 6
 # THE EXTRA HOLD CONDITIONS - a filter over trades that already exist, so every night is
 # traded and tagged and any condition can be switched off. (tag name, label)
@@ -286,7 +286,7 @@ async def run(frm: date, to: date, settings: list[dict]) -> None:
     today = datetime.now(IST).date()
 
     async with Upstox() as up:
-        und = await up.find_instrument("NIFTY")
+        und = await up.find_instrument(instrument())
         key = und["instrument_key"]
         info = await up.option_chain_info(key)
         step = info["strike_step"]
@@ -364,9 +364,10 @@ async def run(frm: date, to: date, settings: list[dict]) -> None:
                               f"({move_pct:+.2f}%); strike {strike:.0f} ({rung} in) from 15:20 price {spot:.2f}; "
                               f"line to beat {sim['line']:.2f}; exit rule {ex_key}"
                               + (f"; trigger {sim['trigger'][0]}" if sim["trigger"] else ""))))
-                if rung == RULE_RUNG:                 # only the rule's rung keeps candles for the chart
-                    osess = option_sessions.setdefault(c["trading_symbol"], {})
-                    osess[day], osess[xday] = erows, xrows
+                # every rung keeps its candles: the second (signal-candle) view re-prices each trade from them;
+                # build_payload(chart="default") still embeds only the rule's own in the report
+                osess = option_sessions.setdefault(c["trading_symbol"], {})
+                osess[day], osess[xday] = erows, xrows
             print(f"{day} {direction:4s} {spot:.0f}  {len(rungs)}x{len(exit_keys)} priced")
 
     print(f"\nSkipped {len(skips)} day(s):")
@@ -436,4 +437,6 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    run_instruments(__file__)
+elif __name__ == "__instrument__":
     main()

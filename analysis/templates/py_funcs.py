@@ -1,8 +1,9 @@
-"""Everything a generated strategy script needs from Upstox, plus the report writer.
+"""Everything a generated strategy script needs from the local candle store, plus the report writer.
 
 A strategy script in analysis/scripts/<category>/ imports this file and contains ONLY the
-strategy: decide, simulate, build trades.  Only CLOSED sessions and EXPIRED contracts are
-cached (section 1b, analysis/cache); everything else is fetched on every run.
+strategy: decide, simulate, build trades.  Every candle, expiry and contract comes from
+analysis/candle_datas (section 1b); nothing is fetched from Upstox without the user's
+permission, and a run ends by listing whatever it needed that was not on disk.
 
     import os, sys
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "templates"))
@@ -28,6 +29,7 @@ Sections: 1 paths  2 Upstox client (3 instruments and options, 4 candles inside 
 from __future__ import annotations
 
 import asyncio
+import functools
 import gzip
 import json
 import math
@@ -74,194 +76,337 @@ def read_access_token() -> str:
 
 
 # ---------------------------------------------------------------------------
-# 1b  the candle cache - CLOSED SESSIONS ONLY, and never a guess
+# 1b  LOCAL DATA ONLY - analysis/candle_datas (the user, 2026-09-29)
 # ---------------------------------------------------------------------------
-# The window starts at a fixed date and grows through the current IST date.  Bars from sessions
-# that have already closed can never change, so caching them turns a re-run from an hour into
-# seconds.
+# Every candle, expiry list and contract list a strategy reads comes from the files that
+# analysis/templates/fetch_data.py keeps in analysis/candle_datas (moved from analysis_rajkumarn/ on
+# 2026-09-30, the user; fetch_data drives the unedited analysis_rajkumarn/fetch_candles.py; layout and
+# format: analysis_rajkumarn/fetch.md, section 3).  A strategy run never fetches from Upstox.
 #
-# Everything here exists to make the cache impossible to trust wrongly:
-#
-#   * ONLY past sessions.  Nothing for today or later is ever written or read - a session
-#     still forming is partial, and a partial bar is not the day's bar (rule 7).
-#   * NEVER an empty result.  "No bars" can mean the contract did not trade, or it can mean a
-#     transient failure; the two are indistinguishable from outside, so an empty answer is
-#     re-fetched every time rather than remembered as fact.
-#   * EVERY read is validated: timestamps unique and ascending, OHLC consistent, all positive.
-#     A row that fails is not repaired - the whole entry is dropped and re-fetched.
-#   * Only what the API returned is stored.  Nothing is interpolated, filled forward, or
-#     reconstructed.  A gap in the data stays a gap.
-#
-# `CACHE_OFF = True` (or --no-cache on a script) bypasses it entirely, and
-# `verify_cache(up, n)` re-fetches a random sample and compares, so the claim is testable.
+#   * What is not on disk is NOT fetched.  It is noted, the run carries on with it as 'no data'
+#     (rule 6), the report says so in meta.limits, and the end of the run prints the exact
+#     fetch_candles.py commands that would fill the gap.  Those are run only with the user's
+#     permission, and only for what was missing.
+#   * A day inside a file's `fetched` ranges with no candles is a real no-trade day; a day outside
+#     them is missing data.  The two are never confused.
+#   * Nothing here writes to disk.  Nothing is interpolated or filled forward: a gap stays a gap.
+#   * The broker's charges and margin calculators, NSE and Yahoo are live calls too: they run only
+#     with PYFUNCS_ALLOW_FETCH=1, set when the user has allowed it for that run.
 
-CACHE_DIR = os.path.join(ANALYSIS_DIR, "cache")
-CACHE_VERSION = 1
-CACHE_OFF = os.environ.get("PYFUNCS_NO_CACHE") == "1"
-_CACHE_STATS = {"hit": 0, "miss": 0, "write": 0, "rejected": 0}
+LOCAL_DATA_DIR = os.path.abspath(os.path.join(ANALYSIS_DIR, "candle_datas"))
+# Stocks and their options live apart in analysis/stock_datas (git-ignored, the user, 2026-09-30);
+# fetch_data.data_dir puts every non-index instrument there.  Both folders are read, candle_datas first.
+STOCK_DATA_DIR = os.path.abspath(os.path.join(ANALYSIS_DIR, "stock_datas"))
+LOCAL_DATA_DIRS = (LOCAL_DATA_DIR, STOCK_DATA_DIR)
+ALLOW_FETCH = os.environ.get("PYFUNCS_ALLOW_FETCH") == "1"
+NO_FETCH = ("live fetches are off - nothing is fetched without the user's permission "
+            "(PYFUNCS_ALLOW_FETCH=1 once they allow it)")
 
-
-def _cache_path(kind: str, day: str) -> str:
-    return os.path.join(CACHE_DIR, f"v{CACHE_VERSION}", kind, f"{day}.json")
-
-
-def _cache_is_past(day: str) -> bool:
-    """Only sessions strictly before today may be cached."""
-    return day < datetime.now(IST).date().isoformat()
-
-
-def _rows_ok(rows, cols: int = 5) -> bool:
-    """A cached session must look exactly like what the API gives, or it is not used.  cols=6 adds
-    the minute's volume (a whole number, zero allowed)."""
-    if not isinstance(rows, list) or not rows:
-        return False
-    last = ""
-    for r in rows:
-        if not isinstance(r, list) or len(r) != cols:
-            return False
-        if cols == 6:
-            if not isinstance(r[5], (int, float)) or r[5] < 0:
-                return False
-            r = r[:5]
-        t, o, h, l, c = r
-        if not isinstance(t, str) or len(t) != 5 or t[2] != ":" or t <= last:
-            return False                                  # unique and ascending
-        last = t
-        try:
-            o, h, l, c = float(o), float(h), float(l), float(c)
-        except (TypeError, ValueError):
-            return False
-        if min(o, h, l, c) <= 0 or l > min(o, c) or h < max(o, c) or l > h:
-            return False                                  # OHLC must be consistent
-    return True
+_OPT_FILE = re.compile(r"^(?P<name>.+?)_(?P<ot>CE|PE)_(?P<strike>[\d.]+)_(?P<expiry>\d{4}-\d{2}-\d{2})(_\w+)?_candles\.json$")
+_INST_FILE = re.compile(r"^(?P<name>.+?)(?:_(?P<iv>\d+[md]))?_candles\.json$")
+_EXPIRY_FILE = re.compile(r"^(?P<name>.+)_expiry\.json$")
+_BLOBS: dict[str, dict | None] = {}              # index candles, expiry and contract lists - this run only
+_KEYS: dict[str, str] | None = None               # instrument_key -> NAME of every index / stock on disk
+_CONTRACTS: dict[str, dict] = {}                  # option instrument_key -> its contract row
+_INDEXED: set[str] = set()                        # NAMEs whose contract list is in _CONTRACTS
+_MISSING: dict[str, list[tuple[date, date]]] = {}  # fetch_candles.py arguments -> date ranges not on disk
+_NOTES: set[str] = set()                          # a gap no single fetch_candles.py command fills
+_BUILT: set[tuple[str, str]] = set()              # (NAME, interval) built from 1-minute candles this run
 
 
-def _cache_read(kind: str, day: str, key: str, cols: int = 5):
-    if CACHE_OFF or not _cache_is_past(day):
-        return None
-    path = _cache_path(kind, day)
-    if not os.path.exists(path):
-        return None
+class LiveFetchBlocked(RuntimeError):
+    """A live call (Upstox, NSE, Yahoo) was asked for while PYFUNCS_ALLOW_FETCH is not set."""
+
+
+def _read_json(path: str) -> dict | None:
     try:
         with open(path, encoding="utf-8") as f:
-            blob = json.load(f)
+            return json.load(f)
     except (OSError, ValueError):
         return None
-    rows = blob.get(key)
-    if rows is None:
+
+
+def _local_path(fname: str) -> str:
+    """Where a data file is: the first of LOCAL_DATA_DIRS that holds it (else where an index file would be)."""
+    for d in LOCAL_DATA_DIRS:
+        p = os.path.join(d, fname)
+        if os.path.exists(p):
+            return p
+    return os.path.join(LOCAL_DATA_DIR, fname)
+
+
+def _local(fname: str) -> dict | None:
+    """One file of LOCAL_DATA_DIRS, parsed once per run."""
+    if fname not in _BLOBS:
+        _BLOBS[fname] = _read_json(_local_path(fname))
+    return _BLOBS[fname]
+
+
+def _local_keys() -> dict[str, str]:
+    """{instrument_key: NAME} for every index or stock with a candle or expiry file on disk.  The key
+    is read from the head of each file (fetch_candles writes it before the candles), so no big
+    file is parsed to find it."""
+    global _KEYS
+    if _KEYS is None:
+        _KEYS = {}
+        names = [(d, fn) for d in LOCAL_DATA_DIRS if os.path.isdir(d) for fn in sorted(os.listdir(d))]
+        for d, fn in names:
+            m = None if _OPT_FILE.match(fn) else (_INST_FILE.match(fn) or _EXPIRY_FILE.match(fn))
+            if not m:
+                continue
+            with open(os.path.join(d, fn), encoding="utf-8") as f:
+                k = re.search(r'"instrument_key":\s*"([^"]+)"', f.read(1024))
+            if k:
+                _KEYS.setdefault(k.group(1), m.group("name"))
+    return _KEYS
+
+
+def _local_contracts(name: str) -> dict[str, list[dict]]:
+    """{expiry: [contract, ...]} from NAME_contracts.json - every past expiry fetch_candles has seen.
+    Each: {instrument_key, trading_symbol, strike, type, lot_size, expired}."""
+    chain = _local(f"{name}_contracts.json") or {}
+    if name not in _INDEXED:
+        _INDEXED.add(name)
+        for e, cs in chain.items():
+            for c in cs:
+                _CONTRACTS[c["instrument_key"]] = dict(c, underlying=name, expiry=e)
+    return chain
+
+
+def _contract_by_key(key: str) -> dict | None:
+    for name in sorted(set(_local_keys().values())):
+        _local_contracts(name)
+    return _CONTRACTS.get(key)
+
+
+def _option_name(option_type: str, strike: float, expiry: str) -> str:
+    """CE_25000_2026-01-27 - the contract part of a file name, as fetch_candles.option_name writes it."""
+    return f"{option_type}_{float(strike):g}_{expiry}"
+
+
+@functools.lru_cache(maxsize=32)
+def _option_file(fname: str) -> tuple[list, dict] | None:
+    """(fetched ranges, {day: [[HH:MM, o, h, l, c, volume], ...]}) of one contract file, or None.
+    Kept for the last 32 contracts: a trade reads its contract on the entry day and the exit day."""
+    blob = _read_json(_local_path(fname))
+    if blob is None:
         return None
-    if not _rows_ok(rows, cols):
-        _CACHE_STATS["rejected"] += 1
-        return None
-    _CACHE_STATS["hit"] += 1
-    return [[r[0]] + [float(x) for x in r[1:5]] + ([int(r[5])] if cols == 6 else []) for r in rows]
+    days: dict[str, list[list]] = {}
+    for r in blob["candles"]:
+        days.setdefault(r[0][:10], []).append(
+            [r[0][11:16], float(r[1]), float(r[2]), float(r[3]), float(r[4]), int(r[5]) if len(r) > 5 else 0])
+    return blob["fetched"], days
 
 
-def _cache_write(kind: str, day: str, key: str, rows: list, cols: int = 5) -> None:
-    if CACHE_OFF or not _cache_is_past(day) or not rows or not _rows_ok(rows, cols):
-        return                                            # never cache empty, never cache today
-    path = _cache_path(kind, day)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    blob = {}
-    if os.path.exists(path):
-        try:
-            with open(path, encoding="utf-8") as f:
-                blob = json.load(f)
-        except (OSError, ValueError):
-            blob = {}
-    blob[key] = rows
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(blob, f, separators=(",", ":"))
-    os.replace(tmp, path)                                 # atomic: no half-written file
-    _CACHE_STATS["write"] += 1
-
-
-def _meta_ok(value) -> bool:
-    """A cached contract list: non-empty, every entry naming its instrument and a positive lot."""
-    return (isinstance(value, list) and bool(value) and all(
-        isinstance(c, dict) and c.get("instrument_key") and isinstance(c.get("lot_size"), int) and c["lot_size"] > 0
-        for c in value))
-
-
-def _meta_read(kind: str, name: str, key: str):
-    """Instrument facts that can no longer change (an EXPIRED contract), same rules as the candles:
-    only a past `name` (a date), validated on every read, dropped and re-fetched when it fails."""
-    if CACHE_OFF or not _cache_is_past(name):
-        return None
-    path = _cache_path(kind, name)
-    try:
-        with open(path, encoding="utf-8") as f:
-            value = json.load(f).get(key)
-    except (OSError, ValueError):
-        return None
-    if value is None:
-        return None
-    if not _meta_ok(value):
-        _CACHE_STATS["rejected"] += 1
-        return None
-    _CACHE_STATS["hit"] += 1
-    return value
-
-
-def _meta_write(kind: str, name: str, key: str, value) -> None:
-    if CACHE_OFF or not _cache_is_past(name) or not _meta_ok(value):
-        return
-    path = _cache_path(kind, name)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    blob = {}
-    if os.path.exists(path):
-        try:
-            with open(path, encoding="utf-8") as f:
-                blob = json.load(f)
-        except (OSError, ValueError):
-            blob = {}
-    blob[key] = value
-    with open(path + ".tmp", "w", encoding="utf-8") as f:
-        json.dump(blob, f, separators=(",", ":"))
-    os.replace(path + ".tmp", path)
-    _CACHE_STATS["write"] += 1
-
-
-def cache_stats() -> str:
-    t = _CACHE_STATS
-    return (f"cache: {t['hit']} hits, {t['miss']} misses, {t['write']} written"
-            + (f", {t['rejected']} REJECTED as invalid" if t["rejected"] else ""))
-
-
-async def verify_cache(up: "Upstox", sample: int = 12) -> str:
-    """Re-fetch a random sample of cached sessions and compare, bar for bar.  The cache is only
-    worth having if this passes, so run it whenever the cache is doubted."""
-    import random
-    root = os.path.join(CACHE_DIR, f"v{CACHE_VERSION}", "opt1m")
-    if not os.path.isdir(root):
-        return "no cache to verify"
-    files = [f for f in os.listdir(root) if f.endswith(".json")]
-    random.shuffle(files)
-    checked = bad = 0
-    for fn in files:
-        if checked >= sample:
+def _gaps(frm: date, to: date, fetched: list[list[str]]) -> list[tuple[date, date]]:
+    """The parts of [frm, to] not inside any fetched [from, to] range."""
+    out, cur = [], frm
+    for a, b in sorted((date.fromisoformat(a), date.fromisoformat(b)) for a, b in fetched):
+        if b < cur:
+            continue
+        if a > to:
             break
-        day = fn[:-5]
-        with open(os.path.join(root, fn), encoding="utf-8") as f:
-            blob = json.load(f)
-        for ikey, rows in list(blob.items())[:2]:
-            if checked >= sample:
-                break
-            live = await up.option_candles({"instrument_key": ikey, "expired": True},
-                                           date.fromisoformat(day))
-            checked += 1
-            if live != rows:
-                bad += 1
-                print(f"  MISMATCH {day} {ikey}: cached {len(rows)} rows, live {len(live)} rows")
-    return f"verified {checked} cached sessions against a live fetch: {checked - bad} identical, {bad} MISMATCHED"
+        if a > cur:
+            out.append((cur, a - timedelta(days=1)))
+        cur = max(cur, b + timedelta(days=1))
+    if cur <= to:
+        out.append((cur, to))
+    return out
+
+
+def _aggregate(rows: list[list], interval: str) -> list[list]:
+    """Bigger candles built from 1-minute rows [timestamp, o, h, l, c, volume, oi], oldest first.
+    Minute and hour candles start at 09:15 like the exchange's own (5m: 09:15, 09:20 ...); a day is
+    its whole session.  open = the first minute's open, high / low = the extremes of the minutes,
+    close = the last minute's close, volume = the sum, oi = the last.  Only minutes that exist are
+    used - nothing is filled.
+
+    A DAY's close is not the last minute's: the exchange sets the official close from the last half
+    hour's average price, so it is the average typical price (h + l + c) / 3 of the 15:00-15:29
+    minutes, weighted by volume when the minutes carry it (a stock; an index has none).  Checked on
+    153 NIFTY sessions against Upstox's official daily closes: median 1.4 points off, 90% within
+    4.3 - the 15:29 minute's close was a median 11 points off, up to 86 (`built_note` says so)."""
+    unit, n = _interval_unit(interval)
+    if unit == "weeks" or (unit == "days" and n != 1):
+        raise ValueError(f"interval {interval!r}: only minutes, hours and 1d are built from 1-minute candles")
+    size = n * 60 if unit == "hours" else n
+    out: list[list] = []
+    last_half_hour: dict[str, list[list]] = {}
+    for r in rows:
+        day = r[0][:10]
+        if unit == "days":
+            key = f"{day}T00:00:00+05:30"
+            if "15:00" <= r[0][11:16] <= "15:29":
+                last_half_hour.setdefault(day, []).append(r)
+        else:
+            m = int(r[0][11:13]) * 60 + int(r[0][14:16])
+            s = 555 + (m - 555) // size * size                    # 555 = 09:15
+            key = f"{day}T{s // 60:02d}:{s % 60:02d}:00+05:30"
+        vol, oi = (r[5] if len(r) > 5 else 0), (r[6] if len(r) > 6 else 0)
+        if out and out[-1][0] == key:
+            c = out[-1]
+            c[2], c[3], c[4], c[5], c[6] = max(c[2], r[2]), min(c[3], r[3]), r[4], c[5] + vol, oi
+        else:
+            out.append([key, r[1], r[2], r[3], r[4], vol, oi])
+    for c in out:
+        tail = last_half_hour.get(c[0][:10])
+        if tail:
+            w = [x[5] if len(x) > 5 else 0 for x in tail]
+            w = w if any(w) else [1] * len(tail)
+            c[4] = round(sum((x[2] + x[3] + x[4]) / 3 * k for x, k in zip(tail, w)) / sum(w), 2)
+    return out
+
+
+def built_note() -> str | None:
+    """One plain line for meta.limits naming the candles this run built from 1-minute candles."""
+    if not _BUILT:
+        return None
+    what = ", ".join(f"{name} {'daily' if iv == '1d' else iv}" for name, iv in sorted(_BUILT))
+    return (f"Candles built from the 1-minute candles on disk, not fetched: {what}.  Open, high and low are "
+            "exact.  A daily close is the average price of the last half hour (15:00-15:29), the way the exchange "
+            "sets its official close: on 153 NIFTY days it was a median 1.4 points from the official close, "
+            "90% of days within 4.3 points.")
+
+
+def _missing(args: str, a: date, b: date) -> None:
+    _MISSING.setdefault(args, []).append((a, b))
+
+
+def missing_local() -> dict[str, list[tuple[date, date]]]:
+    """What this run asked for and the disk did not have: {fetch_candles.py arguments: [(from, to), ...]}."""
+    out = {}
+    for args, rs in sorted(_MISSING.items()):
+        merged: list[tuple[date, date]] = []
+        for a, b in sorted(rs):
+            if merged and a <= merged[-1][1] + timedelta(days=1):
+                merged[-1] = (merged[-1][0], max(merged[-1][1], b))
+            else:
+                merged.append((a, b))
+        out[args] = merged
+    return out
+
+
+def missing_report(limit: int = 40) -> str:
+    """The console block a run ends with when data was missing: every gap as the fetch_candles.py
+    command that fills exactly it.  Run them only with the user's permission."""
+    miss = missing_local()
+    if not miss and not _NOTES:
+        return ""
+    lines = [f"NOT ON LOCAL DISK ({' + '.join(LOCAL_DATA_DIRS)}) - treated as no data, nothing was fetched.",
+             "With the user's permission, fetch only this (from the repository root; see analysis/templates/fetch_data.py):"]
+    for i, (args, rs) in enumerate(miss.items()):
+        if i == limit:
+            lines.append(f"  ... and {len(miss) - limit} more")
+            break
+        lines.append(f"  analysis/.venv/Scripts/python.exe analysis/templates/fetch_data.py {args} --from {rs[0][0]} --to {rs[-1][1]}"
+                     + (f"   ({len(rs)} separate gaps)" if len(rs) > 1 else ""))
+    lines += [f"  - {n}" for n in sorted(_NOTES)]
+    return "\n".join(lines)
+
+
+def missing_note() -> str | None:
+    """One plain line for meta.limits saying what the local data lacked, or None."""
+    miss = missing_local()
+    if not miss and not _NOTES:
+        return None
+    def plain(args: str) -> str:              # "candles NIFTY --interval 1d" -> "NIFTY daily candles"
+        what, name, *rest = args.split()
+        if what == "expiries":
+            return f"{name} expiry list"
+        return f"{name} {'daily' if rest[-1:] == ['1d'] else rest[-1] if rest else '1-minute'} candles"
+
+    n_opt = sum(" --opt " in k for k in miss)
+    parts = [f"{plain(k)} {rs[0][0]} to {rs[-1][1]}" for k, rs in miss.items() if " --opt " not in k]
+    parts += [f"{n_opt} option contract(s)"] if n_opt else []
+    parts += sorted(_NOTES)
+    return ("Local data only (analysis/candle_datas, nothing fetched): not on disk, so treated as "
+            "no data - " + "; ".join(parts) + ".")
+
+
+# ---------------------------------------------------------------------------
+# 1c  INSTRUMENTS - every index strategy runs on each index on disk (the user, 2026-09-30)
+# ---------------------------------------------------------------------------
+# A script written for NIFTY runs unchanged on SENSEX through `run_instruments` (section 8): the
+# script file is executed once per index with `instrument()` set, and ONE report comes out with an
+# Instrument selector (all = the books added together).  What differs between the indices is read,
+# never assumed:
+#   * the strike step and lot size come from the index's own contract list (NIFTY 50 / 65,
+#     SENSEX 100 / 20);
+#   * a rule number written in NIFTY points means the same SHARE OF THE PRICE on another index
+#     (the user, 2026-09-30): multiply it by `price_scale()`, the median SENSEX/NIFTY close ratio over
+#     the window (about 3.22), and `strike_offset` counts its steps in NIFTY strikes;
+#   * costs follow the exchange the contract trades on: SENSEX options are BSE's (`exchange_of`).
+INDEX_INSTRUMENTS = ("NIFTY", "SENSEX")
+REFERENCE_INSTRUMENT = "NIFTY"          # the index every rule was written on
+REFERENCE_STEP = 50.0                   # its strike step: `strike_offset` counts in these
+BSE_UNDERLYINGS = {"SENSEX", "BANKEX", "SENSEX50"}
+# Every index strategy is priced on these strikes, in NIFTY strikes in the money (the user,
+# 2026-09-30: "every strategy has to run on ITM 6 to ATM"): 6 ITM ... 1 ITM, ATM.
+STRIKE_LADDER = (6, 5, 4, 3, 2, 1, 0)
+_ACTIVE: dict = {"instrument": REFERENCE_INSTRUMENT, "collect": None, "rung": 0, "ladder_rung": None}
+
+
+def rung_label(n) -> str:
+    """'6 ITM' ... '1 ITM', 'ATM' - a strike depth in NIFTY strikes in the money."""
+    n = int(n)
+    return "ATM" if n == 0 else f"{n} ITM" if n > 0 else f"{-n} OTM"
+
+
+def instrument() -> str:
+    """The index this run trades - NIFTY unless `run_instruments` is running the script for another."""
+    return _ACTIVE["instrument"]
+
+
+def exchange_of(symbol: str | None = None) -> str:
+    """'BSE' for a SENSEX / BANKEX contract, else 'NSE' - from the trading symbol, or the active index."""
+    return "BSE" if (symbol or instrument()).split()[0].upper() in BSE_UNDERLYINGS else "NSE"
+
+
+def price_scale(name: str | None = None) -> float:
+    """How many points of `name` make one NIFTY point, as a share of the price: the median of its daily
+    close / NIFTY's daily close over START_DATE .. END_DATE (15:29 minutes, from local disk).  1.0 for
+    NIFTY.  A rule number in NIFTY points (a stop of 25 points, a floor of 16 option points) is that
+    number x price_scale() on another index - the same rule, the same share of the price.  With no
+    name it is the ACTIVE index's (the cache is keyed on the resolved name, never on the call)."""
+    return _price_scale(name or instrument())
+
+
+@functools.lru_cache(maxsize=None)
+def _price_scale(name: str) -> float:
+    if name == REFERENCE_INSTRUMENT:
+        return 1.0
+    closes = {}
+    for n in (name, REFERENCE_INSTRUMENT):
+        blob = _local(f"{n}_candles.json")
+        if blob is None:
+            raise LookupError(f"no {n}_candles.json on local disk to scale {name} against {REFERENCE_INSTRUMENT}")
+        closes[n] = {r[0][:10]: r[4] for r in blob["candles"]
+                     if START_DATE.isoformat() <= r[0][:10] <= END_DATE.isoformat()}
+    days = sorted(set(closes[name]) & set(closes[REFERENCE_INSTRUMENT]))
+    return round(statistics.median(closes[name][d] / closes[REFERENCE_INSTRUMENT][d] for d in days), 4)
+
+
+def strike_step(name: str | None = None) -> float:
+    """The index's strike step, read from its latest expiry on disk: the most common gap between
+    adjacent listed strikes (NIFTY 50, SENSEX 100)."""
+    name = name or instrument()
+    chain = _local_contracts(name)
+    if not chain:
+        raise LookupError(f"no option contracts of {name} on local disk ({name}_contracts.json)")
+    strikes = sorted({float(c["strike"]) for c in chain[max(chain)]})
+    gaps = [b - a for a, b in zip(strikes, strikes[1:])]
+    return max(set(gaps), key=gaps.count)
 
 
 # ---------------------------------------------------------------------------
 # 2  Upstox client
 # ---------------------------------------------------------------------------
 class Upstox:
-    """One httpx client, a rate limit and retry.  Use as `async with Upstox() as up:`."""
+    """The data client every script uses: `async with Upstox() as up:`.  Candles, expiries,
+    contracts and instruments come from local disk (section 1b) and never from the API.  The
+    httpx client, rate limit and retry below serve only the live calls (the broker's charges and
+    margin, the instrument master for a futures lot), and those refuse to go out unless
+    PYFUNCS_ALLOW_FETCH=1.  Leaving the block prints what the run needed that was not on disk."""
 
     # Upstox meters per second, per minute AND per half hour, and a breach of the long window
     # puts the whole account in a penalty box for minutes - no amount of retrying gets through.
@@ -273,14 +418,13 @@ class Upstox:
     MAX_COOLDOWN = 240.0        # ... but never trust a server-supplied Retry-After blindly
 
     def __init__(self, token: str | None = None, min_interval: float = 0.25) -> None:
-        self.token = token or read_access_token()
+        self.token = token or (read_access_token() if ALLOW_FETCH else None)
         self._min_interval = min_interval
         self._next_at = 0.0
         self._lock = asyncio.Lock()
         self._client: httpx.AsyncClient | None = None
         self._instruments: dict[str, list[dict]] = {}          # exchange -> rows (this run only)
         self._expired_contracts: dict[tuple[str, str], list[dict]] = {}
-        self._bars: dict[tuple[str, str, int, int], list[list]] = {}   # (key, day, interval, columns) -> rows
         self._times: list[float] = []      # when recent calls went out, for the rolling windows
         self._said_pacing = False
         self.calls = 0
@@ -294,6 +438,9 @@ class Upstox:
     async def __aexit__(self, *exc) -> None:
         if self._client:
             await self._client.aclose()
+        report = missing_report()
+        if report:
+            print(report, flush=True)
 
     async def get(self, url: str, params: dict | None = None, *, retries: int = 8) -> dict:
         """GET with the bearer token; retries 429 and 5xx with backoff (see `_request`)."""
@@ -313,6 +460,8 @@ Pacing happens in `_slot` before the
         the same wall, and permanently widens its own gap.  A ladder of a few thousand calls
         used to die on `UDAPI10005 Too Many Request Sent`; the point of a backtest is to finish
         slowly, not to fail fast."""
+        if not ALLOW_FETCH:
+            raise LiveFetchBlocked(f"{method} {url} not sent: {NO_FETCH}")
         assert self._client, "use `async with Upstox() as up:`"
         delay = 2.0
         for attempt in range(retries + 1):
@@ -372,13 +521,13 @@ Pacing happens in `_slot` before the
                 await asyncio.sleep(min(wait, 10.0))
 
     # -----------------------------------------------------------------------
-    # 3  instruments and options
+    # 3  instruments and options - from local disk
     # -----------------------------------------------------------------------
     async def instruments(self, exchange: str = "NSE") -> list[dict]:
-        """The public instrument master for one exchange (NSE, BSE, MCX ...).
-        Live instruments only; fetched once per run.  Rows carry segment, name,
-        trading_symbol, instrument_key, instrument_type, lot_size, strike_price,
-        expiry (epoch ms), underlying_symbol, underlying_key."""
+        """The public instrument master for one exchange (NSE, BSE, MCX ...) - a LIVE download, so
+        it refuses unless PYFUNCS_ALLOW_FETCH=1.  Only `future_contract` still needs it."""
+        if not ALLOW_FETCH:
+            raise LiveFetchBlocked(f"the {exchange} instrument master not downloaded: {NO_FETCH}")
         if exchange not in self._instruments:
             assert self._client
             r = await self._client.get(INSTRUMENTS_URL.format(exchange=exchange))
@@ -386,98 +535,111 @@ Pacing happens in `_slot` before the
             self._instruments[exchange] = json.loads(gzip.decompress(r.content))
         return self._instruments[exchange]
 
+    def _name(self, instrument_key: str) -> str:
+        """The NAME the local files use for an index or stock key (NSE_INDEX|Nifty 50 -> NIFTY)."""
+        name = _local_keys().get(instrument_key)
+        if name is None:
+            raise LookupError(f"{instrument_key} has no files in {' or '.join(LOCAL_DATA_DIRS)}")
+        return name
+
     async def find_instrument(self, query: str, segment: str | None = None,
                               exchange: str = "NSE") -> dict:
-        """The instrument whose trading symbol or name equals `query` (case-blind).
+        """The index or stock whose name is `query` (case-blind), among those on local disk.
 
-        `find_instrument("NIFTY")`                    -> the Nifty 50 index (NSE_INDEX)
-        `find_instrument("RELIANCE", "NSE_EQ")`       -> the equity
-        `segment` is one of NSE_INDEX, NSE_EQ, NSE_FO ...; without it indices win, then
-        equities.  Raises with the closest candidates when nothing matches, so a typo is
-        obvious instead of silently picking something else."""
-        q = INDEX_ALIASES.get(query.upper().replace(" ", ""), query).lower()
-        rows = await self.instruments(exchange)
-        order = [segment] if segment else ["NSE_INDEX", "NSE_EQ"]
-        for seg in order:
-            for r in rows:
-                if r.get("segment") == seg and q in (str(r.get("trading_symbol", "")).lower(),
-                                                     str(r.get("name", "")).lower()):
-                    return {k: r.get(k) for k in ("instrument_key", "trading_symbol", "name", "segment",
-                                                  "instrument_type", "lot_size", "exchange")}
-        near = sorted({f"{r['segment']}|{r.get('trading_symbol')}" for r in rows
-                       if q.split()[0] in str(r.get("trading_symbol", "")).lower()
-                       and r.get("segment") in ("NSE_INDEX", "NSE_EQ")})[:8]
-        raise LookupError(f"No instrument matching {query!r}. Closest: {near or 'none'}")
+        `find_instrument("NIFTY")`                    -> the Nifty 50 index (NIFTY_candles.json)
+        `find_instrument("SENSEX")`                   -> BSE SENSEX (SENSEX_candles.json)
+        `find_instrument("RELIANCE", "NSE_EQ")`       -> the equity, once RELIANCE_candles.json exists
+        `segment` (NSE_INDEX, NSE_EQ, BSE_INDEX ...) narrows the match.  Raises with what IS on
+        disk when nothing matches, and notes the fetch that would add it."""
+        q = query.upper().replace(" ", "")
+        alias = INDEX_ALIASES.get(q, query).lower()
+        for key, name in _local_keys().items():
+            seg, _, label = key.partition("|")
+            if segment and seg != segment:
+                continue
+            if q == name.upper().replace(" ", "") or label.lower() in (alias, query.lower()):
+                return {"instrument_key": key, "trading_symbol": name, "name": label, "segment": seg,
+                        "instrument_type": "INDEX" if seg.endswith("INDEX") else seg.split("_")[-1],
+                        "lot_size": None, "exchange": seg.split("_")[0]}
+        _missing(f"candles {q}", START_DATE, END_DATE - timedelta(days=1))
+        raise LookupError(f"{query!r} is not on local disk ({' or '.join(LOCAL_DATA_DIRS)}); on disk: "
+                          f"{sorted(set(_local_keys().values())) or 'nothing'}")
 
     async def option_chain_info(self, underlying_key: str) -> dict:
-        """What the LIVE option chain of an underlying looks like:
-        {expiries: [date...], strike_step, lot_size, strikes, contracts}.
-        strike_step is the most common gap between adjacent strikes near the money's
-        expiry (NIFTY 50, BANKNIFTY 100, ...), so it is read, never assumed."""
-        data = await self.get(f"{BASE_V2}/option/contract", {"instrument_key": underlying_key})
-        cs = data.get("data") or []
-        if not cs:
-            raise LookupError(f"No live option contracts for {underlying_key}")
-        expiries = sorted({date.fromisoformat(str(c["expiry"])[:10]) for c in cs})
-        near = [c for c in cs if str(c["expiry"])[:10] == expiries[0].isoformat()]
-        strikes = sorted({float(c["strike_price"]) for c in near})
+        """What the option chain of an underlying looks like, from its local contract list:
+        {expiries: [date...], strike_step, lot_size, strikes, contracts}.  expiries are every
+        expiry on disk; strikes, lot_size and contracts are the LATEST one's.  strike_step is the
+        most common gap between adjacent strikes (NIFTY 50, SENSEX 100), so it is read, never
+        assumed."""
+        name = self._name(underlying_key)
+        chain = _local_contracts(name)
+        if not chain:
+            raise LookupError(f"no option contracts of {name} on local disk ({name}_contracts.json)")
+        expiries = sorted(date.fromisoformat(e) for e in chain)
+        last = chain[expiries[-1].isoformat()]
+        strikes = sorted({float(c["strike"]) for c in last})
         gaps = [b - a for a, b in zip(strikes, strikes[1:])]
         step = max(set(gaps), key=gaps.count) if gaps else None
-        return {"expiries": expiries, "strike_step": step, "lot_size": int(cs[0].get("lot_size") or 0),
-                "strikes": strikes, "contracts": cs}
+        return {"expiries": expiries, "strike_step": step, "lot_size": int(last[0]["lot_size"]),
+                "strikes": strikes,
+                "contracts": [{"instrument_key": c["instrument_key"], "trading_symbol": c["trading_symbol"],
+                               "strike_price": c["strike"], "instrument_type": c["type"],
+                               "lot_size": c["lot_size"], "expiry": expiries[-1].isoformat()} for c in last]}
 
     async def expiry_calendar(self, underlying_key: str, frm: date, to: date) -> list[date]:
-        """Every option expiry from a week before `frm` to a month after `to`:
-        the expired ones (expired-instruments API) plus the live ones."""
-        out: set[date] = set()
-        try:
-            d = await self.get(f"{BASE_V2}/expired-instruments/expiries", {"instrument_key": underlying_key})
-            out |= {date.fromisoformat(s) for s in d.get("data") or []}
-        except RuntimeError as exc:
-            print(f"  ! expired expiries unavailable ({exc})")
-        try:
-            out |= set((await self.option_chain_info(underlying_key))["expiries"])
-        except (RuntimeError, LookupError) as exc:
-            print(f"  ! live expiries unavailable ({exc})")
-        return sorted(e for e in out if frm - timedelta(days=7) <= e <= to + timedelta(days=30))
+        """Every option expiry from a week before `frm` to a month after `to`, from the local
+        NAME_expiry.json.  A window that runs past the list's own end is noted as missing."""
+        name = self._name(underlying_key)
+        blob = _local(f"{name}_expiry.json")
+        if blob is None:
+            _missing(f"expiries {name}", frm, to)
+            return []
+        if to > date.fromisoformat(blob["to"]):
+            _missing(f"expiries {name}", date.fromisoformat(blob["from"]), to)
+        return sorted(e for e in map(date.fromisoformat, blob["expiries"])
+                      if frm - timedelta(days=7) <= e <= to + timedelta(days=30))
 
     async def resolve_option(self, underlying_key: str, expiry: date, strike: float,
                              option_type: str) -> dict | None:
-        """The contract for (expiry, strike, CE|PE) or None.  Live contracts come from
-        /option/contract, past ones from /expired-instruments/option/contract; the
-        instrument key differs (an expired one carries a date suffix), which is why
-        `expired` is returned and must be passed on to `option_candles`."""
+        """The contract for (expiry, strike, CE|PE) from the local contract list, or None.  The
+        lot_size is the one in force for that expiry.  An expiry whose list is not on disk is
+        noted as missing (fetching any contract of it brings the list).
+
+        The strike ladder (`run_instruments`): while a strategy that trades one strike is run at
+        rung N, the strike it asks for is moved N NIFTY strikes in the money here - below the
+        spot for a CE, above it for a PE, the same % distance on another index - so the rest of
+        the script (candles, fills, costs, lot) follows the contract actually traded."""
+        name = self._name(underlying_key)
+        if _ACTIVE["rung"] and strike > 0:
+            step = strike_step(name)
+            n = (_ACTIVE["rung"] if name == REFERENCE_INSTRUMENT
+                 else round(_ACTIVE["rung"] * REFERENCE_STEP * price_scale(name) / step))
+            strike = float(strike) + (-n if option_type == "CE" else n) * step
         ek = expiry.isoformat()
-        if expiry >= datetime.now(IST).date():
-            ck = (underlying_key, "live")
-            if ck not in self._expired_contracts:
-                d = await self.get(f"{BASE_V2}/option/contract", {"instrument_key": underlying_key})
-                self._expired_contracts[ck] = d.get("data") or []
-            pool, expired = [c for c in self._expired_contracts[ck] if str(c["expiry"])[:10] == ek], False
-        else:
-            ck = (underlying_key, ek)
-            if ck not in self._expired_contracts:
-                d = await self.get(f"{BASE_V2}/expired-instruments/option/contract",
-                                   {"instrument_key": underlying_key, "expiry_date": ek})
-                self._expired_contracts[ck] = d.get("data") or []
-            pool, expired = self._expired_contracts[ck], True
+        pool = _local_contracts(name).get(ek)
+        if pool is None:
+            if strike > 0:
+                _missing(f"candles {name} --opt {_option_name(option_type, strike, ek)}",
+                         expiry - timedelta(days=20), expiry)
+            return None
         for c in pool:
-            if float(c.get("strike_price", 0)) == float(strike) and c.get("instrument_type") == option_type:
+            if float(c["strike"]) == float(strike) and c["type"] == option_type:
                 return {"trading_symbol": c["trading_symbol"], "instrument_key": c["instrument_key"],
-                        "expired": expired, "lot_size": int(c.get("lot_size") or 0),
-                        "expiry": ek, "strike": float(strike), "option_type": option_type}
+                        "expired": c["expired"], "lot_size": int(c["lot_size"]), "expiry": ek,
+                        "strike": float(strike), "option_type": option_type, "underlying": name}
         return None
 
     async def listed_strikes(self, underlying_key: str, expiry: date, option_type: str) -> list[float]:
-        """Every strike Upstox lists for (expiry, CE|PE), ascending.  Stock options are NOT evenly
-        spaced (RELIANCE: 10 near the money, 20 further out; INFY 20 and 40), so 'N strikes in the
-        money' on a stock must step through THIS list, never ATM +/- N x one step (RULE 8).
-        Reads the same contract pool as `resolve_option`, so it costs no extra call."""
-        await self.resolve_option(underlying_key, expiry, -1.0, option_type)      # fills the pool
-        ek = expiry.isoformat()
-        pool = (self._expired_contracts.get((underlying_key, ek))
-                or [c for c in self._expired_contracts.get((underlying_key, "live"), []) if str(c["expiry"])[:10] == ek])
-        return sorted({float(c["strike_price"]) for c in pool if c.get("instrument_type") == option_type})
+        """Every strike listed for (expiry, CE|PE), ascending, from the local contract list.  Stock
+        options are NOT evenly spaced (RELIANCE: 10 near the money, 20 further out; INFY 20 and 40),
+        so 'N strikes in the money' on a stock must step through THIS list, never ATM +/- N x one
+        step (RULE 8)."""
+        name = self._name(underlying_key)
+        pool = _local_contracts(name).get(expiry.isoformat())
+        if pool is None:
+            _NOTES.add(f"{name} contract list for expiry {expiry} (fetching any {name} option of that expiry brings it)")
+            return []
+        return sorted({float(c["strike"]) for c in pool if c["type"] == option_type})
 
     async def future_contract(self, underlying_key: str, day: date) -> dict | None:
         """The near-month FUTURES contract in force on `day`: the one with the nearest expiry on
@@ -485,13 +647,16 @@ Pacing happens in `_slot` before the
 
         This is where a stock's F&O LOT SIZE comes from (RULE 8) - NSE revises it every few
         months (HDFCBANK was 550 through the Jun-2026 series and 650 from Jul-2026), so a trade
-        sized "one lot" must read it per day, never from a constant.  Past contracts come from
-        /expired-instruments/future/contract, live ones from the instrument master."""
+        sized "one lot" must read it per day, never from a constant.  LIVE calls (the local store
+        keeps no futures): past contracts come from /expired-instruments/future/contract, live ones
+        from the instrument master - so it refuses unless PYFUNCS_ALLOW_FETCH=1."""
         exps = self._expired_contracts.setdefault((underlying_key, "fut-expiries"), [])
         if not exps:
             try:
                 d = await self.get(f"{BASE_V2}/expired-instruments/expiries", {"instrument_key": underlying_key})
                 exps.extend(sorted(date.fromisoformat(s) for s in d.get("data") or []))
+            except LiveFetchBlocked:
+                raise
             except RuntimeError as exc:
                 print(f"  ! expired expiries unavailable ({exc})")
         live = [r for r in await self.instruments("NSE")
@@ -509,157 +674,82 @@ Pacing happens in `_slot` before the
                         "lot_size": int(r.get("lot_size") or 0), "expiry": e.isoformat()}
         ck = (underlying_key, "fut", e.isoformat())
         if ck not in self._expired_contracts:
-            # an EXPIRED contract never changes, so it is kept on disk (rule 15: past only, never empty)
-            hit = _meta_read("fut", e.isoformat(), underlying_key)
-            if hit is None:
-                d = await self.get(f"{BASE_V2}/expired-instruments/future/contract",
-                                   {"instrument_key": underlying_key, "expiry_date": e.isoformat()})
-                hit = [{"trading_symbol": c.get("trading_symbol"), "instrument_key": c.get("instrument_key"),
-                        "lot_size": int(c.get("lot_size") or 0)} for c in d.get("data") or []]
-                _meta_write("fut", e.isoformat(), underlying_key, hit)
-            self._expired_contracts[ck] = hit
+            d = await self.get(f"{BASE_V2}/expired-instruments/future/contract",
+                               {"instrument_key": underlying_key, "expiry_date": e.isoformat()})
+            self._expired_contracts[ck] = [{"trading_symbol": c.get("trading_symbol"),
+                                            "instrument_key": c.get("instrument_key"),
+                                            "lot_size": int(c.get("lot_size") or 0)} for c in d.get("data") or []]
         for c in self._expired_contracts[ck]:
             return {"trading_symbol": c["trading_symbol"], "instrument_key": c["instrument_key"],
                     "lot_size": int(c.get("lot_size") or 0), "expiry": e.isoformat()}
         return None
 
     # -----------------------------------------------------------------------
-    # 4  candles
+    # 4  candles - from local disk
     # -----------------------------------------------------------------------
     async def candles(self, instrument_key: str, interval: str, frm: date, to: date) -> list[dict]:
-        """OHLCV candles for any interval ('1m','3m','5m','15m','30m','1h','1d'), oldest
-        first.  Upstox caps one request at a month (<=15m) or a quarter (30m, 1h), so the
-        range is chunked.  Today's candles are added from the intraday endpoint for
-        minute intervals, because the historical endpoint does not serve the current day.
-        Each item: {timestamp, open, high, low, close, volume, oi}."""
-        unit, n = _interval_unit(interval)
-        key = quote(instrument_key, safe="")
-        out: dict[str, dict] = {}
-        today = datetime.now(IST).date()
-        cur = frm
-        while cur <= min(to, today - timedelta(days=1) if unit == "minutes" else to):
-            end = min(_chunk_end(interval, cur), to, today - timedelta(days=1) if unit == "minutes" else to)
-            d = await self.get(f"{BASE_V3}/historical-candle/{key}/{unit}/{n}/{end.isoformat()}/{cur.isoformat()}")
-            for raw in (d.get("data") or {}).get("candles") or []:
-                c = _candle(raw)
-                if c:
-                    out[c["timestamp"]] = c
-            cur = end + timedelta(days=1)
-        if unit == "minutes" and frm <= today <= to:
-            d = await self.get(f"{BASE_V3}/historical-candle/intraday/{key}/{unit}/{n}")
-            for raw in (d.get("data") or {}).get("candles") or []:
-                c = _candle(raw)
-                if c and frm.isoformat() <= c["timestamp"][:10] <= to.isoformat():
-                    out[c["timestamp"]] = c
-        return [out[k] for k in sorted(out)]
+        """OHLCV candles of an index or stock, oldest first, from NAME_candles.json ('1m') or
+        NAME_<interval>_candles.json ('5m', '1d' ...).  An interval with no file of its own is BUILT
+        from the 1-minute file (`_aggregate`, the user, 2026-09-29: never fetched), and the report
+        says so.  Closed sessions only - `to` stops at yesterday.  Any part of frm..to the file was
+        never fetched for is noted as missing.  Each item: {timestamp, open, high, low, close, volume, oi}."""
+        name = self._name(instrument_key)
+        to = min(to, datetime.now(IST).date() - timedelta(days=1))
+        if frm > to:
+            return []
+        blob = _local(f"{name}{'' if interval == '1m' else '_' + interval}_candles.json")
+        built = blob is None and interval != "1m"
+        if built:
+            blob = _local(f"{name}_candles.json")
+            _BUILT.add((name, interval))
+        args = f"candles {name}" + ("" if interval == "1m" or built else f" --interval {interval}")
+        for a, b in _gaps(frm, to, blob["fetched"] if blob else []):
+            _missing(args, a, b)
+        if blob is None:
+            return []
+        lo, hi = frm.isoformat(), to.isoformat()
+        rows = [r for r in blob["candles"] if lo <= r[0][:10] <= hi]
+        return [_candle(r) for r in (_aggregate(rows, interval) if built else rows)]
 
     async def minute_sessions(self, instrument_key: str, frm: date, to: date,
                               volume: bool = False) -> dict[str, list[list]]:
-        """1-minute bars of a stock or an index by session, {day: [[HH:MM, o, h, l, c], ...]}, frm..to.
-        volume=True adds the minute's traded volume as a sixth column (cached separately, kind 'eq1mv'),
-        for anything that needs it - a VWAP, relative volume.
-
-        For books that read many stocks over a long window: refetching them on every run costs
-        hundreds of calls against a limit of 880 per half hour.  Whole calendar months are fetched
-        (the API's own chunk), and a month that has ENDED is kept in the candle cache (kind 'eq1m',
-        one file per session - rule 15) together with the list of sessions it held, so a holiday
-        is known to be a holiday rather than a hole to refetch.  The current month is always
-        fetched.  A remembered session that cannot be read back, or fails validation, sends the
-        whole month back to the API.  Volume and OI are not kept - use candles() for those."""
-        today = datetime.now(IST).date()
-        kind, cols = ("eq1mv", 6) if volume else ("eq1m", 5)
-        safe = re.sub(r"[^A-Za-z0-9]+", "_", instrument_key)
-        man_path = os.path.join(CACHE_DIR, f"v{CACHE_VERSION}", f"{kind}_months", f"{safe}.json")
-        manifest: dict[str, list[str]] = {}
-        if not CACHE_OFF and os.path.exists(man_path):
-            try:
-                with open(man_path, encoding="utf-8") as f:
-                    manifest = json.load(f)
-            except (OSError, ValueError):
-                manifest = {}
-        changed = False
+        """1-minute bars of a stock or an index by session, {day: [[HH:MM, o, h, l, c], ...]}, frm..to,
+        from `candles`.  volume=True adds the minute's traded volume as a sixth column, for anything
+        that needs it - a VWAP, relative volume (an index has none: Upstox reports 0)."""
         out: dict[str, list[list]] = {}
-        m = date(frm.year, frm.month, 1)
-        while m <= to:
-            m_end = date(m.year + (m.month == 12), m.month % 12 + 1, 1) - timedelta(days=1)
-            ym = m.strftime("%Y-%m")
-            got: dict[str, list[list]] | None = None
-            if not CACHE_OFF and m_end < today and ym in manifest:
-                got = {}
-                for d in manifest[ym]:
-                    rows = _cache_read(kind, d, instrument_key, cols)
-                    if rows is None:
-                        got = None
-                        break
-                    got[d] = rows
-            if got is None:
-                _CACHE_STATS["miss"] += 1
-                cs = await self.candles(instrument_key, "1m", m, m_end if m_end < today else min(m_end, to))
-                if volume:
-                    got = {}
-                    for c in cs:
-                        got.setdefault(c["timestamp"][:10], []).append(
-                            [c["timestamp"][11:16], c["open"], c["high"], c["low"], c["close"], int(c["volume"])])
-                    got = {d: sorted(r) for d, r in sorted(got.items())}
-                else:
-                    got = sessions_from(cs)
-                if m_end < today and got and all(_rows_ok(r, cols) for r in got.values()):
-                    for d, rows in got.items():
-                        _cache_write(kind, d, instrument_key, rows, cols)
-                    manifest[ym] = sorted(got)
-                    changed = True
-            out.update({d: r for d, r in got.items() if frm.isoformat() <= d <= to.isoformat()})
-            m = m_end + timedelta(days=1)
-        if changed and not CACHE_OFF:
-            os.makedirs(os.path.dirname(man_path), exist_ok=True)
-            with open(man_path + ".tmp", "w", encoding="utf-8") as f:
-                json.dump(manifest, f, separators=(",", ":"))
-            os.replace(man_path + ".tmp", man_path)
-        return dict(sorted(out.items()))
+        for c in await self.candles(instrument_key, "1m", frm, to):
+            out.setdefault(c["timestamp"][:10], []).append(
+                [c["timestamp"][11:16], c["open"], c["high"], c["low"], c["close"]] + ([c["volume"]] if volume else []))
+        return out
 
     async def option_candles(self, contract: dict, day: date, interval_minutes: int = 1,
                              volume: bool = False) -> list[list]:
-        """One session of an option contract as [[HH:MM, o, h, l, c], ...] ([] if it did not trade).
-        `contract` is what `resolve_option` returned.
+        """One session of an option contract as [[HH:MM, o, h, l, c], ...] ([] if it did not trade),
+        from NAME_<CE|PE>_<strike>_<expiry>_candles.json.  `contract` is what `resolve_option`
+        returned.  1-minute only: build bigger candles with `resample`.
 
-        volume=True adds the minute's traded volume as a sixth column (cached separately, kind
-        'opt1mv').  Upstox returns a candle for a minute in which nothing traded (volume 0, usually
-        open = high = low = close); its "price" is the last trade, not one anybody could have
-        filled at, so a rule that wants real fills reads the volume and treats such a minute as no
-        trade (RUN.md rule 6).  build_payload keeps only the first five columns for the charts.
+        volume=True adds the minute's traded volume as a sixth column.  Upstox returns a candle for a
+        minute in which nothing traded (volume 0, usually open = high = low = close); its "price"
+        is the last trade, not one anybody could have filled at, so a rule that wants real fills
+        reads the volume and treats such a minute as no trade (RUN.md rule 6).  build_payload keeps
+        only the first five columns for the charts.
 
-        Memoised for THIS RUN only (nothing on disk, so rule 15 holds): a strike ladder asks for
-        the same contract-day over and over, because one night's exit day is the next night's
-        entry day and neighbouring nights often land on the same strike.  The same URL returns
-        the same bytes, so the memo cannot go stale the way a disk cache could - and it roughly
-        halves the number of calls, which is what keeps the run under the rate limit."""
-        key = quote(contract["instrument_key"], safe="")
+        A contract with no file, or a day outside the file's fetched ranges, is noted as missing
+        and returns [] - the caller logs it as no data."""
+        if interval_minutes != 1:
+            raise ValueError("local option candles are 1-minute; build bigger ones with resample()")
+        c = contract if contract.get("underlying") else _contract_by_key(contract["instrument_key"])
+        if c is None:
+            _NOTES.add(f"option {contract['instrument_key']}: in no local contract list")
+            return []
+        name = c["underlying"]
+        opt = _option_name(c.get("option_type") or c["type"], c["strike"], c["expiry"])
+        got = _option_file(f"{name}_{opt}_candles.json")
         d_ = day.isoformat()
-        kind, cols = ("opt1mv", 6) if volume else ("opt1m", 5)
-        memo = (contract["instrument_key"], d_, interval_minutes, cols)
-        if memo in self._bars and day != datetime.now(IST).date():
-            return self._bars[memo]
-        if interval_minutes == 1:
-            hit = _cache_read(kind, d_, contract["instrument_key"], cols)
-            if hit is not None:
-                self._bars[memo] = hit
-                return hit
-            _CACHE_STATS["miss"] += 1
-        if contract["expired"]:
-            url = f"{BASE_V2}/expired-instruments/historical-candle/{key}/{interval_minutes}minute/{d_}/{d_}"
-        else:
-            url = f"{BASE_V3}/historical-candle/{key}/minutes/{interval_minutes}/{d_}/{d_}"
-            if day == datetime.now(IST).date():
-                url = f"{BASE_V3}/historical-candle/intraday/{key}/minutes/{interval_minutes}"
-        d = await self.get(url)
-        raw = (d.get("data") or {}).get("candles") or []
-        rows = sorted([c[0][11:16], float(c[1]), float(c[2]), float(c[3]), float(c[4])]
-                      + ([int(c[5] or 0)] if volume else [])
-                      for c in raw if len(c) >= (6 if volume else 5))
-        self._bars[memo] = rows
-        if interval_minutes == 1:
-            _cache_write(kind, d_, contract["instrument_key"], rows, cols)
-        return rows
+        if got is None or not any(a <= d_ <= b for a, b in got[0]):
+            _missing(f"candles {name} --opt {opt}", day, day)
+            return []
+        return [r[:6] if volume else r[:5] for r in got[1].get(d_, [])]
 
 
 def _interval_unit(interval: str) -> tuple[str, int]:
@@ -722,10 +812,15 @@ def atm_strike(spot: float, step: float) -> float:
 
 
 def strike_offset(spot: float, step: float, steps: int, option_type: str, itm: bool = True) -> float:
-    """ATM moved `steps` strikes: in the money for a CE is BELOW spot, for a PE ABOVE."""
+    """ATM moved `steps` strikes: in the money for a CE is BELOW spot, for a PE ABOVE.
+
+    `steps` are NIFTY strikes (50 points).  On another index the distance is the same share of the
+    price - steps x 50 x price_scale() - rounded to that index's own `step` (the user, 2026-09-30):
+    6 NIFTY strikes (300 points, about 1.2%) are 10 SENSEX strikes (1,000 points).  NIFTY is unchanged."""
     atm = atm_strike(spot, step)
     sign = -1 if option_type == "CE" else 1
-    return atm + (sign if itm else -sign) * steps * step
+    n = steps if instrument() == REFERENCE_INSTRUMENT else round(steps * REFERENCE_STEP * price_scale() / step)
+    return atm + (sign if itm else -sign) * n * step
 
 
 def next_expiry(expiries: list[date], day: date, min_days_after: int = 0) -> date | None:
@@ -775,11 +870,12 @@ def excursion(rows: list[list], side: str, entry_px: float, t0: str, t1: str) ->
 
 # ---------------------------------------------------------------------------
 # THE WINDOW.  Defined in one place for every strategy.
-# The start is fixed; the end is the current date in exchange time (IST), evaluated whenever a
-# report script starts.  No individual strategy script should define its own defaults.
-# Existing HTML reports are snapshots and must be re-run to include newly available sessions.
+# The user, 2026-09-29: backtest STRICTLY the 143 sessions on local disk, 2026-01-01 .. 2026-07-31,
+# nothing before or after (candles before the start are read only as an indicator's warm-up, never
+# traded).  Both ends are fixed; move them here, and nowhere else, only when the user asks.
+# No individual strategy script should define its own defaults.
 START_DATE = date(2026, 1, 1)
-END_DATE = datetime.now(IST).date()
+END_DATE = date(2026, 7, 31)
 
 # Keep the historical one-year guard, but never reject the shared growing default window once
 # it becomes older than a year.
@@ -789,6 +885,8 @@ MAX_WINDOW_DAYS = max(366, (END_DATE - START_DATE).days)
 def fetch_estimate(calls: int, limits=None) -> str:
     """How long `calls` requests will take under the rolling windows - printed before a ladder
     starts, so a run that is going to take an hour says so at the top instead of at the end."""
+    if not ALLOW_FETCH:
+        return f"{calls} reads from local disk, no Upstox calls"
     limits = limits or Upstox.RATE_LIMITS
     secs = max(calls * win / cap for win, cap in limits)
     return (f"{calls} requests, about {secs / 60:.0f} min at the rate limit"
@@ -799,9 +897,13 @@ def check_window(frm: date, to: date, max_days: int = MAX_WINDOW_DAYS) -> None:
     """Refuse a window longer than the shared default/cap.  Fetching is the expensive part of a run - a strike
     ladder over two years is thousands of option-candle calls and gigabytes held in memory for
     charts nobody opens.  A wider run is a deliberate act: pass max_days= to allow it and say
-    in meta["limits"] why."""
+    in meta["limits"] why.  A window outside START_DATE .. END_DATE is refused outright: the user
+    backtests those sessions only."""
     if to < frm:
         raise SystemExit(f"--to {to} is before --from {frm}")
+    if frm < START_DATE or to > END_DATE:
+        raise SystemExit(f"window {frm} .. {to} leaves {START_DATE} .. {END_DATE}, the only sessions the user "
+                         f"backtests (py_funcs START_DATE / END_DATE)")
     span = (to - frm).days
     if span > max_days:
         raise SystemExit(
@@ -829,8 +931,8 @@ def coverage(sessions: dict[str, list], frm: date, to: date, rows_per_session: i
 # Every strategy belongs to one CATEGORY (intraday stocks, index options, stock options).  The
 # category fixes where its script and report live, how many units a trade is, how it is charged
 # and what capital it ties up.  The rates below were read from Upstox's own charges API
-# (/v2/charges/brokerage, this account) on 2026-09-24 and are re-checked against it on every run
-# by `broker_check()`; regulatory rates carry the date they took effect, so a trade is charged
+# (/v2/charges/brokerage, this account) on 2026-09-24 and are re-checked against it by
+# `broker_check()` on a run the user allows to call Upstox; regulatory rates carry the date they took effect, so a trade is charged
 # what was in force on ITS day.  Change a rate here, with its date and source, never in a script.
 # ---------------------------------------------------------------------------
 BROKER_READ_ON = "2026-09-24"
@@ -851,6 +953,13 @@ EQ_INTRADAY_STT = 0.00025           # 0.025% of the sell leg
 # (Union Budget 2026).  (effective date, rate), oldest first.
 OPT_STT_SCHEDULE = ((date(2024, 10, 1), 0.001), (date(2026, 4, 1), 0.0015))
 EXCHANGE_RATE = OPT_EXCHANGE_RATE   # older name, kept for scripts that read it
+# BSE options (SENSEX, BANKEX), read from the Upstox charges API on 2026-09-30: a live SENSEX option,
+# Rs 10 lakh of premium bought -> brokerage Rs 30, transaction Rs 50 (0.005%), IPFT 0, SEBI 0, stamp
+# Rs 30, GST 18% of brokerage + transaction.  STT is the same statutory schedule on either exchange.
+BSE_READ_ON = "2026-09-30"
+BSE_OPT_EXCHANGE_RATE = 0.00005     # of premium turnover, both legs
+BSE_OPT_IPFT_RATE = 0.0
+BSE_SEBI_RATE = 0.0                 # the broker's calculator charges none on BSE options
 
 
 def _on(day) -> date:
@@ -869,23 +978,33 @@ def option_stt_rate(day=None) -> float:
     return rate
 
 
-def option_costs(buy_turnover: float, sell_turnover: float, orders: int = 2, day=None) -> dict:
+def option_costs(buy_turnover: float, sell_turnover: float, orders: int = 2, day=None,
+                 exchange: str | None = None, sell_day=None) -> dict:
     """Charges on one completed option trade (index or stock options - NSE charges them alike)
-    from the rupee premium turnover of each leg, at the rates in force on `day`."""
+    from the rupee premium turnover of each leg, at the rates in force on `day`.  `exchange` 'BSE'
+    (SENSEX) uses BSE's transaction rate; None = the exchange of the active index (`exchange_of`).
+    `sell_day` = the day of the SALE leg: STT is charged at the rate in force that day (audit fix,
+    2026-10-01 - an overnight trade sold after a rate change pays the new rate); None = `day`."""
+    bse = (exchange or exchange_of()) == "BSE"
     brokerage = BROKERAGE_PER_ORDER * orders
-    stt = option_stt_rate(day) * sell_turnover
-    exch = (OPT_EXCHANGE_RATE + OPT_IPFT_RATE) * (buy_turnover + sell_turnover)
-    sebi = SEBI_RATE * (buy_turnover + sell_turnover)
+    stt = option_stt_rate(sell_day if sell_day is not None else day) * sell_turnover
+    exch = ((BSE_OPT_EXCHANGE_RATE + BSE_OPT_IPFT_RATE) if bse else (OPT_EXCHANGE_RATE + OPT_IPFT_RATE)) \
+        * (buy_turnover + sell_turnover)
+    sebi = (BSE_SEBI_RATE if bse else SEBI_RATE) * (buy_turnover + sell_turnover)
     stamp = STAMP_BUY_RATE * buy_turnover
     gst = GST_RATE * (brokerage + exch + sebi)
     return {"brokerage": brokerage, "stt": stt, "exchange": exch, "sebi": sebi, "stamp": stamp,
             "gst": gst, "total": round(brokerage + stt + exch + sebi + stamp + gst, 2)}
 
 
-def option_round_trip(side: str, entry_px: float, exit_px: float, qty: int, day=None) -> float:
-    """Total costs of one option trade.  side LONG = bought then sold, SHORT = sold then bought."""
+def option_round_trip(side: str, entry_px: float, exit_px: float, qty: int, day=None,
+                      exchange: str | None = None, exit_day=None) -> float:
+    """Total costs of one option trade.  side LONG = bought then sold, SHORT = sold then bought.
+    `day` = the entry day, `exit_day` = the exit day (None = the same day).  The sale tax uses the
+    day of the sale: the exit day for LONG, the entry day for SHORT."""
     e, x = entry_px * qty, exit_px * qty
-    return option_costs(e, x, day=day)["total"] if side == "LONG" else option_costs(x, e, day=day)["total"]
+    return (option_costs(e, x, day=day, exchange=exchange, sell_day=exit_day)["total"] if side == "LONG"
+            else option_costs(x, e, day=day, exchange=exchange, sell_day=day)["total"])
 
 
 def equity_intraday_costs(buy_turnover: float, sell_turnover: float, orders: int = 2, day=None) -> dict:
@@ -926,12 +1045,13 @@ CATEGORIES = {
         "report_unit": "points",
     },
     "index_options": {
-        "label": "Index options - NIFTY, BANKNIFTY ...",
+        "label": "Index options - NIFTY, SENSEX ...",
         "kind": "option", "segment": "NSE_FO", "product": "D",
         "units": "lots x the resolved contract's lot_size (the size in force for that expiry)",
         "costs": "option_round_trip: brokerage Rs 30 per order, STT on the sale 0.1% of premium "
-                 "(0.15% from 2026-04-01), NSE 0.03503% + IPFT Rs 0.50/lakh, stamp 0.003% on the buy leg, "
-                 "SEBI Rs 10/cr, GST 18%",
+                 "(0.15% from 2026-04-01, at the rate of the day of the sale), NSE 0.03503% + IPFT Rs 0.50/lakh, stamp 0.003% on the buy leg, "
+                 "SEBI Rs 10/cr, GST 18%.  SENSEX (BSE): BSE 0.005% of premium, no IPFT or SEBI fee "
+                 "(read from the Upstox charges API on 2026-09-30), the rest the same",
         "capital": "bought: premium x qty.  Sold: the broker's SPAN + exposure margin for the lot "
                    "(broker_margin), an estimate at today's margin",
         "holding": "intraday or overnight (NRML); a bought option is not held through its expiry day",
@@ -956,11 +1076,14 @@ def category_of(key: str) -> dict:
     return CATEGORIES[key]
 
 
-def trade_costs(category: str, side: str, entry_px: float, exit_px: float, qty: int, day=None) -> float:
-    """Round-trip costs of one trade in `category`, at the rates in force on `day`."""
+def trade_costs(category: str, side: str, entry_px: float, exit_px: float, qty: int, day=None,
+                exit_day=None) -> float:
+    """Round-trip costs of one trade in `category`, at the rates in force on `day` (the sale tax of an
+    option at the rate of the sale's own day - see option_round_trip)."""
     c = category_of(category)
-    fn = equity_round_trip if c["kind"] == "equity" else option_round_trip
-    return fn(side, entry_px, exit_px, qty, day=day)
+    if c["kind"] == "equity":
+        return equity_round_trip(side, entry_px, exit_px, qty, day=day)
+    return option_round_trip(side, entry_px, exit_px, qty, day=day, exit_day=exit_day)
 
 
 async def broker_charges(up: "Upstox", instrument_key: str, qty: int, price: float, side: str,
@@ -975,7 +1098,8 @@ async def broker_charges(up: "Upstox", instrument_key: str, qty: int, price: flo
 async def broker_check(up: "Upstox", category: str, instrument_key: str, qty: int, price: float) -> str:
     """Price one round trip (buy and sell at `price`) with the model AND with the broker's own
     calculator, today, and say whether they agree.  Every script calls it once and prints the
-    line; a disagreement means a rate in section 6 is stale - fix it there, with its date."""
+    line; a disagreement means a rate in section 6 is stale - fix it there, with its date.
+    A live call: without PYFUNCS_ALLOW_FETCH=1 the line says SKIPPED."""
     c = category_of(category)
     try:
         broker = (await broker_charges(up, instrument_key, qty, price, "BUY", c["product"])
@@ -1022,7 +1146,11 @@ async def nse_results_stamps(symbol: str, frm: date, to: date) -> list[datetime]
     scheduled results board meetings with no disclosure found (assumed 18:00, after the close).
     Several filings of one quarter (standalone, then consolidated a day later) collapse to the
     first.  Returns None when NSE cannot be reached - a caller must then say the event tag is
-    unknown rather than treat every day as event-free (RULE 6).  Nothing is written to disk."""
+    unknown rather than treat every day as event-free (RULE 6).  Nothing is written to disk.
+    A live call: None unless PYFUNCS_ALLOW_FETCH=1."""
+    if not ALLOW_FETCH:
+        print(f"  ! NSE results calendar for {symbol} not fetched: {NO_FETCH}")
+        return None
     f, t = frm.strftime("%d-%m-%Y"), to.strftime("%d-%m-%Y")
     hdr = {"User-Agent": NSE_UA, "Referer": NSE_HOME, "Accept": "application/json"}
     try:
@@ -1060,7 +1188,11 @@ async def nse_results_stamps(symbol: str, frm: date, to: date) -> list[datetime]
 async def nse_exdividend_days(symbol: str, frm: date, to: date) -> set[str] | None:
     """Ex-dividend dates ("YYYY-MM-DD") from NSE corporate actions.  On an ex-date the open gaps
     down by the dividend mechanically - not a market move - so a gap rule should know about it.
-    None when NSE cannot be reached (say so; never treat it as 'no dividends')."""
+    None when NSE cannot be reached (say so; never treat it as 'no dividends').
+    A live call: None unless PYFUNCS_ALLOW_FETCH=1."""
+    if not ALLOW_FETCH:
+        print(f"  ! NSE corporate actions for {symbol} not fetched: {NO_FETCH}")
+        return None
     f, t = frm.strftime("%d-%m-%Y"), to.strftime("%d-%m-%Y")
     hdr = {"User-Agent": NSE_UA, "Referer": NSE_HOME, "Accept": "application/json"}
     try:
@@ -1081,16 +1213,39 @@ async def nse_exdividend_days(symbol: str, frm: date, to: date) -> set[str] | No
 YAHOO_CHART = "https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
 
 
+def yahoo_file(ticker: str) -> str:
+    """The local file of a Yahoo daily series: yahoo_<ticker>_daily.json in LOCAL_DATA_DIR, the ticker
+    with ^ dropped and = . - turned into _ (^N225 -> yahoo_N225_daily.json, 000001.SS -> yahoo_000001_SS_daily.json).
+    Format: {ticker, name, source, fetched_utc, timezone, fetched: [[from, to]], candles: [[day, o, h, l, c], ...]}."""
+    safe = ticker.replace("^", "").replace("=", "_").replace(".", "_").replace("-", "_")
+    return f"yahoo_{safe}_daily.json"
+
+
 async def yahoo_daily(ticker: str, frm: date, to: date) -> list[list] | None:
-    """Daily bars of a market Upstox does not carry (Asian and US indices, commodities, FX) from
-    Yahoo Finance's chart API: [[YYYY-MM-DD, open, high, low, close], ...] oldest first.
+    """Daily bars of a market Upstox does not carry (Asian and US indices, commodities, FX):
+    [[YYYY-MM-DD, open, high, low, close], ...] oldest first.
+
+    LOCAL FIRST (the user, 2026-09-30): if `yahoo_file(ticker)` is on local disk it is the only source,
+    and a part of frm..to outside its fetched ranges is noted as missing (never filled).  Without the
+    file, Yahoo Finance's chart API is a live call: None unless PYFUNCS_ALLOW_FETCH=1, and None when
+    Yahoo cannot be reached - the caller must then say the factor is unknown (RULE 6), never treat it
+    as flat.  Nothing is written to disk by this function.
 
     The date is the EXCHANGE's own calendar day (Tokyo's session of 2026-03-02 is '2026-03-02',
     and it opens at 05:30 IST - before NSE's pre-open), so a caller pairing it with an NSE session
-    must decide which of its prices were known at that minute.  Bars without a close are dropped;
-    nothing is filled.  Returns None when Yahoo cannot be reached - the caller must then say the
-    factor is unknown (RULE 6), never treat it as flat.  Nothing is written to disk."""
-    p1 = int(datetime(frm.year, frm.month, frm.day, tzinfo=timezone.utc).timestamp())
+    must decide which of its prices were known at that minute.  Bars without a close are dropped."""
+    fname = yahoo_file(ticker)
+    blob = _local(fname)
+    if blob is not None:
+        lo, hi = frm.isoformat(), to.isoformat()
+        for a, b in _gaps(frm, to, blob.get("fetched") or []):
+            _NOTES.add(f"yahoo {ticker}: {a}..{b} not inside {fname}'s fetched ranges - unknown on those days")
+        return [[r[0], float(r[1]), float(r[2]), float(r[3]), float(r[4])]
+                for r in blob.get("candles") or [] if lo <= r[0] <= hi and r[4] is not None]
+    if not ALLOW_FETCH:
+        print(f"  ! Yahoo daily bars for {ticker} not fetched: {NO_FETCH}")
+        return None
+    p1 =int(datetime(frm.year, frm.month, frm.day, tzinfo=timezone.utc).timestamp())
     p2 = int((datetime(to.year, to.month, to.day, tzinfo=timezone.utc) + timedelta(days=1)).timestamp())
     try:
         async with httpx.AsyncClient(timeout=30.0, headers={"User-Agent": NSE_UA}, follow_redirects=True) as c:
@@ -1379,7 +1534,8 @@ def make_trade(*, day: str, side: str, symbol: str, entry_time: str, entry_px: f
     prem_pts = round(exit_px, 2) - round(entry_px, 2)   # the traded price's own move, signed, from the prices shown
     if costs is None:
         if kind == "option":
-            costs = option_round_trip(side, entry_px, exit_px, qty, day=day)
+            costs = option_round_trip(side, entry_px, exit_px, qty, day=day, exchange=exchange_of(symbol),
+                                      exit_day=exit_day)
         elif kind == "equity":
             costs = equity_round_trip(side, entry_px, exit_px, qty, day=day)
         else:
@@ -1671,6 +1827,7 @@ WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 STANDARD_GROUPS = ["weekday", "week", "month", "entry hour", "exit reason"]
 OPTION_GROUP = "option type"       # CE / PE - added only when the trades are options
 DTE_GROUP = "DTE"                  # days to expiry at entry - added only when the trades are options
+INSTRUMENT_GROUP = "instrument"    # NIFTY / SENSEX - added only when a report holds more than one index
 _REQUIRED_TRADE = ("day", "exit_day", "side", "symbol", "entry_time", "entry_px", "exit_time",
                    "exit_px", "qty", "gross", "costs", "net")
 
@@ -1763,6 +1920,8 @@ def _group_label(t: dict, kind: str) -> str:
         return t.get("option_type") or "-"
     if kind == DTE_GROUP:
         return "-" if t.get("dte") is None else f"{t['dte']} DTE"
+    if kind == INSTRUMENT_GROUP:
+        return t.get("instrument") or "-"
     raise KeyError(kind)
 
 
@@ -1841,9 +2000,12 @@ def _stability(trs: list[dict], break_date: str | None = None) -> list[dict]:
 
 # Two scenarios only: the rule, and the bar close as the one comparison.
 FILL_MODES = [
-    ("worst", "worst price of the minute - buy at its high, sell at its low"),
-    ("close", "closing price of the minute - for comparison only, not a real fill"),
+    ("worst", "worst case - buy at the next candle's high, sell at the next candle's low"),
+    ("signal", "signal candle - buy at the signal candle's high, sell at the exit candle's low"),
 ]
+# Exits at a set time keep their own minute in every view (the user, 2026-09-30); only an exit a
+# price triggered (stop, target, trail, floor ...) moves to the candle that triggered it.
+_SCHEDULED_EXIT = re.compile(r"time exit|fixed exit|next-morning|square[- ]?off|expiry|end of day", re.I)
 
 
 def _bar_at(rows: list[list], hhmm: str) -> list | None:
@@ -1853,20 +2015,29 @@ def _bar_at(rows: list[list], hhmm: str) -> list | None:
     return None
 
 
-def _price_fills(trades: list[dict], index: dict, option_sessions: dict | None) -> int:
-    """Re-price every trade at the CLOSE of the SAME bars it already used - the one comparison
-    beside the worst fill (the rule).  Nothing else is computed.
+def _minute_before(hhmm: str) -> str:
+    m = int(hhmm[:2]) * 60 + int(hhmm[3:5]) - 1
+    return f"{m // 60:02d}:{m % 60:02d}"
 
-    The fill convention is the single biggest lever on an option backtest and it is usually
-    invisible: a rule can read as -Rs 89k at the worst fill and +Rs 91k at the close, on
-    identical trades, because the exit bar is the opening minute and 57 points wide.  The
-    source reports made it a dropdown, so the template does too - for every strategy, with no
-    extra fetching, because both prices are already in the bar.
 
-    `worst` stays the default and the rule (RUN.md rule 1).  The close is labelled as what it
-    is: a sensitivity check, not a result you could have traded."""
+def _price_fills(trades: list[dict], index: dict, option_sessions: dict | None) -> tuple[int, dict]:
+    """The SECOND VIEW of every trade (the user, 2026-09-30): the same signals and the same exit minutes,
+    re-priced one candle earlier - in at the SIGNAL candle, out at the candle that TRIGGERED the exit.
+
+        worst   (the rule)  a buy fills at the NEXT candle's high, a sell at the NEXT candle's low
+        signal              a buy fills at the signal candle's high, a sell at the exit candle's low;
+                            a short (stocks) mirrors it: in at the signal candle's low, out at the
+                            exit candle's high
+
+    The signal candle is the 1-minute candle just before the entry minute - also when the signal came
+    from a bigger candle (the user's choice: its last minute).  The exit candle is the minute before
+    the exit fill for an exit a price triggered; an exit at a set time (15:14, 09:30, next morning)
+    keeps its own minute.  Never a price nobody could have had: if the signal minute or the trigger
+    minute has no candle in the traded instrument (nothing traded, or the entry is the day's first
+    minute - a signal known before the open), that leg keeps its worst-case price.  Returns (trades
+    re-priced, counts of the legs that kept the worst price)."""
     opt = option_sessions or {}
-    done = 0
+    done, kept = 0, {"entry": 0, "exit": 0, "scheduled": 0}
     for t in trades:
         src = opt.get(t["symbol"])          # the traded instrument's own bars: an option, or one stock of a book
         if src is None:
@@ -1875,27 +2046,46 @@ def _price_fills(trades: list[dict], index: dict, option_sessions: dict | None) 
         x = _bar_at((src or {}).get(t["exit_day"]), t["exit_time"])
         if not e or not x:
             continue
-        sgn = 1 if t["side"] == "LONG" else -1
+        long_ = t["side"] == "LONG"
+        sgn = 1 if long_ else -1
+        s_bar = _bar_at(src.get(t["day"]), _minute_before(t["entry_time"]))
+        scheduled = bool(_SCHEDULED_EXIT.search(t.get("exit_reason") or ""))
+        x_bar = None if scheduled else _bar_at(src.get(t["exit_day"]), _minute_before(t["exit_time"]))
+        kept["entry"] += s_bar is None
+        kept["scheduled"] += scheduled
+        kept["exit"] += (not scheduled) and x_bar is None
+        ep = (s_bar[2] if long_ else s_bar[3]) if s_bar else t["entry_px"]
+        xp = (x_bar[3] if long_ else x_bar[2]) if x_bar else t["exit_px"]
+        ep, xp = round(ep, 2), round(xp, 2)
+        gross = round(sgn * (xp - ep) * t["qty"], 2)
+        costs = (round(option_round_trip(t["side"], ep, xp, t["qty"], day=t["day"],
+                                         exchange=exchange_of(t["symbol"]), exit_day=t.get("exit_day")), 2)
+                 if t.get("kind") == "option" else
+                 round(equity_round_trip(t["side"], ep, xp, t["qty"], day=t["day"]), 2)
+                 if t.get("kind") == "equity" else t["costs"])
         out = {"worst": {"entry_px": t["entry_px"], "exit_px": t["exit_px"], "gross": t["gross"],
-                         "costs": t["costs"], "net": t["net"]}}
-        for mode, ep, xp in (("close", e[4], x[4]),):
-            ep, xp = round(ep, 2), round(xp, 2)
-            gross = round(sgn * (xp - ep) * t["qty"], 2)
-            costs = (round(option_round_trip(t["side"], ep, xp, t["qty"], day=t["day"]), 2)
-                     if t.get("kind") == "option" else
-                     round(equity_round_trip(t["side"], ep, xp, t["qty"], day=t["day"]), 2)
-                     if t.get("kind") == "equity" else t["costs"])
-            out[mode] = {"entry_px": ep, "exit_px": xp, "gross": gross, "costs": costs,
-                         "net": round(gross - costs, 2),
-                         "prem_pts": round(xp - ep, 2),
-                         "prem_pct": (xp - ep) / ep * 100 if ep else None,
-                         **trade_economics(t["side"], ep, xp, t["qty"], round(gross - costs, 2), t.get("capital"))}
-        out["worst"]["prem_pts"] = t["prem_pts"]
-        out["worst"]["prem_pct"] = t["prem_pct"]
-        out["worst"].update({k: t.get(k) for k in ("pts", "move_pct", "notional", "leverage", "rom")})
+                         "costs": t["costs"], "net": t["net"], "entry_time": t["entry_time"],
+                         "exit_time": t["exit_time"], "prem_pts": t.get("prem_pts"), "prem_pct": t.get("prem_pct"),
+                         **{k: t.get(k) for k in ("pts", "move_pct", "notional", "leverage", "rom")}},
+               "signal": {"entry_px": ep, "exit_px": xp, "gross": gross, "costs": costs,
+                          "net": round(gross - costs, 2), "prem_pts": round(xp - ep, 2),
+                          "prem_pct": (xp - ep) / ep * 100 if ep else None,
+                          "entry_time": s_bar[0] if s_bar else t["entry_time"],
+                          "exit_time": x_bar[0] if x_bar else t["exit_time"],
+                          **trade_economics(t["side"], ep, xp, t["qty"], round(gross - costs, 2), t.get("capital"))}}
         t["fills"] = out
         done += 1
-    return done
+    return done, kept
+
+
+def fill_note(priced: int, n: int, kept: dict) -> str:
+    """One plain line for meta.limits: what the signal-candle view could and could not re-price."""
+    return (f"SECOND VIEW - signal candle: {priced} of {n} trades re-priced in at the signal candle's high and out at "
+            f"the exit candle's low (a short mirrored). Kept the worst-case price because nothing traded in that minute "
+            f"or the signal came before the open: {kept['entry']} entries, {kept['exit']} exits. Exits at a set time "
+            f"({kept['scheduled']}) keep their own minute in both views."
+            + (f" {n - priced} trades have no candles kept to re-price and read the same in both views." if priced < n else "")
+            + " The worst case stays the rule; this view is a comparison, never a result.")
 
 
 def _sides(trades: list[dict]) -> list[str]:
@@ -2031,7 +2221,8 @@ def points_view(t: dict) -> dict:
     v.update({"gross": t["pts"], "net": t["pts"], "costs": 0.0, "qty": 1})
     if t.get("fills"):
         v["fills"] = {m: {"entry_px": f["entry_px"], "exit_px": f["exit_px"], "gross": f["pts"], "net": f["pts"],
-                          "costs": 0.0, "pts": f["pts"], "move_pct": f.get("move_pct")}
+                          "costs": 0.0, "pts": f["pts"], "move_pct": f.get("move_pct"),
+                          **{k: f[k] for k in ("entry_time", "exit_time") if k in f}}
                       for m, f in t["fills"].items()}
     return v
 
@@ -2040,8 +2231,14 @@ def build_payload(meta: dict, trades: list[dict], index_sessions: dict[str, list
                   option_sessions: dict[str, dict[str, list[list]]] | None = None,
                   groups: list[dict] | None = None, settings: list[dict] | None = None,
                   chart: str = "default", sessions_log: list[dict] | None = None,
-                  worst_only: bool = False) -> dict:
+                  worst_only: bool = False, index_by: dict[str, dict[str, list[list]]] | None = None) -> dict:
     """Assemble what the HTML reads.
+
+    index_by  {instrument: {day: rows}} for a report that holds SEVERAL indices (built by
+              `run_instruments`, never by a script): every trade then carries `instrument`, is
+              charted on its own index, and the page gets an Instrument selector.  index_sessions
+              is ignored.  While `run_instruments` is collecting, a script's own call is also
+              recorded, so the combined report can be built from the same inputs.
 
     worst_only  True = the report is the WORST price only (buy at the candle's HIGH, sell at its
               LOW), with no middle / close comparison - what stock_intraday always is.  Every
@@ -2077,6 +2274,15 @@ def build_payload(meta: dict, trades: list[dict], index_sessions: dict[str, list
     recomputes the book for whatever settings and date range are chosen.  `baseline` is the
     same book computed here, over every trade, and the page checks itself against it on load.
     """
+    multi = index_by is not None
+    if _ACTIVE["collect"] is not None and not multi:          # run_instruments: keep this index's inputs
+        _ACTIVE["collect"].append({
+            "instrument": instrument(), "rung": _ACTIVE["ladder_rung"], "meta": dict(meta),
+            "index_sessions": index_sessions,
+            "trades": [dict(t, tags=dict(t["tags"]), variant=dict(t["variant"])) for t in trades],
+            "option_sessions": dict(option_sessions or {}), "groups": groups, "settings": settings,
+            "chart": chart, "worst_only": worst_only,
+            "sessions_log": [dict(r, facts=dict(r.get("facts") or {})) for r in sessions_log or []]})
     groups = groups or []
     tag_keys = {k for t in trades for k in t["tags"]}
     for g in groups:
@@ -2087,13 +2293,21 @@ def build_payload(meta: dict, trades: list[dict], index_sessions: dict[str, list
     spec = list(settings) if declared else _derive_settings(trades)
     for w in check_settings(settings, trades):
         print("WARNING  " + w)
+    by = index_by if multi else {None: index_sessions}          # the index sessions, per instrument
+    if multi and (odd := sorted({str(t.get("instrument")) for t in trades} - set(index_by))):
+        raise ValueError(f"trades on {odd} but index_by holds {list(index_by)}")
+    inst_of = (lambda t: t["instrument"]) if multi else (lambda t: None)
     # every session a trade lives through: entry day, exit day, and any session between them
     def lives(t: dict) -> set:
         if t["day"] == t["exit_day"]:
             return {t["day"]}
-        return {d for d in index_sessions if t["day"] <= d <= t["exit_day"]} | {t["day"], t["exit_day"]}
-    need = set().union(*(lives(t) for t in trades)) if trades else set()     # validate_payload reports a missing one
-    index = {d: _round_rows(r) for d, r in index_sessions.items() if d in need}
+        return {d for d in by[inst_of(t)] if t["day"] <= d <= t["exit_day"]} | {t["day"], t["exit_day"]}
+    need_by: dict = {k: set() for k in by}
+    for t in trades:
+        need_by[inst_of(t)] |= lives(t)
+    need = set().union(*need_by.values())                     # validate_payload reports a missing one
+    embedded = {k: {d: _round_rows(r) for d, r in s.items() if d in need_by[k]} for k, s in by.items()}
+    index = next(iter(embedded.values()))
     own = option_sessions or {}
     for t in trades:
         # the underlying's move during the trade: the index - or, for one stock of a book of several,
@@ -2101,7 +2315,8 @@ def build_payload(meta: dict, trades: list[dict], index_sessions: dict[str, list
         src = own.get(t["symbol"]) if t.get("kind") != "option" else None
         for k, day, hhmm in (("entry_spot", t["day"], t["entry_time"]), ("exit_spot", t["exit_day"], t["exit_time"])):
             if t.get(k) is None:
-                b = bar_at((src if src is not None else index).get(day, []), hhmm, tolerance=3, direction=-1)
+                b = bar_at((src if src is not None else embedded[inst_of(t)]).get(day, []), hhmm,
+                           tolerance=3, direction=-1)
                 t[k] = b[4] if b else None
         es, xs = t["entry_spot"], t["exit_spot"]
         t["spot_pts"] = None if es is None or xs is None else xs - es
@@ -2147,19 +2362,19 @@ def build_payload(meta: dict, trades: list[dict], index_sessions: dict[str, list
         # nights whose candles are embedded can be re-checked here - the script checks the rest
         chk = trades if cat == "stock_intraday" else [
             t for t in trades if t["day"] in (own.get(t["symbol"]) or {}) and t["exit_day"] in (own.get(t["symbol"]) or {})]
-        bad = worst_fill_breaches(chk, index_sessions, own)
+        bad = worst_fill_breaches(chk, {} if multi else index_sessions, own)
         if bad:
             raise ValueError(f"{len(bad)} trade(s) not filled at the worst price of their candle "
                              "(buy = the candle's HIGH, sell = its LOW):\n  " + "\n  ".join(bad[:15]))
         if worst_only and cat != "stock_intraday":
             print(f"worst fill checked on {len(chk)} of {len(trades)} trades here (the rest by the script)")
-        priced = 0
-    else:
-        priced = _price_fills(trades, index, option_sessions)
+    # the second view, for every category (the user, 2026-09-30): the same trades at the signal candle
+    priced, kept = _price_fills(trades, {} if multi else index, option_sessions)
     for t in trades:
         t["filters"] = {"side": t["side"], **t["variant"]}      # kept for older readers
     standard = (STANDARD_GROUPS + ([OPTION_GROUP] if any(t.get("option_type") for t in trades) else [])
-                + ([DTE_GROUP] if any(t.get("dte") is not None for t in trades) else []))
+                + ([DTE_GROUP] if any(t.get("dte") is not None for t in trades) else [])
+                + ([INSTRUMENT_GROUP] if multi else []))
     spec_c = category_of(cat)
     here = script_category()
     if here is not None and here != cat:
@@ -2172,19 +2387,24 @@ def build_payload(meta: dict, trades: list[dict], index_sessions: dict[str, list
         meta["cost_model"] = None           # nothing in a points report is charged
         meta["lot_size"] = None
     meta["unit"] = spec_c.get("report_unit", "rupees")
+    local = [n for n in (built_note(), missing_note()) if n]
+    if local:
+        meta["limits"] = list(meta.get("limits") or []) + local
     meta.setdefault("generated", datetime.now(IST).strftime("%Y-%m-%d %H:%M IST"))
     meta["settings"] = spec
     meta["sides"] = _sides(trades)
-    meta["fill_modes"] = [{"value": k, "label": v} for k, v in FILL_MODES] if priced == len(trades) and trades else []
-    if trades and priced != len(trades) and cat != "stock_intraday" and not worst_only:
-        print(f"WARNING  fill comparison off: only {priced} of {len(trades)} trades had both bars "
-              f"in the embedded candles")
+    meta["fill_modes"] = [{"value": k, "label": v} for k, v in FILL_MODES] if priced else []
+    if priced:
+        meta["limits"] = list(meta.get("limits") or []) + [fill_note(priced, len(trades), kept)]
+    if trades and priced != len(trades):
+        print(f"NOTE  signal-candle view: {priced} of {len(trades)} trades had their candles to re-price; "
+              f"the rest read the same in both views")
     meta["group_defs"] = {"standard": standard, "custom": groups}
     meta["groups"] = standard + [g["name"] for g in groups]
     meta["chart_scope"] = ("every setting" if chart_syms is None else
                            "the rule's own settings only - other settings show metrics but no chart of the "
                            "instrument traded")
-    log = sorted(sessions_log or [], key=lambda r: r["day"])
+    log = sorted(sessions_log or [], key=lambda r: (r["day"], r.get("instrument") or ""))
     counts: dict[str, int] = {k: 0 for k in STATUSES}
     for r in log:
         counts[r["status"]] += 1
@@ -2192,14 +2412,16 @@ def build_payload(meta: dict, trades: list[dict], index_sessions: dict[str, list
     meta["log_columns"] = list(dict.fromkeys(k for r in log for k in r["facts"]))
     # every trading day of the window (market open, traded or not), for the 'average trades per week' card: the page
     # counts the days inside whatever date range the reader picks, so holiday weeks and part-weeks come out exact
-    meta["trading_days"] = trading_days_in(index_sessions, meta.get("from"), meta.get("to"))
+    meta["trading_days"] = sorted(set().union(*(trading_days_in(s, meta.get("from"), meta.get("to")) for s in by.values())))
+    if multi:
+        meta["instruments"] = list(index_by)
     overview = _book(trades)
     overview.update(_per_week(len(trades), len(meta["trading_days"])))
     payload = {"meta": meta, "trades": trades, "sessions": log,
                "baseline": {"overview": overview, "series": _series(trades),
                             "groups": _groups(trades, groups, standard),
                             "stability": _stability(trades, meta.get("break_date"))},
-               "candles": {"index": index, "option": opt}}
+               "candles": {"index": index, "option": opt, **({"index_by": embedded} if multi else {})}}
     validate_payload(payload)
     return payload
 
@@ -2232,20 +2454,26 @@ def validate_payload(p: dict) -> None:
                 bad.append(f"trade {i} ({t.get('day')}): missing {k}")
         if None not in (t.get("net"), t.get("gross"), t.get("costs")) and abs(t["gross"] - t["costs"] - t["net"]) > 0.05:
             bad.append(f"trade {i} ({t['day']}): net != gross - costs")
+        by = p["candles"].get("index_by")
+        idx = by.get(t.get("instrument"), {}) if by else p["candles"]["index"]
         for d in {t.get("day"), t.get("exit_day")}:
-            if d not in p["candles"]["index"]:
-                bad.append(f"trade {i}: no index candles for {d}")
+            if d not in idx:
+                bad.append(f"trade {i}: no {t.get('instrument') or 'index'} candles for {d}")
     log = p.get("sessions") or []
-    if log:
-        days = {r["day"] for r in log}
-        tdays = {t["day"] for t in p["trades"]}
+    if log:                                   # a session is (instrument, day) - one index per row
+        key = lambda r: (r.get("instrument") or "", r["day"])
+        days = {key(r) for r in log}
+        tdays = {key(t) for t in p["trades"]}
         miss = sorted(tdays - days)
         if miss:
             bad.append(f"{len(miss)} trade day(s) are not in the session log, e.g. {miss[:3]}")
-        orphan = sorted({r["day"] for r in log if r["status"] == "traded"} - tdays)
+        orphan = sorted({key(r) for r in log if r["status"] == "traded"} - tdays)
         if orphan:
             bad.append(f"{len(orphan)} session(s) logged 'traded' but produced no trade, e.g. {orphan[:3]}")
-        dupes = sorted({d for d in days if sum(1 for r in log if r["day"] == d) > 1})
+        seen: dict = {}
+        for r in log:
+            seen[key(r)] = seen.get(key(r), 0) + 1
+        dupes = sorted(k for k, n in seen.items() if n > 1)
         if dupes:
             bad.append(f"{len(dupes)} day(s) appear twice in the session log, e.g. {dupes[:3]}")
     base = (p.get("baseline") or {}).get("overview")
@@ -2269,7 +2497,12 @@ def _clean(o):
 def write_report(payload: dict, name: str, template: str = SAMPLE_HTML) -> str:
     """Put `payload` into the template and write analysis/report/<category>/<name>.html.  Returns the path.
     The template is a normal HTML file whose data sits between /*DATA_START*/ and /*DATA_END*/;
-    the same function rewrites sample.html itself when asked to."""
+    the same function rewrites sample.html itself when asked to.  While `run_instruments` is
+    collecting, nothing is written: the one combined report is written when every index has run."""
+    if _ACTIVE["collect"] is not None:
+        _ACTIVE["collect_name"] = name
+        cat = payload.get("meta", {}).get("category")
+        return os.path.join(REPORT_DIR, cat, f"{name}.html") if os.path.dirname(name) == "" and cat else name
     with open(template, encoding="utf-8") as f:
         html = f.read()
     m = payload.get("meta", {})
@@ -2294,7 +2527,9 @@ def write_report(payload: dict, name: str, template: str = SAMPLE_HTML) -> str:
         f.write(html)
     mb = len(blob) / 1e6
     cand = len(json.dumps(_clean(payload.get("candles", {})), separators=(",", ":"), default=str)) / 1e6
-    print(cache_stats())
+    n_miss = len(missing_local()) + len(_NOTES)
+    print("local data: everything this run asked for was on disk" if not n_miss else
+          f"local data: {n_miss} item(s) not on disk, treated as no data - see the NOT ON LOCAL DISK list")
     print(f"report data {mb:.1f} MB ({cand:.1f} MB of it candles)"
           + ("  - consider a shorter window or chart='default'" if mb > 40 else ""))
     return path
@@ -2318,3 +2553,280 @@ def console_summary(trades: list[dict]) -> str:
     pf = f"{b['pf']:.2f}" if b["pf"] is not None else "n/a"
     return (f"{b['n']} trades, {b['wins']} wins ({b['win']:.1f}%), net Rs {b['net']:,.0f}, "
             f"costs Rs {b['costs']:,.0f}, profit factor {pf}, max drawdown Rs {b['max_dd']:,.0f}")
+
+
+# ---------------------------------------------------------------------------
+# 8b  one report, several indices (the user, 2026-09-30)
+# ---------------------------------------------------------------------------
+_INDEX_WORD = re.compile(r"\bNIFTY(?: 50)?\b|\bNifty 50\b")
+_COLUMN_WORD = re.compile(r"\b(?:NIFTY(?: 50)?|Nifty 50|SENSEX)\b")
+
+
+def _renamed(v, name: str):
+    """Free text a NIFTY-born script wrote, read for another index: 'NIFTY' / 'NIFTY 50' -> `name`."""
+    if isinstance(v, str):
+        return _INDEX_WORD.sub(name, v)
+    if isinstance(v, (list, tuple)):
+        return [_renamed(x, name) for x in v]
+    if isinstance(v, dict):
+        return {k: _renamed(x, name) for k, x in v.items()}
+    return v
+
+
+def _merge_lines(lists: list[list], insts: list[str]) -> list:
+    """One list of text lines from several indices: a line they all share appears once, a line that
+    differs appears once per index, prefixed with the index's name."""
+    key = lambda x: json.dumps(x, sort_keys=True, default=str)
+    tag = lambda x, i: (f"[{i}] {x}" if isinstance(x, str)
+                        else [f"[{i}] {x[0]}", *x[1:]] if isinstance(x, (list, tuple)) and x
+                        else dict(x, title=f"[{i}] {x.get('title', '')}") if isinstance(x, dict) else x)
+    out: list = []
+    if len({len(l) for l in lists}) == 1:                      # the same script: compare line by line
+        for items in zip(*lists):
+            out += [items[0]] if len({key(x) for x in items}) == 1 else [tag(x, i) for x, i in zip(items, insts)]
+        return out
+    shared = set.intersection(*({key(x) for x in l} for l in lists))
+    done: set = set()
+    for l, i in zip(lists, insts):
+        for x in l:
+            if key(x) not in shared:
+                out.append(tag(x, i))
+            elif key(x) not in done:
+                out.append(x)
+                done.add(key(x))
+    return out
+
+
+def _rule_combo(settings: list[dict] | None, trades: list[dict]) -> dict[str, str]:
+    """{sweep key: the rule's value} for every sweep but the strike depth - what a trade at another
+    strike must match to be kept.  With no declared panel, the derived panel's defaults."""
+    spec = settings if settings is not None else _derive_settings(trades)
+    return {s["key"]: s["default"] for s in spec if s["mode"] == "sweep" and s["key"] != "moneyness"}
+
+
+def _combine(parts: list[dict], failed: dict[str, str], own_ladder: bool, rule_rung: int,
+             ladder_opts: list[dict], combo: dict[str, str]) -> dict:
+    """The one payload of a report that holds several indices and the strike ladder, built from what
+    each (index, strike) run passed to build_payload.  The rule's strike keeps every setting; the
+    other strikes were already cut to the rule's own settings by `run_instruments`.  Trades,
+    sessions and candles are kept per index; the meta text is merged (shared lines once,
+    differing ones per index)."""
+    rule_parts = [p for p in parts if p["rung"] == rule_rung]
+    insts = list(dict.fromkeys(p["instrument"] for p in rule_parts))
+    both = " & ".join(insts)
+    metas = [p["meta"] if p["instrument"] == REFERENCE_INSTRUMENT else _renamed(p["meta"], p["instrument"])
+             for p in rule_parts]
+    m = dict(metas[0])
+    m.pop("rerun", None)             # a run's own command names one strike; write_report writes the whole ladder's
+    for k in ("title", "subtitle"):
+        v = rule_parts[0]["meta"].get(k) or ""
+        m[k] = (_INDEX_WORD.sub(both, v, count=1) if _INDEX_WORD.search(v)
+                else f"{v} - {both}" if k == "title" else v)
+    m["instrument"] = both
+    m["lot_size"] = " · ".join(f"{i} {x.get('lot_size')}" for i, x in zip(insts, metas))
+    for k in ("rule_steps", "limits", "rejected"):
+        m[k] = _merge_lines([x.get(k) or [] for x in metas], insts)
+    if any(x.get("rule_sections") for x in metas):           # a part that differs by index appears once per index
+        m["rule_sections"] = _merge_lines([x.get("rule_sections") or [] for x in metas], insts)
+    params: dict = {}
+    for k in dict.fromkeys(k for x in metas for k in (x.get("params") or {})):
+        vals = [(x.get("params") or {}).get(k) for x in metas]
+        same = len({json.dumps(v, sort_keys=True, default=str) for v in vals}) == 1
+        params[k] = vals[0] if same else " · ".join(f"{i}: {v}" for i, v in zip(insts, vals))
+    m["params"] = dict(params, **{"strike ladder": " · ".join(o["label"] for o in ladder_opts)
+                                  + f" (the rule: {rung_label(rule_rung)})"})
+    covs = [x.get("coverage") or {} for x in metas]
+    m["coverage"] = {"sessions": " · ".join(f"{i} {c.get('sessions')}" for i, c in zip(insts, covs)),
+                     "weekday_gaps": sorted(set().union(*(c.get("weekday_gaps") or [] for c in covs))),
+                     "short_sessions": {f"{i} {d}": n for i, c in zip(insts, covs)
+                                        for d, n in (c.get("short_sessions") or {}).items()}}
+    # A strategy that converts NIFTY numbers with its OWN ratio (e.g. one known before the window, onh_v4) passes
+    # meta["price_ratio"] = {index: ratio} and meta["price_ratio_basis"]; the note then quotes those (2026-10-01).
+    own_ratio = metas[0].get("price_ratio") or {}
+    ratio_basis = metas[0].get("price_ratio_basis") or "the median close ratio over the window"
+    scaled = "; ".join(
+        f"{i}: strike step {strike_step(i):g}, lot {x.get('lot_size')}, "
+        + ("the reference" if i == REFERENCE_INSTRUMENT else f"NIFTY points x {own_ratio.get(i, price_scale(i)):.4g}")
+        for i, x in zip(insts, metas))
+    rungs = sorted({p["rung"] for p in parts}, reverse=True)
+    m["limits"] = [
+        f"ONE RULE, {len(insts)} INDICES ({scaled}). Each index trades its own candles and options. A number "
+        "the rule states in NIFTY points (a stop, a floor, a profile row, a strike depth of N strikes) is the "
+        f"same share of the price on the other index: NIFTY points x {ratio_basis}, and "
+        "N NIFTY strikes (N x 50 points) the same distance rounded to that index's own strikes. SENSEX options "
+        "are charged BSE's rates. 'All (combined)' adds the books together - a day can hold a trade on each "
+        "index at once.",
+        f"STRIKE LADDER (the user, 2026-09-30): the rule is priced on {len(rungs)} strikes, "
+        f"{', '.join(rung_label(r) for r in rungs)}, counted in NIFTY strikes in the money (on SENSEX the same % "
+        f"distance: 6 ITM = 10 SENSEX strikes). The rule's own strike ({rung_label(rule_rung)}) carries every "
+        "setting in the panel; every other strike is priced on the rule's own settings only, so another setting "
+        "at another strike has no trades."
+        + ("" if own_ladder else " The strategy itself picks the ATM strike; at another rung the contract is "
+                                 "moved that many strikes in the money and everything after (candles, fills, "
+                                 "costs, lot) follows it.")] + m["limits"]
+    m["limits"] += [f"{i}: NOT IN THIS REPORT - its run failed: {e}" for i, e in failed.items()]
+    trades, log, option_sessions, index_by = [], [], {}, {}
+    for p in parts:
+        i = p["instrument"]
+        index_by.setdefault(i, p["index_sessions"])
+        for sym, days in p["option_sessions"].items():      # one contract can trade at two rungs on different days
+            option_sessions.setdefault(sym, {}).update(days)
+        for t in p["trades"]:
+            t = dict(t, instrument=i)
+            if not own_ladder:
+                t["variant"] = dict(t["variant"], moneyness=str(p["rung"]))
+            if i != REFERENCE_INSTRUMENT:
+                t["note"] = _renamed(t.get("note") or "", i)
+                t["levels"] = [dict(l, name=_renamed(l.get("name", ""), i)) for l in t.get("levels") or []]
+            trades.append(t)
+        for r in p["sessions_log"]:                          # the day log is the rule strike's
+            log.append(dict(r, instrument=i, note=_renamed(r.get("note") or "", i) if i != REFERENCE_INSTRUMENT
+                            else r.get("note") or "",
+                            facts={_COLUMN_WORD.sub("index", k): v for k, v in (r.get("facts") or {}).items()}))
+    base = rule_parts[0]
+    settings = base["settings"]
+    if settings is None:                                     # no declared panel: derive it at the rule's strike
+        rule_trades = [t for t in trades if t["variant"].get("moneyness") == str(rule_rung)]
+        settings = [dict(s, default=combo.get(s["key"], s["default"])) for s in _derive_settings(rule_trades)
+                    if s["key"] != "moneyness"]
+    ladder = setting("moneyness", "Strike depth", kind="strike", default=str(rule_rung), options=ladder_opts,
+                     help="NIFTY strikes in the money (the same % distance on SENSEX); the rule's own strike "
+                          "carries every setting, the others the rule's settings only")
+    settings = [ladder if s["key"] == "moneyness" else s for s in settings]
+    if not own_ladder:
+        settings = settings + [ladder]
+    groups = [dict(g, name=_COLUMN_WORD.sub("index", g["name"])) for g in base["groups"] or []]
+    return build_payload(m, trades, None, option_sessions, groups, settings=settings,
+                         chart=base["chart"], sessions_log=log, worst_only=base["worst_only"], index_by=index_by)
+
+
+def run_instruments(script: str, instruments=INDEX_INSTRUMENTS, ladder=STRIKE_LADDER) -> str:
+    """Run an index strategy on every index on local disk and every strike of the ladder (6 ITM ..
+    ATM), and write ONE report: an Instrument selector ('all' adds the books together) and a Strike
+    depth setting (the user, 2026-09-30).
+
+    The script is unchanged but for its last lines:
+        if __name__ == "__main__":
+            run_instruments(__file__)
+        elif __name__ == "__instrument__":
+            main()
+    Its file is executed afresh for each (index, strike) with `instrument()` set, so a constant that
+    depends on the index (STEP = strike_step(), a point amount x price_scale()) is right for it.  A
+    script with its own "moneyness" setting is run once per strike with --moneyness N; one that
+    trades a single strike (ATM) has the contract moved N strikes in the money by `resolve_option`.
+    The rule's own strike runs first and keeps every setting; at every other strike only the trades
+    of the rule's own settings are kept (the user's choice: the report stays a size a browser can
+    open).  Build_payload() inputs are collected, write_report() is held back, and the combined
+    report is written at the end.  --instruments NIFTY and --rungs 6,0 narrow the runs.  An index
+    whose rule run fails is left out and the report says so."""
+    import runpy
+    import traceback
+    argv = list(sys.argv)
+    for flag in ("--instruments", "--rungs"):
+        if flag in argv:
+            k = argv.index(flag)
+            vals = [x.strip().upper() for x in argv[k + 1].split(",") if x.strip()]
+            if flag == "--instruments":
+                instruments = vals
+            else:
+                ladder = tuple(int(v) for v in vals)
+            del argv[k:k + 2]
+    own = 'setting("moneyness"' in open(script, encoding="utf-8").read()
+    if "--moneyness" in argv:                        # the report's re-run command names the ladder this way
+        k = argv.index("--moneyness")
+        ladder = tuple(int(v) for v in argv[k + 1].split(",") if v.strip())
+        del argv[k:k + 2]
+    ladder_opts = [{"value": str(r), "label": rung_label(r)} for r in ladder]
+    rule_rung = 0                                            # a one-strike strategy trades ATM
+    if own:                                                  # its own ladder: the rule's rung, and its labels
+        g = runpy.run_path(script, run_name="__settings__")
+        mset = next(s for s in g["SETTINGS"] if s["key"] == "moneyness")
+        rule_rung = int(mset["default"])
+        known = {o["value"]: o for o in mset["options"]}
+        missing = [r for r in ladder if str(r) not in known]
+        if missing:
+            raise SystemExit(f"{script}: its moneyness setting has no rung {missing} - widen its options")
+        ladder_opts = [{"value": str(r), "label": known[str(r)]["label"]} for r in ladder]
+    order = [rule_rung] + [r for r in ladder if r != rule_rung]
+    combo: dict | None = None                                # the rule's settings, from the first index
+    parts: list[dict] = []
+    failed: dict[str, str] = {}
+    _ACTIVE.update(collect=parts, collect_name=None)
+    try:
+        for inst in instruments:
+            for r in order:
+                _ACTIVE.update(instrument=inst, rung=0 if own else r, ladder_rung=r)
+                sys.argv = argv + (["--moneyness", str(r)] if own else [])
+                n0 = len(parts)
+                print(f"\n{'=' * 18} {inst}  {rung_label(r)} {'=' * 18}", flush=True)
+                try:
+                    runpy.run_path(script, run_name="__instrument__")
+                except (Exception, SystemExit) as exc:
+                    traceback.print_exc()
+                    del parts[n0:]
+                    if r == rule_rung:                       # no rule run: leave the index out
+                        failed[inst] = f"{type(exc).__name__}: {exc}"[:300]
+                        break
+                    failed[f"{inst} {rung_label(r)}"] = f"{type(exc).__name__}: {exc}"[:300]
+                    continue
+                if len(parts) == n0:
+                    failed[inst if r == rule_rung else f"{inst} {rung_label(r)}"] = "the script built no report"
+                    if r == rule_rung:
+                        break
+                    continue
+                p = parts[-1]
+                if r == rule_rung:
+                    if combo is None:
+                        combo = _rule_combo(p["settings"], p["trades"])
+                    continue
+                # another strike: the rule's own settings only
+                p["trades"] = [t for t in p["trades"] if all(t["variant"].get(k) == v for k, v in combo.items())]
+                syms = {t["symbol"] for t in p["trades"]}
+                p["option_sessions"] = {s: d for s, d in p["option_sessions"].items() if s in syms}
+                p["sessions_log"] = []
+    finally:
+        name = _ACTIVE.get("collect_name")
+        sys.argv = argv
+        _ACTIVE.update(instrument=REFERENCE_INSTRUMENT, collect=None, collect_name=None, rung=0, ladder_rung=None)
+    if not any(p["rung"] == rule_rung for p in parts) or not name:
+        raise SystemExit(f"no report was built for any index: {failed or 'nothing ran'}")
+    payload = _combine(parts, failed, own, rule_rung, ladder_opts, combo or {})
+    path = write_report(payload, name)
+    print(f"\n{'=' * 18} {payload['meta']['instrument']}: the rule's settings on each strike {'=' * 18}")
+    spec = payload["meta"]["settings"]
+    dflt = {s["key"]: s["default"] for s in spec if s["mode"] == "sweep" and s["key"] != "moneyness"}
+    fopt = [next(o for o in s["options"] if o["value"] == s["default"]) for s in spec if s["mode"] == "filter"]
+    ruled = [t for t in payload["trades"] if all(t["variant"].get(k) == v for k, v in dflt.items())
+             and all(_admits(t, o) for o in fopt)]
+    for r in [x for x in order if any(t["variant"].get("moneyness") == str(x) for t in ruled)]:
+        for inst in payload["meta"]["instruments"] + ["all"]:
+            mine = [t for t in ruled if t["variant"].get("moneyness") == str(r) and inst in ("all", t["instrument"])]
+            print(f"{rung_label(r):<6} {inst:<7} {console_summary(mine)}")
+    for what, err in failed.items():
+        print(f"FAILED   {what}: {err}")
+    print(path)
+    return path
+
+
+def refresh_report(path: str) -> str:
+    """Re-wrap a written report in the current template and give it the second (signal-candle) view,
+    re-priced from the candles the report already embeds - for a report whose script cannot be
+    re-run here (its data is not on local disk).  A trade whose candles were not kept reads the same
+    in both views, and the report's limits say how many."""
+    with open(path, encoding="utf-8") as f:
+        html = f.read()
+    p = json.loads(html[html.rindex(DATA_START) + len(DATA_START):html.rindex(DATA_END)])
+    trades, c = p["trades"], p.get("candles") or {}
+    for t in trades:
+        t.pop("fills", None)
+    priced, kept = _price_fills(trades, {} if c.get("index_by") else c.get("index") or {}, c.get("option") or {})
+    if p["meta"].get("unit") == "points":                       # a points report: the view in points too
+        for t in trades:
+            for f in (t.get("fills") or {}).values():
+                f.update(gross=f["pts"], net=f["pts"], costs=0.0)
+    m = p["meta"]
+    m["fill_modes"] = [{"value": k, "label": v} for k, v in FILL_MODES] if priced else []
+    m["limits"] = [l for l in m.get("limits") or [] if not str(l).startswith("SECOND VIEW")]
+    if priced:
+        m["limits"].append(fill_note(priced, len(trades), kept))
+    return write_report(p, path)

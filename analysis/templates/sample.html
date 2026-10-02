@@ -96,9 +96,16 @@
   <div id="checkBox"></div>
   <div class="panel" id="panel"></div>
   <div class="banner" id="verdict"></div>
+  <details class="sec" open id="coreSec" style="display:none"><summary>How the rule works <span class="hint">the strategy step by step, then an example for each entry</span></summary>
+    <div id="ruleCore"></div><div id="exCore"></div>
+  </details>
 
   <details class="sec" open><summary>Overview <button class="small" id="showAll" title="every filter condition, side by side">show all</button> <span class="hint" id="ovCond"></span></summary>
     <div class="cards" id="cards"></div>
+  </details>
+
+  <details class="sec" open id="ladSec"><summary>The rule on every strike <span class="hint" id="ladHint"></span></summary>
+    <div class="scroll"><table id="tblLad"></table></div>
   </details>
 
   <details class="sec" open id="comboSec"><summary>Every setting compared <span class="hint">click a column to sort it, click a row to load that setting</span></summary>
@@ -185,15 +192,17 @@
     <div class="scroll" style="max-height:560px"><table id="tblSess"></table></div>
   </details>
 
-  <details class="sec" open><summary>The rule, its settings and its limits</summary>
+  <details class="sec" open id="ruleSec"><summary id="ruleSecTitle">The rule, its settings and its limits</summary>
+    <div id="ruleCore2"></div>
     <div class="two">
-      <div><div style="font-weight:600;margin-bottom:6px">The rule, step by step</div><ol class="steps" id="steps"></ol>
+      <div><div style="font-weight:600;margin-bottom:6px" id="stepsHead">The rule, step by step</div><ol class="steps" id="steps"></ol>
         <div style="font-weight:600;margin:14px 0 6px">Settings used</div><div class="kv" id="params"></div></div>
       <div><div style="font-weight:600;margin-bottom:6px">Assumptions and warnings</div><ul class="steps" id="limits"></ul>
         <div style="font-weight:600;margin:14px 0 6px">Data quality</div><div class="kv" id="cov"></div>
         <div style="font-weight:600;margin:14px 0 6px" id="fillsTitle">Fills and costs</div><div class="kv" id="fills"></div>
         <div id="rejBox"></div></div>
     </div>
+    <div id="exBox"></div>
     <div style="font-weight:600;margin:18px 0 6px">What each number means</div><div class="kv" id="defs"></div>
   </details>
   <div id="tip"></div>
@@ -222,7 +231,11 @@ const pill = s => '<span class="pill ' + String(s).toLowerCase() + '">' + esc(s)
 const holdTxt = m => !num(m) ? '—' : (m >= 1440 ? fmt(m / 1440, 1) + ' d' : (m >= 120 ? fmt(m / 60, 1) + ' h' : fmt(m, 0) + ' min'));
 const isoOf = d => d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
 
-const RAW = (DATA.trades || []).map((t, i) => Object.assign({id: i, tags: {}, levels: [], filters: {}, variant: {}}, t, {overnight: t.exit_day !== t.day}));
+/* Every trade names its INSTRUMENT: the index (or stock) it is on - `instrument` when the report was built
+   from several (py_funcs.run_instruments), else the first word of its symbol: "NIFTY 25000 CE ..." ->
+   NIFTY, "HDFCBANK 1700 CE ..." -> HDFCBANK, a cash-equity trade's own stock. */
+const RAW = (DATA.trades || []).map((t, i) => Object.assign({id: i, tags: {}, levels: [], filters: {}, variant: {}}, t,
+  {overnight: t.exit_day !== t.day, instrument: t.instrument || String(t.symbol || '').split(' ')[0] || M.instrument || '-'}));
 /* An intraday-stock report (cash equity, MIS) is read in the stock's own points, the position,
    the broker's margin and the leverage between them - there is no premium, and the "underlying"
    IS the traded instrument.  Options reports keep the premium view.  Decided by the data. */
@@ -258,7 +271,26 @@ const SETTINGS = (M.settings || []).map(s => Object.assign({mode: 'sweep', kind:
 const SIDES = M.sides || [];
 const SIDE_DIM = {key: 'side', label: 'Side', kind: 'other', mode: 'side', default: 'all', help: '',
   options: [{value: 'all', label: 'all', tag: null}].concat(SIDES.map(v => ({value: v, label: v, tag: null})))};
-const DIMS = (SIDES.length > 1 ? [SIDE_DIM] : []).concat(SETTINGS);
+/* The INSTRUMENT dropdown, in every report (the user, 2026-09-30), first in the row. With several
+   instruments (NIFTY and SENSEX from py_funcs.run_instruments, or the stocks of a book) 'all (combined)'
+   adds the books together and each one shows its own book; with one it names what was traded. Like
+   'side' it is not a strategy setting, so it is not "the rule" and the best-setting search keeps it
+   where it is. */
+const INSTS = M.instruments || Array.from(new Set(RAW.map(t => t.instrument))).sort();
+const MULTI_INST = INSTS.length > 1;
+const BY_INDEX = !!(DATA.candles || {}).index_by;          // each instrument has its own index candles
+const INST_DIM = {key: 'instrument', label: 'Instrument', kind: 'other', mode: 'instrument', default: MULTI_INST ? 'all' : INSTS[0],
+  help: MULTI_INST ? 'which instrument the trades are on - all adds the books together' : 'the instrument this strategy traded',
+  options: (MULTI_INST ? [{value: 'all', label: 'all (combined)', tag: null}] : []).concat(INSTS.map(v => ({value: v, label: v, tag: null})))};
+if (MULTI_INST && (GD_OF(M).standard || []).indexOf('instrument') < 0) {   // and a by-instrument breakdown
+  M.group_defs = Object.assign({standard: [], custom: []}, M.group_defs); M.group_defs.standard = M.group_defs.standard.concat(['instrument']);
+  M.groups = (M.groups || []).concat(['instrument']);
+}
+function GD_OF(m) { return m.group_defs || {standard: [], custom: []}; }
+/* A strategy that declares its own 'side' setting (e.g. "Which side") keeps it: the built-in Side
+   dropdown would share its key, read 'buy' as a side and show no trades at all. */
+const OWN_SIDE = SETTINGS.some(s => s.key === 'side');
+const DIMS = (INSTS.length ? [INST_DIM] : []).concat(SIDES.length > 1 && !OWN_SIDE ? [SIDE_DIM] : []).concat(SETTINGS);
 const HAS_RULE = SETTINGS.length > 0 && !SETTINGS.some(d => d.derived);   // declared, so a default means something
 /* Buying a put is still LONG the instrument, so an option-buying strategy has side=LONG on
    every trade and the side column says nothing while hiding that half the book is bearish.
@@ -270,7 +302,7 @@ const dirCls = t => t.option_type === 'CE' ? 'long' : t.option_type === 'PE' ? '
 const dirPill = t => ONE_SIDE
   ? '<span class="pill ' + dirCls(t) + '">' + esc(dirText(t)) + '</span>'
   : pill(t.side);
-const RULEMARK = d => (HAS_RULE && !d.derived && d.mode !== 'side') ? '  ← the rule' : '';
+const RULEMARK = d => (HAS_RULE && !d.derived && d.mode !== 'side' && d.mode !== 'instrument') ? '  ← the rule' : '';
 const GD = M.group_defs || {standard: [], custom: []};
 const WIN = {from: M.from || (ALL.length ? ALL[0].day : ''), to: M.to || (ALL.length ? ALL[ALL.length - 1].exit_day : '')};
 
@@ -291,6 +323,7 @@ const admits = (t, o) => {
 function dimOK(t, d, f) {
   const v = f[d.key];
   if (d.mode === 'side') return v === 'all' || t.side === v;
+  if (d.mode === 'instrument') return v === 'all' || t.instrument === v;
   if (d.mode === 'filter') return admits(t, optOf(d, v));
   return String(t.variant[d.key]) === String(v);
 }
@@ -379,6 +412,7 @@ function glabel(t, kind) {
   if (kind === 'exit reason') return t.exit_reason || '-';
   if (kind === 'option type') return t.option_type || '-';
   if (kind === 'DTE') return num(t.dte) ? t.dte + ' DTE' : '-';
+  if (kind === 'instrument') return t.instrument || '-';
   return '-';
 }
 function bucketBy(ts, keyOf) {
@@ -496,7 +530,8 @@ function ctlHtml(d) {
    numbers belongs to its own section (zone 2) or to the chart (zone 3), never up here. */
 function renderPanel() {
   const P = presets(), curPre = P.findIndex(p => p.a === S.from && p.b === S.to);
-  const ordered = KIND_ORDER.reduce((a, k) => a.concat(DIMS.filter(d => d.kind === k)), []);
+  const ordered = DIMS.filter(d => d.mode === 'instrument')
+    .concat(KIND_ORDER.reduce((a, k) => a.concat(DIMS.filter(d => d.kind === k && d.mode !== 'instrument')), []));
   let html = '<div class="zh"><b>Settings</b> &mdash; change any box and every number below changes with it</div>' +
     '<div class="prow"><div class="grp">' +
     '<div class="ctl"><label>from</label><input type="date" id="dFrom" value="' + esc(S.from) + '" min="' + esc(WIN.from) + '" max="' + esc(WIN.to) + '"></div>' +
@@ -506,8 +541,8 @@ function renderPanel() {
       P.map((p, i) => '<option value="' + i + '"' + (i === curPre ? ' selected' : '') + '>' + esc(p.l) + '</option>').join('') +
     '</select></div></div>' +
     (ordered.length ? '<div class="grp">' + ordered.map(ctlHtml).join('') + '</div>' : '') +
-    (FILLS.length ? '<div class="grp"><div class="ctl"><label>fill</label><select id="fillSel" ' +
-      'title="which price of the 1-minute candle a trade gets; the worst price is the rule, the close is only a comparison">' +
+    (FILLS.length ? '<div class="grp"><div class="ctl"><label>fill view</label><select id="fillSel" ' +
+      'title="which candle a trade fills at. Worst case (the rule): buy at the NEXT candle&rsquo;s high, sell at the next candle&rsquo;s low. Signal candle (a comparison): buy at the signal candle&rsquo;s high, sell at the exit candle&rsquo;s low; exits at a set time keep their own minute">' +
       FILLS.map(o => '<option value="' + esc(o.value) + '"' + (FILLMODE === o.value ? ' selected' : '') + '>' +
         esc(o.label) + (o.value === 'worst' ? '  ← the rule' : '') + '</option>').join('') +
       '</select></div></div>' : '');
@@ -519,13 +554,18 @@ function renderPanel() {
     '<div class="pnote" id="fNote"></div>' +
     (M.rerun ? '<div class="cmd" id="cmdBox" style="display:none">' + esc(M.rerun) + '</div>' : '');
   $('panel').innerHTML = html;
-  $('panel').querySelectorAll('select[data-k]').forEach(el => el.onchange = () => { S.f[el.dataset.k] = el.value; renderAll(); });
+  $('panel').querySelectorAll('select[data-k]').forEach(el => el.onchange = () => {
+    S.f[el.dataset.k] = el.value;
+    S.snapped = snapToSimulated(el.dataset.k);
+    if (S.snapped) renderPanel();                 // the other dropdowns moved: redraw them
+    renderAll();
+  });
   $('dPre').onchange = () => { const p = P[+$('dPre').value]; if (!p) return; S.from = p.a; S.to = p.b; renderPanel(); renderAll(); };
   $('bestBtn').onclick = () => { const b = bestRow(); if (b) applyCombo(b.f); };
   if (FILLS.length) $('fillSel').onchange = () => { setFill($('fillSel').value); renderAll(); };
   $('dFrom').onchange = () => { S.from = $('dFrom').value || WIN.from; renderPanel(); renderAll(); };
   $('dTo').onchange = () => { S.to = $('dTo').value || WIN.to; renderPanel(); renderAll(); };
-  $('fReset').onclick = () => { DIMS.forEach(d => S.f[d.key] = d.default); S.from = WIN.from; S.to = WIN.to;
+  $('fReset').onclick = () => { DIMS.forEach(d => S.f[d.key] = d.default); S.from = WIN.from; S.to = WIN.to; S.snapped = '';
     setFill('worst'); renderPanel(); renderAll(); };
   $('showAll2').onclick = () => { $('comboSec').open = true; $('comboSec').scrollIntoView({behavior: 'smooth', block: 'start'}); };
   if (M.rerun) $('cmdBtn').onclick = () => {
@@ -542,7 +582,16 @@ function renderPanel() {
 const STATS = ['traded', 'declined', 'no signal', 'no data'];
 const stCls = st => 'st ' + st.replace(/ /g, '');
 const STLABEL = {'all': 'all days', 'traded': 'traded', 'declined': 'skipped by the rule', 'no signal': 'no setup', 'no data': 'bad data'};
-const sessionRows = () => (DATA.sessions || []).filter(r => (!S.from || r.day >= S.from) && (!S.to || r.day <= S.to));
+/* With several indices a session is one index's day: the log follows the Instrument dropdown. */
+const LOG_BY_INST = (DATA.sessions || []).some(r => r.instrument);   // one log row per instrument per day
+const instOK = r => !MULTI_INST || S.f.instrument === 'all' || !r.instrument || r.instrument === S.f.instrument;
+const rowInst = r => r.instrument || (INSTS.length === 1 ? INSTS[0] : '');
+/* How many SESSIONS a set of log rows is, and on how many indices: with 'all (combined)' every day has one
+   row per index, so 143 sessions on 2 indices are 286 rows - say so rather than calling them 286 days. */
+const daysOf = rows => ({days: new Set(rows.map(r => r.day)).size, idx: new Set(rows.map(r => r.instrument || '')).size, rows: rows.length});
+const dayWords = rows => { const d = daysOf(rows);
+  return d.idx > 1 ? d.days + ' sessions × ' + d.idx + ' indices = ' + d.rows + ' index-days' : d.rows + ' days'; };
+const sessionRows = () => (DATA.sessions || []).filter(r => (!S.from || r.day >= S.from) && (!S.to || r.day <= S.to) && instOK(r));
 function sessionCounts(rows) {
   const c = {};
   STATS.forEach(k => c[k] = 0);
@@ -555,22 +604,24 @@ function renderSessions() {
   if (!rows.length) { sec.style.display = 'none'; return; }
   sec.style.display = '';
   const cols = M.log_columns || [], c = sessionCounts(rows);
-  const netBy = {};
-  subset().forEach(t => netBy[t.day] = (netBy[t.day] || 0) + t.net);
-  $('sessHint').textContent = rows.length + ' days, ' + winLabel();
+  const netBy = {}, nk = (i, d) => (LOG_BY_INST ? i || '' : '') + '|' + d, showInst = LOG_BY_INST || INSTS.length === 1;
+  subset().forEach(t => netBy[nk(t.instrument, t.day)] = (netBy[nk(t.instrument, t.day)] || 0) + t.net);
+  $('sessHint').textContent = dayWords(rows) + (daysOf(rows).idx > 1 ? ' (one row per index per day)' : '') + ', ' + winLabel();
   $('sessTabs').innerHTML = [['all', rows.length]].concat(STATS.map(k => [k, c[k]]))
     .map(x => '<button class="tab' + (S.sess === x[0] ? ' on' : '') + '" data-s="' + esc(x[0]) + '">' + esc(STLABEL[x[0]] || x[0]) + ' <b>' + x[1] + '</b></button>').join('');
   $('sessTabs').querySelectorAll('.tab').forEach(b => b.onclick = () => { S.sess = b.dataset.s; renderSessions(); });
   const shown = S.sess === 'all' ? rows : rows.filter(r => r.status === S.sess);
-  $('tblSess').innerHTML = '<thead><tr><th class="l">day</th>' + cols.map(k => '<th>' + esc(k) + '</th>').join('') +
+  $('tblSess').innerHTML = '<thead><tr><th class="l">day</th>' + (showInst ? '<th class="l">instrument</th>' : '') +
+    cols.map(k => '<th>' + esc(k) + '</th>').join('') +
     '<th class="l">status</th><th class="l">what happened</th><th>result with these settings</th></tr></thead><tbody>' +
     (shown.length ? shown.slice().reverse().map(r => {
-      const n = netBy[r.day];
-      return '<tr><td class="l">' + esc(r.day) + '</td>' + cols.map(k => '<td>' + factTxt((r.facts || {})[k]) + '</td>').join('') +
+      const n = netBy[nk(r.instrument, r.day)];
+      return '<tr><td class="l">' + esc(r.day) + '</td>' + (showInst ? '<td class="l">' + esc(rowInst(r)) + '</td>' : '') +
+        cols.map(k => '<td>' + factTxt((r.facts || {})[k]) + '</td>').join('') +
         '<td class="l"><span class="' + stCls(r.status) + '">' + esc(STLABEL[r.status] || r.status) + '</span></td>' +
         '<td class="l dimc">' + esc(r.note) + '</td>' +
         '<td class="' + sgn(n) + '">' + (n === undefined ? '<span class="dimc">—</span>' : rs(n)) + '</td></tr>';
-    }).join('') : '<tr><td class="l dimc" colspan="' + (cols.length + 4) + '">none in this window</td></tr>') + '</tbody>';
+    }).join('') : '<tr><td class="l dimc" colspan="' + (cols.length + 4 + (showInst ? 1 : 0)) + '">none in this window</td></tr>') + '</tbody>';
 }
 
 /* ---------- what each condition costs ----------------------------------------------------
@@ -664,7 +715,7 @@ function renderVerdict(v) {
   let t = '<b>' + lead + '</b>, ' + esc(winLabel()) +
     (isRule(S.f) ? '' : ' <span class="dimc">(' + esc(condLabel(S.f)) + ')</span>') + '. ';
   if (rows.length) { const c = sessionCounts(rows);
-    t += 'It traded on <b>' + c['traded'] + '</b> of ' + rows.length + ' days (' + c['declined'] + ' skipped by its own filters, ' +
+    t += 'It traded on <b>' + c['traded'] + '</b> of ' + dayWords(rows) + ' (' + c['declined'] + ' skipped by its own filters, ' +
       c['no signal'] + ' with no setup, ' + c['no data'] + ' with bad data). '; }
   if (!b) { el.className = 'banner'; el.innerHTML = t + 'No trade with these settings.'; return; }
   const bst = bestRow(), onBest = bst && fkey(S.f) === bst.k;
@@ -748,12 +799,13 @@ function renderOverview(v) {
   if (!v) { $('cards').innerHTML = '<div class="note" style="grid-column:1/-1">No trades with these settings in this window.</div>'; return; }
   const b = v.overview;
   const card = (k, val, cls, def, sub) => '<div class="card"><div class="k" title="' + esc(def) + '">' + k + '</div><div class="v ' + (cls || '') + '">' + val + '</div>' + (sub ? '<div class="s">' + sub + '</div>' : '') + '</div>';
-  const L = sessionRows(), sc = L.length ? sessionCounts(L) : null;
+  const L = sessionRows(), sc = L.length ? sessionCounts(L) : null, dd = daysOf(L), per = dd.idx > 1 ? ' index-days' : '';
   $('cards').innerHTML = (sc ? [
-    card('days', L.length, '', 'Every trading day in the window, traded or not.', winLabel()),
-    card('skipped by the rule', sc['declined'], 'dimc', 'Days with a setup that one of the rule’s filters said no to. Switching that filter off in the settings counts them.', 'a filter said no'),
-    card('no setup', sc['no signal'], 'dimc', 'Days with nothing to trade.', ''),
-    card('bad data', sc['no data'], sc['no data'] ? 'neg' : 'dimc', 'Days skipped for missing or broken data. Never filled in with a guess.', 'skipped'),
+    card('days', dd.days, '', 'Every trading day in the window, traded or not.' + (per ? ' With all indices shown, each day is counted once per index in the cards next to it.' : ''),
+      per ? '× ' + dd.idx + ' indices = ' + dd.rows + per + ' · ' + winLabel() : winLabel()),
+    card('skipped by the rule', sc['declined'], 'dimc', 'Days with a setup that one of the rule’s filters said no to. Switching that filter off in the settings counts them.', per ? 'index-days a filter said no to' : 'a filter said no'),
+    card('no setup', sc['no signal'], 'dimc', 'Days with nothing to trade.', per ? 'index-days' : ''),
+    card('bad data', sc['no data'], sc['no data'] ? 'neg' : 'dimc', 'Days skipped for missing or broken data. Never filled in with a guess.', per ? 'index-days skipped - see Every day' : 'skipped'),
   ] : []).concat([
     card('trades', b.n, '', DEFS.trades, 'on ' + b.sessions + ' days'),
     (() => { const td = tradingDaysIn(S.from, S.to), pw = perWeek(b.n, td);
@@ -853,9 +905,8 @@ const MAX_ROWS = 1000;
 const MIN_BEST = 20;              // do not crown a combination on a handful of trades
 let ROWCACHE = {key: null, rows: null};
 function allRows() {              // every combination booked over the CURRENT window, memoised
-  const key = S.from + '|' + S.to;
+  const cl = comboList(), key = S.from + '|' + S.to + (PARTIAL ? '|' + otherKey() : '');
   if (ROWCACHE.key === key) return ROWCACHE.rows;
-  const cl = comboList();
   ROWCACHE = {key: key, rows: cl ? cl.map(f => ({f: f, k: fkey(f), o: book(pick(f))})) : null};
   return ROWCACHE.rows;
 }
@@ -871,13 +922,26 @@ function allRows() {              // every combination booked over the CURRENT w
    The sample floor steps down 20 -> 10 -> 5 and stops. If nothing clears 5 trades there is no
    best worth naming, and the report says so instead of crowning noise. */
 const MIN_BEST_TIERS = [20, 10, 5];
+/* The sweep combinations that were actually SIMULATED. A strike ladder priced on the rule's own
+   settings only (py_funcs.run_instruments) has no trades for another setting at another strike,
+   so those combinations are never listed, searched or counted against MAX_ROWS - only what ran. */
+const SWEEP_DIMS = DIMS.filter(d => d.mode === 'sweep');
+const SIMULATED = (() => {
+  const seen = {};
+  RAW.forEach(t => { const v = SWEEP_DIMS.map(d => String(t.variant[d.key])); seen[JSON.stringify(v)] = v; });
+  const pos = (d, v) => { const i = d.options.findIndex(o => o.value === v); return i < 0 ? 1e6 : i; };
+  return Object.values(seen).sort((a, b) => { for (let i = 0; i < a.length; i++) { const x = pos(SWEEP_DIMS[i], a[i]) - pos(SWEEP_DIMS[i], b[i]); if (x) return x; } return 0; })
+    .map(v => { const f = {}; SWEEP_DIMS.forEach((d, i) => f[d.key] = v[i]); return f; });
+})();
+function crossWith(out, d, vals) {
+  const nx = [];
+  out.forEach(c => vals.forEach(v => nx.push(Object.assign({}, c, {[d.key]: v}))));
+  return nx;
+}
 function sweepCombos() {
-  let out = [{}];
-  DIMS.forEach(d => {
-    const vals = d.mode === 'filter' ? [d.default] : d.options.map(o => o.value);
-    const nx = [];
-    out.forEach(c => vals.forEach(v => nx.push(Object.assign({}, c, {[d.key]: v}))));
-    out = nx;
+  let out = SWEEP_DIMS.length ? SIMULATED.slice() : [{}];
+  DIMS.filter(d => d.mode !== 'sweep').forEach(d => {
+    out = crossWith(out, d, d.mode === 'filter' ? [d.default] : d.mode === 'instrument' ? [S.f[d.key]] : d.options.map(o => o.value));
   });
   return out.length <= MAX_ROWS ? out : null;
 }
@@ -901,23 +965,86 @@ function bestRow() {
 }
 let BESTFLOOR = MIN_BEST_TIERS[0];
 const fkey = f => DIMS.map(d => d.key + '=' + f[d.key]).join('|');
+/* Every simulated sweep combination x every value of the other controls (instrument, side, filters).
+   When that cross passes MAX_ROWS, the table lists every simulated sweep combination with the other
+   controls as they are set above (PARTIAL), rather than listing nothing. */
+let PARTIAL = false;
+const otherKey = () => DIMS.filter(d => d.mode !== 'sweep').map(d => d.key + '=' + S.f[d.key]).join('|');
 function comboList() {
-  let out = [{}];
-  for (let i = 0; i < DIMS.length; i++) {
-    const next = [];
-    for (const c of out) for (const o of DIMS[i].options) { const x = Object.assign({}, c); x[DIMS[i].key] = o.value; next.push(x); }
-    out = next;
-    if (out.length > MAX_ROWS) return null;
+  const base = SWEEP_DIMS.length ? SIMULATED.slice() : [{}];
+  if (base.length > MAX_ROWS) return null;
+  let out = base;
+  for (const d of DIMS.filter(d => d.mode !== 'sweep')) {
+    out = crossWith(out, d, d.options.map(o => o.value));
+    if (out.length > MAX_ROWS) {
+      PARTIAL = true;
+      const fixed = {}; DIMS.filter(x => x.mode !== 'sweep').forEach(x => fixed[x.key] = S.f[x.key]);
+      return base.map(f => Object.assign({}, fixed, f));
+    }
   }
+  PARTIAL = false;
   return out;
 }
-function applyCombo(f) { DIMS.forEach(d => S.f[d.key] = f[d.key]); renderPanel(); renderAll(); window.scrollTo({top: 0, behavior: 'smooth'}); }
+function applyCombo(f) { DIMS.forEach(d => S.f[d.key] = f[d.key]); S.snapped = ''; renderPanel(); renderAll(); window.scrollTo({top: 0, behavior: 'smooth'}); }
+
+/* ---------- the rule on every strike ----------
+   A strike ladder (py_funcs.run_instruments: 6 ITM .. ATM) prices the RULE's own settings on every
+   strike; the rule's own strike alone carries every other setting. This table puts the strikes side by
+   side, ONE INDEX AT A TIME - NIFTY and SENSEX are never added into one count here. The window, the
+   side and the filters are as set above; every sweep but the strike is at the rule's value. */
+const LAD = DIMS.find(d => d.mode === 'sweep' && d.kind === 'strike' && d.options.length > 1) || null;
+const skey = f => SWEEP_DIMS.map(d => String(f[d.key])).join('\u0001');
+const SIM_KEYS = new Set(SIMULATED.map(skey));
+const simulated = f => !SWEEP_DIMS.length || SIM_KEYS.has(skey(f));
+function ruleAt(f, strike) {
+  const g = Object.assign({}, f);
+  SWEEP_DIMS.forEach(d => g[d.key] = d.default);
+  g[LAD.key] = strike;
+  return g;
+}
+function renderLadder() {
+  const sec = $('ladSec');
+  if (!LAD) { sec.style.display = 'none'; return; }
+  sec.style.display = '';
+  const insts = INSTS.length ? INSTS : [null], others = SWEEP_DIMS.filter(d => d !== LAD).map(d => d.label);
+  $('ladHint').textContent = (HAS_RULE ? 'the rule' : 'the panel defaults') + (others.length ? ' (' + others.join(', ') + ')' : '') +
+    ' on every strike, each index on its own · window, side and filters as set above · click a strike to load it';
+  let html = '<thead><tr><th class="l">' + esc(LAD.label) + '</th>' + insts.map(i => '<th colspan="4">' + esc(i || 'trades') + '</th>').join('') + '</tr>' +
+    '<tr><th class="l"></th>' + insts.map(() => '<th>trades</th><th>win %</th><th>total ' + CUR + '</th><th>profit factor</th>').join('') + '</tr></thead><tbody>';
+  LAD.options.forEach(o => {
+    const f = ruleAt(S.f, o.value), on = skey(S.f) === skey(f);
+    html += '<tr' + (on ? ' class="sel"' : '') + '><td class="l pick" data-v="' + esc(o.value) + '" title="load this strike with the rule&rsquo;s settings">' +
+      esc(o.label) + (o.value === LAD.default ? ' <span class="rule">← the rule</span>' : '') + '</td>' +
+      insts.map(i => { const b = row(pick(i ? Object.assign({}, f, {instrument: i}) : f));
+        return '<td>' + b.n + '</td><td>' + pct(b.win) + '</td><td class="' + sgn(b.net) + '">' + (b.n ? rs(b.net) : '—') + '</td><td>' + (num(b.pf) ? fmt(b.pf, 2) : '—') + '</td>'; }).join('') + '</tr>';
+  });
+  $('tblLad').innerHTML = html + '</tbody>';
+  $('tblLad').querySelectorAll('td.pick').forEach(td => td.onclick = () => applyCombo(ruleAt(S.f, td.dataset.v)));
+}
+/* A setting chosen in the panel that makes a combination nobody simulated (another setting at another
+   strike: only the rule was priced there) would show no trades. Move the other sweeps to the rule's values
+   instead - or, failing that, to the first simulated combination with the chosen value - and say so. */
+function snapToSimulated(key) {
+  if (simulated(S.f)) return '';
+  const moved = [];
+  SWEEP_DIMS.forEach(d => { if (d.key !== key && S.f[d.key] !== d.default) { S.f[d.key] = d.default; moved.push(d.label); } });
+  if (!simulated(S.f)) {
+    const c = SIMULATED.find(x => String(x[key]) === String(S.f[key]));
+    if (!c) return '';
+    SWEEP_DIMS.forEach(d => { if (S.f[d.key] !== c[d.key]) { S.f[d.key] = c[d.key]; if (moved.indexOf(d.label) < 0) moved.push(d.label); } });
+  }
+  const d0 = DIMS.find(d => d.key === key), o = d0 ? optOf(d0, S.f[key]) : null;
+  return moved.length ? 'At ' + (o ? o.label : S.f[key]) + ' only ' + (HAS_RULE ? 'the rule&rsquo;s' : 'the default') + ' settings were simulated, so ' +
+    moved.map(esc).join(', ') + (moved.length > 1 ? ' were' : ' was') + ' moved to match.' : '';
+}
 function setCombo(f) { DIMS.forEach(d => S.f[d.key] = f[d.key]); }        // no re-render
 function renderAllTable() {
   renderMatrix();
   const combos = comboList(), cur = fkey(S.f);
   $('allWin').innerHTML = '<b>' + esc(winLabel()) + '</b> &middot; ' +
-    (combos ? combos.length + ' setting combinations' : 'more than ' + MAX_ROWS + ' setting combinations') +
+    (combos ? combos.length + ' setting combinations' + (PARTIAL ? ' (every simulated setting, with ' +
+      esc(DIMS.filter(d => d.mode !== 'sweep').map(d => d.label).join(', ')) + ' as set above - the full cross is more than ' + MAX_ROWS + ')' : '')
+      : 'more than ' + MAX_ROWS + ' setting combinations') +
     (HAS_RULE ? ' &middot; the rule&rsquo;s own row is marked <span class="rule">← the rule</span>' : '') +
     ' &middot; the highlighted row is the one shown above';
   if (!combos) { $('tblAll').innerHTML = '<tbody><tr><td class="l dimc">Too many combinations to list. Narrow a setting with its --flag and re-run the script.</td></tr></tbody>'; return; }
@@ -1011,8 +1138,8 @@ function renderStab(v) {
 const cls = (v, txt) => '<span class="' + sgn(v) + '">' + txt + '</span>';
 const TCOLS_EQ = [
   {k: 'id', l: '#', f: t => t.id + 1, c: 'l'},
-  {k: 'day', l: 'day', f: t => esc(t.day), c: 'l'}].concat(MULTI ? [
-  {k: 'symbol', l: 'stock', f: t => esc(t.symbol), c: 'l'}] : []).concat([
+  {k: 'day', l: 'day', f: t => esc(t.day), c: 'l'},
+  {k: 'symbol', l: 'stock', f: t => esc(t.symbol), c: 'l'}].concat([
   {k: ONE_SIDE ? 'option_type' : 'side', l: ONE_SIDE ? 'direction' : 'side', f: dirPill, c: 'l'},
   {k: 'entry_time', l: 'in', f: t => t.entry_time, c: 'l'}, {k: 'exit_time', l: 'out', f: t => t.exit_time, c: 'l'},
   {k: 'entry_px', l: 'entry price', f: t => fmt(t.entry_px)}, {k: 'exit_px', l: 'exit price', f: t => fmt(t.exit_px)},
@@ -1029,6 +1156,7 @@ const capPct = t => t.capital > 0 ? t.net / t.capital * 100 : null;
 const TCOLS_OPT = [
   {k: 'id', l: '#', f: t => t.id + 1, c: 'l'},
   {k: 'day', l: 'day', f: t => esc(t.day) + (t.overnight ? ' <span class="dimc">→ ' + esc(t.exit_day.slice(5)) + '</span>' : ''), c: 'l'},
+  {k: 'instrument', l: 'instrument', f: t => esc(t.instrument), c: 'l'}].concat([
   {k: ONE_SIDE ? 'option_type' : 'side', l: ONE_SIDE ? 'direction' : 'side', f: dirPill, c: 'l'},
   {k: 'entry_time', l: 'in', f: t => t.entry_time, c: 'l'}, {k: 'exit_time', l: 'out', f: t => t.exit_time, c: 'l'},
   {k: 'entry_spot', l: 'inst. in', f: t => fmt(t.entry_spot)}, {k: 'exit_spot', l: 'inst. out', f: t => fmt(t.exit_spot)},
@@ -1040,8 +1168,11 @@ const TCOLS_OPT = [
   {k: 'net', l: 'net &#8377;', f: t => '<b class="' + sgn(t.net) + '">' + fmt(t.net, 0) + '</b>'},
   {k: 'cap_pct', l: 'cap. %', v: capPct,
    f: t => { const v = capPct(t); return v == null ? '<span class="dimc">&ndash;</span>' : cls(v, (v > 0 ? '+' : '') + fmt(v, 1) + '%'); }},
+  // The capital the trade needed (make_trade(capital=)): premium x qty for a bought option, the broker's
+  // margin for a sold one - the same number the 'avg capital / trade' card averages.
+  {k: 'capital', l: 'req. capital &#8377;', f: t => num(t.capital) ? fmt(t.capital, 0) : '<span class="dimc">&ndash;</span>'},
   {k: 'exit_reason', l: 'exit', f: t => esc(t.exit_reason), c: 'l'},
-];
+]);
 const TCOLS = EQ ? TCOLS_EQ : TCOLS_OPT;
 function renderTrades(trs) {
   const k = S.sortKey, d = S.sortDir, col = TCOLS.find(c => c.k === k);
@@ -1149,7 +1280,10 @@ const zoomAll = fn => ['idxChart', 'optChart'].forEach(id => { const s = $(id); 
    traded UNDER THE CURRENT RUN, which is a smaller set whenever another setting traded a day
    this one did not. */
 const curTrade = () => ALL.find(t => t.id === S.sel) || null;
-const candleDays = () => Object.keys((DATA.candles || {}).index || {}).sort();
+/* An index's candles: its own set in a report of several indices (candles.index_by), else the one index. */
+const IDX = inst => { const C = DATA.candles || {}; return (inst && C.index_by && C.index_by[inst]) || C.index || {}; };
+const chartInst = () => BY_INDEX ? (S.f.instrument !== 'all' ? S.f.instrument : INSTS[0]) : null;
+const candleDays = () => Object.keys(IDX(chartInst())).sort();
 function dayList() {
   const traded = {};
   subset().forEach(t => { traded[t.day] = 1; traded[t.exit_day] = 1; });
@@ -1180,7 +1314,7 @@ function renderChart(resetView) {
   const t = curTrade();
   const C = DATA.candles || {index: {}, option: {}};
   if (!t) {                                   // no trade selected: still draw the chosen session
-    const d0 = S.day && C.index[S.day] ? S.day : null;
+    const CX = IDX(chartInst()), d0 = S.day && CX[S.day] ? S.day : null;
     $('optChart').style.display = 'none'; $('optHead').textContent = '';
     $('tblWalk').innerHTML = '<tbody><tr><td class="l dimc">no trade selected</td></tr></tbody>';
     $('tBanner').className = 'banner';
@@ -1188,11 +1322,12 @@ function renderChart(resetView) {
                                   : 'No trade with these settings.';
     if (!d0) { $('idxChart').innerHTML = ''; $('idxHead').textContent = ''; return; }
     if (resetView) delete VIEW['d' + d0];
-    $('idxHead').innerHTML = '<b>' + esc(M.index_label || M.instrument || 'Index') + '</b> &mdash; ' + esc(d0);
-    drawCandles($('idxChart'), {key: 'd' + d0, days: [d0], rows: C.index, day: d0, h: 360, levels: [], hlines: [], marks: []});
+    $('idxHead').innerHTML = '<b>' + esc(chartInst() || M.index_label || M.instrument || 'Index') + '</b> &mdash; ' + esc(d0);
+    drawCandles($('idxChart'), {key: 'd' + d0, days: [d0], rows: CX, day: d0, h: 360, levels: [], hlines: [], marks: []});
     return;
   }
-  const days = Object.keys(C.index).filter(d => d >= t.day && d <= t.exit_day).sort();   // every session the trade lives through
+  const CI = IDX(t.instrument), iname = (BY_INDEX && t.instrument) || M.instrument || 'Index';   // the trade's own index
+  const days = Object.keys(CI).filter(d => d >= t.day && d <= t.exit_day).sort();   // every session the trade lives through
   if (!days.length) days.push(t.day);
   const optRows = (C.option || {})[t.symbol], hasOpt = !!optRows && t.kind === 'option', key0 = 'i' + t.id, key1 = 'o' + t.id;
   if (resetView) { delete VIEW[key0]; delete VIEW[key1]; }
@@ -1202,9 +1337,9 @@ function renderChart(resetView) {
   const stockBook = t.kind !== 'option' && (!!optRows || MULTI);      // one stock of a book of several
   if (stockBook) drawStockCharts(t, C, optRows, days, key0, key1, own, lv, outCol);
   else {
-  const sl = slotsOf(days, C.index), ei = slotIndex(sl, t.day, t.entry_time), xi = slotIndex(sl, t.exit_day, t.exit_time);
-  $('idxHead').innerHTML = '<b>' + esc(M.instrument || 'Index') + '</b> &mdash; ' + days.join(' &rarr; ') + (lv.length ? ' &middot; ' + lv.length + ' price levels' : '');
-  drawCandles($('idxChart'), {key: key0, days, rows: C.index, day: t.day, h: 360, levels: lv, hlines: t.kind === 'option' ? [] : own,
+  const sl = slotsOf(days, CI), ei = slotIndex(sl, t.day, t.entry_time), xi = slotIndex(sl, t.exit_day, t.exit_time);
+  $('idxHead').innerHTML = '<b>' + esc(iname) + '</b> &mdash; ' + days.join(' &rarr; ') + (lv.length ? ' &middot; ' + lv.length + ' price levels' : '');
+  drawCandles($('idxChart'), {key: key0, days, rows: CI, day: t.day, h: 360, levels: lv, hlines: t.kind === 'option' ? [] : own,
     marks: [{i: ei, px: t.entry_spot, label: 'IN', color: 'var(--accent)'}, {i: xi, px: t.exit_spot, label: 'OUT', color: outCol}]});
   if (hasOpt) {
     const os = slotsOf(days, optRows), m0 = {i: slotIndex(os, t.day, t.entry_time), px: t.entry_px, label: 'IN', color: 'var(--accent)'}, m1 = {i: slotIndex(os, t.exit_day, t.exit_time), px: t.exit_px, label: 'OUT', color: outCol};
@@ -1224,12 +1359,12 @@ function renderChart(resetView) {
       ? '<br><span class="dimc">price:</span> ' + fmt(t.entry_px) + ' &rarr; ' + fmt(t.exit_px) + ' ' + mv(t.pts, t.move_pct) +
         ' <span class="dimc">per share, in the trade’s favour</span>'
       : '<br><span class="dimc">' + (t.kind === 'option' ? 'premium' : 'price') + ':</span> ' + fmt(t.entry_px) + ' &rarr; ' + fmt(t.exit_px) + ' ' + mv(t.prem_pts, t.prem_pct) +
-        ' &nbsp;&middot;&nbsp; <span class="dimc">' + esc(M.instrument || 'index') + ':</span> ' + fmt(t.entry_spot) + ' &rarr; ' + fmt(t.exit_spot) + ' ' + mv(t.spot_pts, t.spot_pct)) +
+        ' &nbsp;&middot;&nbsp; <span class="dimc">' + esc(iname) + ':</span> ' + fmt(t.entry_spot) + ' &rarr; ' + fmt(t.exit_spot) + ' ' + mv(t.spot_pts, t.spot_pct)) +
     (t.expiry ? ' &nbsp;&middot;&nbsp; <span class="dimc">expiry</span> ' + esc(t.expiry) + ' (' + t.dte + ' DTE)' : '') +
     (t.exit_reason ? ' &nbsp;&middot;&nbsp; closed by: ' + esc(t.exit_reason) : '') + (num(t.mfe) ? ' &nbsp;&middot;&nbsp; best point ' + fmt(t.mfe) + ' / worst point ' + fmt(t.mae) : '') +
     (t.note ? '<br>' + esc(t.note) : '') + (Object.keys(t.filters).length > 1 ? '<br>' + Object.entries(t.filters).filter(([k]) => k !== 'side').map(([k, v]) => '<span class="dimc">' + esc(k) + ':</span> ' + esc(v)).join(' &nbsp; ') : '') +
     (Object.keys(t.tags).length ? '<br>' + Object.entries(t.tags).map(([k, v]) => '<span class="dimc">' + esc(k) + ':</span> ' + esc(v)).join(' &nbsp; ') : '');
-  renderWalk(t, stockBook ? (optRows || null) : hasOpt ? optRows : (t.kind === 'option' ? null : C.index), days);
+  renderWalk(t, stockBook ? (optRows || null) : hasOpt ? optRows : (t.kind === 'option' ? null : CI), days);
 }
 /* One stock of a book of several: the trade on its OWN stock's candles - the fills, the stop /
    target and the strategy's levels - and the index under it over the same minutes, for context
@@ -1296,8 +1431,15 @@ function renderInfo() {
       'before it closed.';
   }
   $('title').textContent = M.title || 'Strategy report';
-  $('sub').innerHTML = [esc(M.instrument), M.from && M.to ? esc(M.from) + ' → ' + esc(M.to) : '', M.generated ? 'generated ' + esc(M.generated) : ''].filter(Boolean).join(' &nbsp;&middot;&nbsp; ') + (M.subtitle ? '<br>' + esc(M.subtitle) : '');
-  $('steps').innerHTML = (M.rule_steps || []).map(s => '<li>' + esc(s) + '</li>').join('') || '<li class="dimc">none supplied</li>';
+  const longDate = s => { const d = new Date(s + 'T00:00:00'); return num(d.getTime()) ? d.getDate() + ' ' + d.toLocaleString('en-GB', {month: 'short'}) + ' ' + d.getFullYear() : s; };
+  const nDays = (M.trading_days || []).length;
+  $('sub').innerHTML = [esc(M.instrument), M.from && M.to ? esc(M.from) + ' → ' + esc(M.to) : '', M.generated ? 'generated ' + esc(M.generated) : ''].filter(Boolean).join(' &nbsp;&middot;&nbsp; ') +
+    (M.from && M.to ? '<br><b>Backtest window: ' + esc(longDate(M.from)) + ' to ' + esc(longDate(M.to)) + '</b> &mdash; ' +
+      (nDays ? nDays + ' sessions of local data' + (BY_INDEX ? ' on each index' : '') + '; ' : '') + 'nothing before or after is traded.' : '') +
+    (INSTS.length ? '<br><b>Instrument' + (MULTI_INST ? 's' : '') + ':</b> ' + esc(INSTS.join(', ')) +
+      (MULTI_INST ? ' &mdash; pick one in the Instrument box, or all (combined)' : '') : '') +
+    (M.subtitle ? '<br>' + esc(M.subtitle) : '');
+  $('steps').innerHTML = (M.rule_steps || []).map(s => '<li style="white-space:pre-line">' + esc(s) + '</li>').join('') || '<li class="dimc">none supplied</li>';
   $('limits').innerHTML = (M.limits || []).map(s => '<li>' + esc(s) + '</li>').join('') || '<li class="dimc">none supplied</li>';
   const kv = o => Object.entries(o || {}).filter(([, v]) => v !== undefined && v !== null).map(([k, v]) => '<div class="k">' + esc(k) + '</div><div>' + esc(typeof v === 'object' ? JSON.stringify(v) : v) + '</div>').join('') || '<div class="dimc">none</div>';
   $('params').innerHTML = kv(M.params);
@@ -1319,6 +1461,62 @@ function renderInfo() {
     ? '<div style="font-weight:600;margin:14px 0 6px">What was tested and left out</div><ul class="steps">' +
       (M.rejected || []).map(r => '<li>' + (Array.isArray(r) ? '<b>' + esc(r[0]) + '</b> — ' + esc(r[1]) : esc(r)) + '</li>').join('') + '</ul>'
     : '';
+  /* Plain-text tables for the rule core and the worked examples.  Cells wrap and keep line breaks; the first
+     and last columns are bold; a row with ONE cell is a group heading across the table. */
+  const txtCell = 'text-align:left;white-space:pre-line;vertical-align:top;line-height:1.55';
+  const txtTable = (head, rows) => '<table style="margin-top:6px"><thead><tr>' +
+    (head || []).map(h => '<th style="text-align:left;position:static">' + esc(h) + '</th>').join('') + '</tr></thead><tbody>' +
+    (rows || []).map(r => r.length === 1
+      ? '<tr><td colspan="' + Math.max(1, (head || []).length) + '" style="' + txtCell + ';font-weight:700;background:var(--chip);padding-top:9px">' + esc(r[0]) + '</td></tr>'
+      : '<tr>' + r.map((c, i) => '<td style="' + txtCell + (i === 0 || i === r.length - 1 ? ';font-weight:600' : '') +
+          (i === 0 ? ';min-width:120px' : '') + '">' + esc(c) + '</td>').join('') + '</tr>').join('') + '</tbody></table>';
+  /* Worked examples (meta.examples, optional): real nights, every number the rule read, in plain English.
+     Each = {title, intro, head: [..], rows: [[..], ..], open}. */
+  const exHtml = (M.examples || []).length
+    ? '<div style="font-size:15px;font-weight:700;margin:22px 0 6px">Real nights, worked through the same way</div>' +
+      M.examples.map(ex => '<details' + (ex.open ? ' open' : '') + ' style="margin:6px 0;border:1px solid var(--border);border-radius:8px;padding:8px 12px">' +
+        '<summary style="cursor:pointer;font-weight:600">' + esc(ex.title) + '</summary>' +
+        (ex.intro ? '<div class="dimc" style="margin:8px 0">' + esc(ex.intro) + '</div>' : '') +
+        txtTable(ex.head, ex.rows) + '</details>').join('')
+    : '';
+  /* The rule core (meta.rule_sections, optional): the rule told in parts at the TOP of the page - each part
+     {title, note, items: [..]} (a numbered list) or {title, note, head: [..], rows: [[..], ..]} (a table).
+     When it is there, the bottom section keeps only settings, assumptions and data quality. */
+  const core = M.rule_sections || [];
+  /* a 'flow' part = a flowchart: boxes top to bottom, each with the red condition that stops you (no 'go to') */
+  const flowHtml = f => '<div style="max-width:1150px">' + f.map((st, i) =>
+    '<div style="display:grid;grid-template-columns:minmax(0,1.7fr) minmax(0,1fr);gap:16px;align-items:center">' +
+      '<div style="border:2px solid ' + (st.go ? 'var(--up)' : 'var(--border)') + ';border-radius:10px;padding:10px 14px;background:var(--surface)">' +
+        '<div style="font-weight:700;font-size:14px">' + esc(st.step) + ' &nbsp;&middot;&nbsp; ' + esc(st.ask) + '</div>' +
+        (st.how ? '<div class="dimc" style="white-space:pre-line;line-height:1.55;margin-top:4px">' + esc(st.how) + '</div>' : '') + '</div>' +
+      '<div style="white-space:pre-line;line-height:1.5">' + (st.stop ? '<b style="color:var(--down)">NO TRADE</b> if ' + esc(st.stop) : '') + '</div>' +
+    '</div>' + (i < f.length - 1 ? '<div style="padding:3px 0 3px 30px;color:var(--muted);font-size:18px;line-height:1">&#8595;</div>' : '')).join('') + '</div>';
+  if (core.length) {
+    const coreHtml = core.map(s => '<div style="margin:6px 0 20px">' +
+      '<div style="font-size:15px;font-weight:700;margin-bottom:4px">' + esc(s.title) + '</div>' +
+      (s.lead ? '<div style="font-size:15px;line-height:1.6;padding:10px 14px;border-left:4px solid var(--up);background:var(--chip);border-radius:6px">' + esc(s.lead) + '</div>' : '') +
+      (s.note ? '<div class="dimc" style="margin-bottom:8px">' + esc(s.note) + '</div>' : '') +
+      (s.flow ? flowHtml(s.flow) : '') +
+      (s.text ? '<div style="white-space:pre-line;line-height:1.7;max-width:1100px">' + esc(s.text) + '</div>' : '') +
+      (s.items ? '<ol class="steps">' + s.items.map(i => '<li style="white-space:pre-line">' + esc(i) + '</li>').join('') + '</ol>' : '') +
+      (s.rows ? txtTable(s.head, s.rows) : '') + '</div>').join('');
+    $('ruleCore2').innerHTML = coreHtml;         // the rule, once, in the rule section (the user, 2026-10-01)
+    $('ruleSecTitle').textContent = 'The rule, step by step';
+    if (!$('notesSec')) {                        // the technical detail moves to its own closed section
+      const notes = document.createElement('details');
+      notes.className = 'sec'; notes.id = 'notesSec';
+      notes.innerHTML = '<summary>Settings, assumptions and data notes <span class="hint">the technical detail behind the backtest</span></summary>';
+      [...$('ruleSec').children].filter(el => el.tagName !== 'SUMMARY' && el.id !== 'ruleCore2' && el.id !== 'exBox')
+        .forEach(el => notes.appendChild(el));
+      $('ruleSec').after(notes);
+    }
+    $('exCore').innerHTML = exHtml;
+    $('exBox').innerHTML = '';
+    $('stepsHead').style.display = 'none';
+    $('steps').style.display = 'none';
+  } else {
+    $('exBox').innerHTML = exHtml;
+  }
   const c = M.coverage || {};
   $('cov').innerHTML = kv({'sessions loaded': c.sessions, 'weekdays with no candles': (c.weekday_gaps || []).length ? (c.weekday_gaps.length + ' (holidays or feed misses): ' + c.weekday_gaps.slice(0, 12).join(', ') + (c.weekday_gaps.length > 12 ? ' …' : '')) : 0,
     'short sessions': Object.keys(c.short_sessions || {}).length ? JSON.stringify(c.short_sessions) : 0});
@@ -1332,8 +1530,9 @@ function renderAll() {
     (isRule(S.f) ? ' <span class="rule">(the rule)</span>' : '') +
     (HAS_RULE ? '' : ' &middot; <span class="rule">panel derived from this script&rsquo;s own variants and tags</span>' +
       ' &mdash; declare SETTINGS to name them and mark which value is the rule') +
-    (S.from === WIN.from && S.to === WIN.to ? '' : ' &middot; ' + esc(S.from) + ' → ' + esc(S.to));
-  renderVerdict(v); renderOverview(v); renderAllTable(); renderSeries(v); renderGroup(v);
+    (S.from === WIN.from && S.to === WIN.to ? '' : ' &middot; ' + esc(S.from) + ' → ' + esc(S.to)) +
+    (S.snapped ? '<br><span class="rule">' + S.snapped + '</span>' : '');
+  renderVerdict(v); renderOverview(v); renderLadder(); renderAllTable(); renderSeries(v); renderGroup(v);
   renderStab(v); renderTrades(trs); renderSessions(); renderConditions(); renderControl();
   renderDayBar(); renderChart(true);
 }
