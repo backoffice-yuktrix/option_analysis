@@ -31,9 +31,15 @@ the Asia rescue added 2026-09-30 from the global-factor study of the Jan-Jul 202
           are the nights the rule found the market takes the day's move back next morning.
   Step 3  Strike six strikes ITM (300 points; reference = the 15:19 index close rounded to 50); expiry =
           nearest at least one day after the exit day.
-  Step 4  Buy in the 15:20 minute at that minute's HIGH; line = paid + round-trip costs per unit.
-  Step 5  From 09:30 next session: when a completed minute's LOW is above the line, sell in the NEXT
-          minute at its LOW.  Nothing by 15:14 -> sell in the 15:14 minute at its LOW.  No stop, no target.
+  Step 4  Buy in the 15:20 minute at that minute's HIGH; sell-line = paid + round-trip costs per unit.
+  Step 5  THE EXIT (the user, 2026-10-04, chosen after the exit study).  Two exits are in the report's 'Exit' box:
+            above paid + costs   from the 09:20 candle on, the first FINISHED candle whose LOW is above the sell-line
+                                 sells in the NEXT minute at its LOW; none before 14:00 -> sell in the 14:00 minute.
+            in profit at 09:20   the 09:19 candle's LOW above the sell-line -> sell in the 09:20 minute; otherwise hold
+                                 and sell in the 14:00 minute.
+          RULE_EXIT names the selected one.  No stop, no target; nothing is held after 14:00.
+          (Until 2026-10-03: the line from 09:16 - 09:30 before - else 15:14.  For one day, 2026-10-04: every trade
+          sold in the 09:16 minute; it cost about a fifth of the profit.)
   WORST FILL ONLY: every buy at the minute's high, every sell at its low; the report carries no
   middle/close comparison and refuses a better fill.
 
@@ -90,11 +96,27 @@ import os, sys
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "templates"))
 from py_funcs import *          # noqa: F401,F403
 import argparse
+from datetime import datetime, timedelta, timezone      # crude_reads; py_funcs exports date and timedelta too
 
 ENTRY_MIN = "15:20"
 READ_MIN = "15:19"
 SIGNAL_MIN = "15:14"
 TIME_EXIT = "15:14"
+# THE EXIT (the user, 2026-10-04, after the exit study in the scratchpad: "make these two rules in the exit clearly, and
+# in the rule's steps mention which is selected").  Both are in the report's 'Exit' box; RULE_EXIT is the selected one.
+#   EXIT_LINE  from the 09:20 candle on, the first FINISHED candle whose LOW is above the sell-line (paid + costs) sells
+#              in the NEXT minute at that minute's LOW; if none does before 14:00, sell in the 14:00 minute at its LOW.
+#   EXIT_TWO   when the 09:19 candle has finished: its LOW above the sell-line -> sell in the 09:20 minute at its LOW;
+#              otherwise hold and sell in the 14:00 minute at its LOW.  Nothing in between is looked at.
+# Why these: 09:15-09:16 are the widest minutes of the day (selling there costs most); a trade in profit at 09:20 gains
+# nothing by waiting; a trade in loss at 09:20 tends to recover in the afternoon, most of it by 14:00.
+# History: the line from 09:16 (09:30 before), else 15:14, until 2026-10-03; every trade sold in the 09:16 minute for
+# one day (2026-10-04).  sell_by_rule() is the exit; simulate_exit() stays because onh_v5.py (another candidate) calls it.
+EXIT_START, EXIT_END = "09:20", "14:00"
+EXIT_LINE, EXIT_TWO = "above_line", "profit_0920"
+RULE_EXIT = EXIT_LINE            # the selected exit; the panel's variant key keeps its old name, 'first_exit'
+EXIT_LABEL = {EXIT_LINE: f"from {EXIT_START}, sell when a candle's low is above paid + costs; else sell at {EXIT_END}",
+              EXIT_TWO: f"in profit at {EXIT_START}: sell at {EXIT_START}; else sell at {EXIT_END}"}
 STEP = strike_step()             # 50 on NIFTY, 100 on SENSEX - read from the contract list
 LOTS = 1
 # The three entry checks, side by side.  One time-value limit is three different questions, and
@@ -130,7 +152,7 @@ AGREES, AGAINST, NO_HIST = "agrees with the day", "against the day", "no history
 ASIA_AGAINST, ASIA_WITH, ASIA_NO_READ = "against the day", "with the day", "no read (fewer than 4 open)"
 # THE REVERSE (the user, 2026-09-30): no scenario, no rescue, a big day on a nervous tape -> the OPPOSITE side.
 IVIX_NAME = "VIX"            # India VIX on local disk: VIX_candles.json (NSE_INDEX|India VIX), 1-minute bars
-REVERSE_MOVE = 0.6           # the day's move (15:14 close vs 09:15 open), at least this %
+REVERSE_MOVE = SMALL_MOVE    # entry 8: the day is not small - its move is at least this %
 REVERSE_IVIX = 17.0          # India VIX's 15:19 close (the same minute as the option price) at least this
 SIDE_TAG, IVIX_TAG = "side vs day", "India VIX"
 # THE HOLIDAY SKIP (the user, 2026-09-30, made part of THE RULE the same day): no trade on a night with fewer
@@ -141,6 +163,66 @@ HOLIDAY_TAG = "holiday night"
 WITH_DAY, AGAINST_DAY = "with the day", "against the day (reverse)"
 WHY_SCEN, WHY_RESCUE, WHY_REVERSE, WHY_NO = ("entry 1-6 (scenario A-F)", "entry 7 only (Asia)",
                                              "entry 8 (opposite side)", "no entry")
+# ENTRY 9 - THE BALANCE REVERSAL (the user, 2026-10-03: "keep this as entry 9").  Looked at only on a night entries 1-8
+# give no trade (none true, or a holiday night).  Auction market theory: when today's value has not left recent value
+# the day's move is given back overnight, so buy the OPPOSITE side.  Balance = today's value area overlaps
+# yesterday's, OR the 15:14 close is inside the value area of the previous five sessions taken together.
+# A value area = the price band holding 70% of the time, from 30-minute brackets of the candles up to 15:14.
+WHY_NINE = "entry 9 (balance, opposite side)"
+# THE WATCHLIST (the user, 2026-10-03): entries 8 and 9 are PARKED - they deepen the drawdown or work in one stretch
+# only - and are not part of the rule or of the rule report.  The rule is entries 1-7.  Turn one back on here ONLY
+# when the user says to add it; the code, the tags and the written steps follow these two switches.
+USE_ENTRY_8 = False
+W8_TEXT = "India VIX at 15:19 is 17 or more, the range is not normal, the day moved 0.3% or more, and more than half of the Asian markets that traded today moved our day's way"
+USE_ENTRY_9 = False
+# (Entry 10 was first a pair of opposite-side models, 10A gap exhaustion and 10C balance at the money to 12:00.  The user
+# removed it on 2026-10-03 - "10C is the most dangerous" - and the crude read, first numbered 11, became entry 10.)
+# ENTRY 10 (the user, 2026-10-03, watchlist) - THE CRUDE READ, a day-side entry like 1-7 and standing by itself: the day
+# moved SMALL_MOVE% or more, Asia went against the day, and crude oil is moving AGAINST the day (down on an UP day, up on
+# a DOWN day) -> buy the day's side.  Never on a holiday night.  Crude = CL futures, hourly bars: the last bar FINISHED
+# by 14:30 IST (09:00 UTC) against the last bar finished by 21:00 UTC the evening before.  The entry reads CRUDE_FILE
+# (or the path in the ONH_CRUDE_FILE environment variable) and is simply false on a night with no read.
+USE_ENTRY_10 = False
+WHY_TEN = "entry 10 (crude against the day)"
+CRUDE_FILE = os.path.join(LOCAL_DATA_DIR, "yahoo_CL_F_hourly.json")     # {"rows": [[unix seconds UTC of the bar start, o, h, l, c], ...]}
+CRUDE_STALE = 4 * 3600                                                  # a bar older than this is no read (market shut)
+
+
+def crude_reads(days: list[str]) -> dict[str, float]:
+    """{day: % move of crude from 21:00 UTC the evening before to 14:30 IST today}, from finished hourly bars only."""
+    path = os.environ.get("ONH_CRUDE_FILE") or CRUDE_FILE
+    import bisect
+    import json as _json
+    if "ONH_CRUDE_FILE" in os.environ:
+        blob = _json.load(open(path)) if os.path.exists(path) else None
+    else:
+        import py_funcs as _pf                       # the joining loader: with PYFUNCS_TEST_DATA=1 the
+        blob = _pf._local(os.path.basename(path))    # test_data copy's rows are joined on (holdout run, 2026-10-05)
+    if not blob or not blob.get("rows"):
+        print(f"  ! crude oil hourly bars not on local disk ({path}) - entry 10 is false every night")
+        return {}
+    rows = blob["rows"]
+    starts = [r[0] for r in rows]
+
+    def last_done(ts):                       # close of the last one-hour bar finished by ts, or None when stale
+        i = bisect.bisect_right(starts, ts - 3600) - 1
+        return rows[i][4] if i >= 0 and ts - starts[i] <= CRUDE_STALE else None
+    out = {}
+    for d in days:
+        y, m, dd = (int(x) for x in d.split("-"))
+        now = datetime(y, m, dd, 9, 0, tzinfo=timezone.utc).timestamp()
+        px = last_done(now)
+        ref = next((q for q in (last_done((datetime(y, m, dd, 21, 0, tzinfo=timezone.utc) - timedelta(days=b)).timestamp())
+                                for b in range(1, 6)) if q is not None), None)
+        if px is not None and ref:
+            out[d] = (px / ref - 1) * 100
+    return out
+TRADE_TAG = "v4 trades"              # yes = the rule trades the night (the entries switched on, off a holiday night)
+VALUE_SHARE, VALUE_BIN, BALANCE_DAYS = 0.70, 0.0002, 5      # 70% of the time; price bins of 0.02%; a 5-session composite
+# ENTRY 8 WAS REDEFINED on 2026-10-03 (the user: "it is the modified rule of 8"): India VIX at 15:19 >= REVERSE_IVIX,
+# the range NOT normal, the day NOT small (moved SMALL_MOVE% or more), and MORE than half of the open Asian markets moved
+# the day's way -> the OPPOSITE side.  It stands by itself on every session; entries 1-7 are still checked first.  The
+# first version (day move >= 0.6% and India VIX >= 17, only when 1-7 were false) lost when run alone.
 # The window is START_DATE .. END_DATE from py_funcs - one place for every strategy.
 # Do not shadow them here; a local copy is how one script silently ran a different period.
 # Only the strike ladder costs requests, and Upstox meters per second, per minute and per half
@@ -177,11 +259,12 @@ SETTINGS = [
     setting("confirm", "Direction check", kind="entry", mode="filter", default="rule",
             help="which nights the day's direction is traded on; 'off' trades every night",
             options=[
-                {"value": "rule", "label": "the v4 rule: at least one of entries 1-8 TRUE, never on a holiday night "
-                                           "(Asia thin or US shut)",
-                 "tag": {RULE_TAG: ["yes"], HOLIDAY_TAG: ["no"]}},
-                {"value": "rule_holidays", "label": "the v4 rule, holiday nights traded too (the 103-trade book)",
-                 "tag": {RULE_TAG: ["yes"]}},
+                {"value": "rule", "label": "the v4 rule: at least one of entries 1-7 TRUE, never on a holiday night"
+                                           + (" (plus the entries switched on from the watchlist)"
+                                              if USE_ENTRY_8 or USE_ENTRY_9 else ""),
+                 "tag": {TRADE_TAG: ["yes"]}},
+                {"value": "rule_holidays", "label": "the same entries, holiday nights traded too",
+                 "tag": {RULE_TAG: ["yes"], entry_tag("9"): ["no"]}},
                 {"value": "off", "label": "no check - every night", "tag": None}]
             if ENTRY_MODE is None else [
                 {"value": "rule", "label": f"entry {ENTRY_MODE} alone: both its conditions TRUE, never on a holiday night",
@@ -196,8 +279,9 @@ SETTINGS = [
                 {"value": "rank", "label": f"cheaper than {TV_RANK_KEEP} nights in 100",
                  "tag": {"tv vs recent": [PASS_RANK]}},
                 {"value": "off", "label": "no time-value check (the rule)", "tag": None}]),
-    setting("first_exit", "First exit candle", kind="exit", values=["09:16", "09:30", "10:00"],
-            default="09:30", help="earliest candle whose LOW may trigger the sale next morning"),
+    setting("first_exit", "Exit", kind="exit", default=RULE_EXIT,
+            options=[{"value": k, "label": EXIT_LABEL[k], "raw": k} for k in (EXIT_LINE, EXIT_TWO)],
+            help="how the option is sold the next session; 'paid + costs' is the sell-line"),
     setting("moneyness", "Strike depth", kind="strike", default=6, rerun=True,
             options=[{"value": v, "label": rung_label(v), "raw": v} for v in LADDER],
             help="every rung is priced on the same nights; --moneyness narrows the ladder"),
@@ -307,6 +391,58 @@ def direction_checks(full: dict[str, list[list]], days: list[str], d: str, side_
 
 
 ENTRY_MINUTES = {f"{m // 60:02d}:{m % 60:02d}" for m in range(9 * 60 + 15, 15 * 60 + 20)}   # 09:15 .. 15:19
+
+
+def tpo_brackets(rows: list[list]) -> list[tuple[float, float]]:
+    """(low, high) of each 30-minute bracket from 09:15, candles up to 15:14 only (what is known at the decision)."""
+    br: dict[int, list[float]] = {}
+    for r in rows:
+        if "09:15" <= r[0] <= SIGNAL_MIN:
+            b = br.setdefault((hhmm_minutes(r[0]) - 555) // 30, [r[3], r[2]])
+            b[0], b[1] = min(b[0], r[3]), max(b[1], r[2])
+    return [(lo, hi) for lo, hi in br.values()]
+
+
+def value_area(brackets: list[tuple[float, float]], binw: float) -> tuple[float, float]:
+    """(low, high) of the value area: count the brackets that traded at each price bin, start at the busiest bin
+    (the one nearest the middle on a tie) and widen toward the busier neighbour until VALUE_SHARE of the count is in."""
+    lo, hi = min(b[0] for b in brackets), max(b[1] for b in brackets)
+    n = int((hi - lo) / binw) + 1
+    tpo = [0] * n
+    for l, h in brackets:
+        for k in range(int((l - lo) / binw), int((h - lo) / binw) + 1):
+            tpo[k] += 1
+    top = max(tpo)
+    poc = min((k for k in range(n) if tpo[k] == top), key=lambda k: abs(k - (n - 1) / 2))
+    a = b = poc
+    got, total = tpo[poc], sum(tpo)
+    while got < VALUE_SHARE * total and (a > 0 or b < n - 1):
+        up, dn = (tpo[b + 1] if b < n - 1 else -1), (tpo[a - 1] if a > 0 else -1)
+        if up >= dn:
+            b += 1
+            got += up
+        else:
+            a -= 1
+            got += dn
+    return lo + a * binw, lo + (b + 1) * binw
+
+
+def balance_read(full: dict[str, list[list]], days: list[str], d: str, c1514: float) -> dict:
+    """Entry 9's two reads, from candles complete by 15:14: does today's value area overlap yesterday's, and is the
+    15:14 close inside the value area of the previous BALANCE_DAYS sessions together?"""
+    i = days.index(d)
+    if i < BALANCE_DAYS:
+        return {"ok": False, "overlap": False, "inside": False, "text": "no history yet"}
+    val, vah = value_area(tpo_brackets(full[d]), full[d][0][1] * VALUE_BIN)
+    prev = days[i - 1]
+    pval, pvah = value_area(tpo_brackets(full[prev]), full[prev][0][1] * VALUE_BIN)
+    cval, cvah = value_area([b for x in days[i - BALANCE_DAYS:i] for b in tpo_brackets(full[x])], c1514 * VALUE_BIN)
+    overlap = not (val > pvah or vah < pval)
+    inside = cval <= c1514 <= cvah
+    return {"ok": overlap or inside, "overlap": overlap, "inside": inside,
+            "text": f"today's value {val:,.0f}-{vah:,.0f}, yesterday's {pval:,.0f}-{pvah:,.0f} "
+                    f"({'overlap' if overlap else 'no overlap'}); {BALANCE_DAYS}-session value {cval:,.0f}-{cvah:,.0f}, "
+                    f"close {c1514:,.0f} ({'inside' if inside else 'outside'})"}
 PRE_RATIOS: dict[str, float] = {}  # {index: its close ratio to NIFTY over the sessions BEFORE the window}
 
 
@@ -422,6 +558,138 @@ def simulate_exit(exit_rows: list[list], line: float, first_exit: str, time_exit
     return {"bar": tb, "reason": "time exit", "trigger": None}
 
 
+def sell_by_rule(exit_rows: list[list], line: float, mode: str = RULE_EXIT) -> dict:
+    """THE EXIT, either of the two in the 'Exit' box (see EXIT_LINE / EXIT_TWO).  A sale decided by a FINISHED candle
+    fills in the NEXT traded minute at its LOW; a scheduled sale (09:20, 14:00) fills in that minute at its LOW.  A thin
+    contract that did not trade in the minute needed sells in the first minute after it that traded - a real trade at
+    the worst price of its minute, never an invented one.  No bar left to sell in -> no exit (no data)."""
+    at = lambda t: next((r for r in exit_rows if r[0] >= t), None)          # noqa: E731  first traded minute at or after t
+    def timed(trigger=None):
+        tb = at(EXIT_END)
+        if tb is None:
+            return {"bar": None, "reason": f"no option bar at or after {EXIT_END} on the exit day", "trigger": trigger}
+        return {"bar": tb, "reason": f"{EXIT_END} exit" + ("" if tb[0] == EXIT_END else ", first trade after it"), "trigger": trigger}
+    if mode == EXIT_LINE:
+        for r in exit_rows:
+            if EXIT_START <= r[0] < EXIT_END and r[3] > line:
+                nxt = next((x for x in exit_rows if x[0] > r[0]), None)
+                if nxt is None:
+                    return {"bar": None, "reason": f"no option bar after the {r[0]} candle", "trigger": r}
+                return {"bar": nxt, "reason": "low above the sell-line", "trigger": r}
+        return timed()
+    if mode == EXIT_TWO:
+        seen = next((r for r in exit_rows if r[0] == prev_minute(EXIT_START)), None)       # the candle that has just finished
+        if seen is not None and seen[3] > line:
+            b = at(EXIT_START)
+            if b is None:
+                return {"bar": None, "reason": f"no option bar at or after {EXIT_START} on the exit day", "trigger": seen}
+            return {"bar": b, "reason": f"in profit at {EXIT_START}", "trigger": seen}
+        return timed(seen)
+    raise ValueError(f"unknown exit {mode!r}")
+
+
+def exit_story(symbol: str, paid: float, qty: int, line: float, day: str, exit_day: str, exit_rows: list[list],
+               ex: dict, trade: dict, mode: str = RULE_EXIT) -> str:
+    """One trade's exit told in plain sentences with its own numbers: how the sell-line is worked out, what the candles
+    did, where it was sold, the result.  (The user, 2026-10-04: "for above paid, work with a real example in plain
+    English in the report".)"""
+    c = option_costs(paid * qty, line * qty, day=day, sell_day=exit_day)
+    eb, tg = ex["bar"], ex["trigger"]
+    txt = (f"Bought {symbol} on {_long(day)} at {_n(paid)} a unit, {qty} units = Rs {_n(paid * qty, 0)}. "
+           f"SELL-LINE: the costs of buying, and of selling at the sell-line, are brokerage Rs {_n(c['brokerage'])}, sale tax "
+           f"(STT) Rs {_n(c['stt'])}, exchange and SEBI charges Rs {_n(c['exchange'] + c['sebi'])}, stamp duty Rs "
+           f"{_n(c['stamp'])} and GST Rs {_n(c['gst'])} - Rs {_n(c['total'])} in all, which is Rs {_n(line - paid)} a "
+           f"unit. So the sell-line is {_n(paid)} + {_n(line - paid)} = {_n(line)}; any sale above {_n(line)} is a "
+           f"profit after every cost. ")
+    watched = [r for r in exit_rows if EXIT_START <= r[0] < EXIT_END]
+    if mode == EXIT_LINE and ex["reason"].startswith("low above"):
+        before = [r for r in watched if r[0] < tg[0]]
+        if before:
+            top = max(before, key=lambda r: r[3])
+            txt += (f"NEXT DAY, {_long(exit_day)}: from the {EXIT_START} candle to the {before[-1][0]} candle no candle's lowest "
+                    f"price was above the sell-line (the highest low was {_n(top[3])}, at {top[0]}). Then the {tg[0]} candle's "
+                    f"lowest price was {_n(tg[3])} - above {_n(line)}. ")
+        else:
+            txt += (f"NEXT DAY, {_long(exit_day)}: the {tg[0]} candle - the first one watched - had its lowest price at "
+                    f"{_n(tg[3])}, already above {_n(line)}. ")
+        txt += f"So we sold in the next minute, {eb[0]}, at that minute's lowest price, {_n(eb[3])}. "
+    elif mode == EXIT_LINE:
+        top = max(watched, key=lambda r: r[3]) if watched else None
+        txt += (f"NEXT DAY, {_long(exit_day)}: from {EXIT_START} to {prev_minute(EXIT_END)} no candle's lowest price got above "
+                f"the sell-line" + (f" (the highest low was {_n(top[3])}, at {top[0]})" if top else "")
+                + f". So we sold in the {eb[0]} minute at that minute's lowest price, {_n(eb[3])}. ")
+    elif ex["reason"].startswith("in profit"):
+        txt += (f"NEXT DAY, {_long(exit_day)}: when the {tg[0]} candle finished, its lowest price was {_n(tg[3])} - above "
+                f"{_n(line)}, so the trade was in profit. We sold in the {eb[0]} minute at that minute's lowest price, {_n(eb[3])}. ")
+    else:
+        txt += (f"NEXT DAY, {_long(exit_day)}: when the {prev_minute(EXIT_START)} candle finished, its lowest price was "
+                + (f"{_n(tg[3])} - not above {_n(line)}" if tg else "not known (the option had not traded)")
+                + f", so the trade was not in profit. We held and sold in the {eb[0]} minute at that minute's lowest price, {_n(eb[3])}. ")
+    txt += (f"RESULT: ({_n(eb[3])} - {_n(paid)}) x {qty} = Rs {trade['gross']:+,.0f}, less the costs of Rs {_n(trade['costs'])} "
+            f"= Rs {trade['net']:+,.0f}. (The costs differ a little from the sell-line's because the sale tax is charged on "
+            "the actual sale price.)")
+    if trade["net"] <= 0 and ex["reason"].startswith(("low above", "in profit")):
+        txt += " (The sale minute's lowest price dipped under the sell-line, so this one ended a little below zero.)"
+    return txt
+
+
+def exit_steps() -> list[str]:
+    """The exit as plain steps, the selected exit first (the same words in every index's report)."""
+    other = EXIT_TWO if RULE_EXIT == EXIT_LINE else EXIT_LINE
+    line_txt = (f"The next session, from the {EXIT_START} candle onward, watch each finished 1-minute candle. As soon as a "
+                "candle's LOWEST price is above the sell-line, sell in the next minute. (The backtest assumes you got the "
+                f"lowest price of that minute.) A trade that is already above the sell-line at {EXIT_START} is sold at once, in "
+                f"the minute after. If no candle's lowest price gets above the sell-line before {EXIT_END}, sell in the "
+                f"{EXIT_END} minute, whatever the price.")
+    two_txt = (f"The next session, when the {prev_minute(EXIT_START)} candle has finished: if its LOWEST price is above the "
+               f"sell-line, the trade is in profit - sell in the {EXIT_START} minute. If not, hold and sell in the {EXIT_END} "
+               "minute, whatever the price. The candles in between are not looked at. (The backtest assumes you got the "
+               "lowest price of the minute you sell in.)")
+    body = {EXIT_LINE: line_txt, EXIT_TWO: two_txt}
+    return [
+        "Work out the SELL-LINE: the price you paid for one unit, plus all the costs of buying and selling one unit "
+        "(brokerage, sale tax, exchange charges, stamp duty and GST). Above the sell-line the trade is in profit after "
+        "every cost; 'above paid + costs' means exactly this. The real nights at the end of these steps work it out "
+        "with their own numbers. The sale tax is charged at the rate in force on the day you sell: 0.10% of the premium "
+        "until 31 March 2026, 0.15% from 1 April 2026.",
+        f"EXIT - THE SELECTED EXIT is '{EXIT_LABEL[RULE_EXIT]}'. " + body[RULE_EXIT]
+        + f" There is no stop-loss and no profit target, and nothing is held after {EXIT_END}.",
+        f"THE OTHER EXIT in the report's 'Exit' box (not the selected one) is '{EXIT_LABEL[other]}'. " + body[other],
+    ]
+
+
+def exit_limit() -> str:
+    other = EXIT_TWO if RULE_EXIT == EXIT_LINE else EXIT_LINE
+    return (f"THE EXIT (the user, 2026-10-04). Selected: {EXIT_LABEL[RULE_EXIT]}. The sell-line = the price paid + the "
+            "round-trip costs per unit (worked out with the sale at the line; the sale tax at the rate of the sale's day). "
+            "A candle 'above the sell-line' is a FINISHED candle whose LOW is above it, so the sale fills in the NEXT "
+            "minute at that minute's LOW - which can be a little under the line. A scheduled sale "
+            f"({EXIT_START} or {EXIT_END}) fills in that minute at its LOW. A contract that did not trade in the minute "
+            f"needed sells in the first minute after it that traded. The 'Exit' box also offers: {EXIT_LABEL[other]}. No "
+            f"stop, no target; nothing is held after {EXIT_END}.")
+
+
+def exit_examples() -> list[str]:
+    """Real nights of this index at the rule's strike and the selected exit, one for each way the exit can end."""
+    nights = [x for _d, x in sorted(DETAILS.items()) if x.get("exit_story") and (
+        (x["rule_ok"] and not x["holiday"]) if ENTRY_MODE is None else x.get("entry_on"))]
+    m = lambda t: hhmm_minutes(t)                                            # noqa: E731
+    if RULE_EXIT == EXIT_LINE:
+        cases = [("sold as soon as the day's watch began", lambda x: x["exit_reason"].startswith("low above") and x["trigger"][0] == EXIT_START),
+                 ("sold later, when the price came back above the sell-line", lambda x: x["exit_reason"].startswith("low above") and m(x["trigger"][0]) >= m("09:45")),
+                 (f"never above the sell-line - sold at {EXIT_END}", lambda x: x["exit_reason"].startswith(EXIT_END))]
+    else:
+        cases = [(f"in profit at {EXIT_START} - sold at {EXIT_START}", lambda x: x["exit_reason"].startswith("in profit")),
+                 (f"not in profit at {EXIT_START} - held and sold at {EXIT_END}, at a profit", lambda x: x["exit_reason"].startswith(EXIT_END) and x["net"] > 0),
+                 (f"not in profit at {EXIT_START} - held and sold at {EXIT_END}, at a loss", lambda x: x["exit_reason"].startswith(EXIT_END) and x["net"] <= 0)]
+    out = []
+    for lab, f in cases:
+        hit = next((x for x in nights if f(x)), None)
+        if hit:
+            out.append(f"A REAL NIGHT ({instrument()}) - {lab}. " + hit["exit_story"])
+    return out
+
+
 # ---------------------------------------------------------------------------
 # fetch + main
 # ---------------------------------------------------------------------------
@@ -462,6 +730,7 @@ async def run(frm: date, to: date, settings: list[dict]):
             print(f"  ! India VIX: {exc}")
         print(f"India VIX 15:19 reads on local disk: {len(ivix)} sessions" if ivix else
               f"  ! India VIX ({IVIX_NAME}_candles.json): no 1-minute bars on local disk - the reverse never fires")
+        crude = crude_reads(sorted(sessions)) if USE_ENTRY_10 else {}
         us_bars = await yahoo_daily(US_TICKER, frm - timedelta(days=TREND_LOOKBACK_DAYS), fetch_to) or []
         us_days = {b[0] for b in us_bars}
         us_span = (us_bars[0][0], us_bars[-1][0]) if us_bars else None
@@ -494,7 +763,7 @@ async def run(frm: date, to: date, settings: list[dict]):
         print(f"strike ladder {[rung_label(v) for v in rungs]}: "
               f"{fetch_estimate(len(traded) * len(rungs) * 2)} "
               f"(fewer in practice - one night's exit day is the next night's entry day). "
-              f"First-exit candles {firsts} are free: the same bars, re-scanned.")
+              f"Exits priced: {', '.join(firsts)}.")
         for d in traded:
             rows = full[d]
             side_opt, why, o915, c1514 = signal(rows)
@@ -518,7 +787,8 @@ async def run(frm: date, to: date, settings: list[dict]):
             asia_note = (f"{asia_r['agree']} of {asia_r['open']} Asian markets moved with the day"
                          if asia_r["open"] else "no Asian market open")
             iv = ivix.get(d)
-            reverse_pre = checks["day move %"] >= REVERSE_MOVE and iv is not None and iv >= REVERSE_IVIX
+            reverse_pre = (iv is not None and iv >= REVERSE_IVIX and checks["range ratio"] is not None
+                           and not checks["normal"] and not checks["small"] and asia_r["tag"] == ASIA_WITH)
             iv_tag = "unknown" if iv is None else bucket(iv, [12, 14, 17], ["below 12", "12-14", "14-17", "17 and above"])
             us_closed = us_span is not None and us_span[0] <= d <= us_span[1] and d not in us_days
             holiday = asia_r["open"] < ASIA_MIN_OPEN or us_closed
@@ -526,6 +796,9 @@ async def run(frm: date, to: date, settings: list[dict]):
             base.update({ASIA_TAG: asia_r["tag"], "Asian markets open": asia_r["open"],
                          "Asian markets with the day": asia_r["agree"], IVIX_TAG: iv,
                          HOLIDAY_TAG: holiday_why if holiday else "no"})
+            bal = balance_read(full, days, d, c1514)
+            base["balance (entry 9)"] = ("value overlaps yesterday" if bal["overlap"] else "") + (
+                " + " if bal["overlap"] and bal["inside"] else "") + ("close inside the 5-day value" if bal["inside"] else "") or "no"
             later = [x for x in days if x > d]
             if not later:
                 skips.append(f"{d}: no later complete session (exit day unknown)")
@@ -572,13 +845,29 @@ async def run(frm: date, to: date, settings: list[dict]):
                 scen = dict(checks["scen"], E=checks["late pull-back"] and share is not None and share <= TV_MAX_SHARE)
                 fired = [k for k in "ABCDEF" if scen[k]]
                 scen_ok = bool(fired)
-                reverse_ok = reverse_pre if ENTRY_MODE == "8" else (not scen_ok and not rescue_ok and reverse_pre)
+                reverse_ok = reverse_pre if ENTRY_MODE == "8" else (
+                    USE_ENTRY_8 and not scen_ok and not rescue_ok and reverse_pre)
                 entry_true = {"1": scen["A"], "2": scen["B"], "3": scen["C"], "4": scen["D"], "5": scen["E"],
                               "6": scen["F"], "7": rescue_ok, "8": reverse_pre}
                 rule_ok = scen_ok or rescue_ok or reverse_ok
-                why = WHY_SCEN if scen_ok else (WHY_RESCUE if rescue_ok else (WHY_REVERSE if reverse_ok else WHY_NO))
+                # entry 10 (watchlist): a day-side entry of its own - checked with entries 1-7, before 8 and 9
+                cr = crude.get(d)
+                eleven_ok = (USE_ENTRY_10 and ENTRY_MODE is None and not holiday and cr is not None
+                             and cr * (1 if side_opt == "CE" else -1) < 0 and not checks["small"]
+                             and asia_r["tag"] == ASIA_AGAINST)
+                entry_true["10"] = eleven_ok
+                if eleven_ok and reverse_ok:           # cannot happen (8 needs Asia with the day); the day's side wins if it did
+                    reverse_ok = False
+                # entry 9: only on a night entries 1-8 give no trade (none true, or a holiday night); not in a
+                # single-entry report
+                nine_ok = USE_ENTRY_9 and ENTRY_MODE is None and bal["ok"] and (holiday or not (rule_ok or eleven_ok))
+                entry_true["9"] = nine_ok
+                trades_tonight = nine_ok or ((rule_ok or eleven_ok) and not holiday)
+                why = WHY_NINE if nine_ok else WHY_SCEN if scen_ok else (
+                    WHY_TEN if eleven_ok and not rescue_ok and not reverse_ok else
+                    WHY_RESCUE if rescue_ok else (WHY_REVERSE if reverse_ok else WHY_NO))
                 trade_side = side_opt
-                if reverse_ok:
+                if reverse_ok or nine_ok:
                     # THE REVERSE: the opposite side, the same depth ITM for THAT side, its own 15:19 / 15:20 bars.
                     # Only this contract is priced tonight, so 'every night' carries the reverse on these nights.
                     trade_side = "PE" if side_opt == "CE" else "CE"
@@ -602,10 +891,11 @@ async def run(frm: date, to: date, settings: list[dict]):
                 if no_buy:
                     skips.append(f"{tag}: {no_buy}")
                     if steps == chart_rung:
-                        wanted = rule_ok if ENTRY_MODE is None else bool(entry_true[ENTRY_MODE])
-                        decided = holiday or not wanted
+                        wanted = (rule_ok or eleven_ok) if ENTRY_MODE is None else bool(entry_true[ENTRY_MODE])
+                        decided = (holiday or not wanted) and not nine_ok
                         seen = {"status": "declined" if decided else "no data", "facts": dict(base),
-                                "note": (f"holiday night ({holiday_why}) - no trade; also " if holiday and wanted else
+                                "note": ("" if nine_ok else
+                                         f"holiday night ({holiday_why}) - no trade; also " if holiday and wanted else
                                          ("no entry is true" if ENTRY_MODE is None else f"entry {ENTRY_MODE} is FALSE")
                                          + " - no trade; also " if not wanted else "") + no_buy}
                     continue
@@ -628,17 +918,24 @@ async def run(frm: date, to: date, settings: list[dict]):
                     tvc["tv share value"] = f"{share:.6f}"         # carrier for add_rank_tags
                 if steps == chart_rung:
                     seen = {
-                        "status": "traded" if rule_ok else "declined",
-                        "note": (f"bought {c['trading_symbol']} in the 15:20 minute - scenario {'+'.join(fired)}"
+                        "status": "traded" if rule_ok or nine_ok or eleven_ok else "declined",
+                        "note": (f"bought {c['trading_symbol']} in the 15:20 minute - ENTRY 10: day move "
+                                 f"{checks['day move %']:.2f}%, {asia_note}, crude oil {cr:+.2f}% (against the day)"
+                                 if eleven_ok and not rule_ok else
+                                 f"bought {c['trading_symbol']} in the 15:20 minute - ENTRY 9, the opposite side: "
+                                 + ("a holiday night" if holiday else "entries 1-8 all false") + f", balance ({bal['text']})"
+                                 if nine_ok else
+                                 f"bought {c['trading_symbol']} in the 15:20 minute - scenario {'+'.join(fired)}"
                                  if scen_ok else
                                  f"bought {c['trading_symbol']} in the 15:20 minute - Asia rescue: {asia_note}, "
                                  f"close location {loc_dir:.2f}" if rescue_ok else
-                                 f"bought {c['trading_symbol']} in the 15:20 minute - REVERSE, the opposite side: day "
-                                 f"move {checks['day move %']:.2f}%, India VIX {iv:.1f}, no scenario, no rescue" if reverse_ok else
+                                 f"bought {c['trading_symbol']} in the 15:20 minute - ENTRY 8, the opposite side: India "
+                                 f"VIX {iv:.1f}, range {checks['range ratio']:.2f} x the usual, day move "
+                                 f"{checks['day move %']:.2f}%, {asia_note}; entries 1-7 all false" if reverse_ok else
                                  f"no scenario A-F, no Asia rescue ({asia_r['tag']}: {asia_note}; close "
                                  f"location {loc_dir:.2f}), no reverse (day move {checks['day move %']:.2f}%, India VIX "
-                                 f"{'unknown' if iv is None else f'{iv:.1f}'}) - the trade exists, set the direction check "
-                                 f"to off to count it"),
+                                 f"{'unknown' if iv is None else f'{iv:.1f}'}), no entry 9 (no balance: {bal['text']}) "
+                                 f"- the trade exists, set the direction check to off to count it"),
                         "facts": dict(base, **{"direction": ("up day" if side_opt == "CE" else "down day")
                                                             + f": buy {trade_side}",
                                                "side": trade_side, "strike": strike, "premium 15:19": prem,
@@ -647,7 +944,7 @@ async def run(frm: date, to: date, settings: list[dict]):
                                                "tv % of premium (option bought)": None if share is None else share * 100,
                                                "tv % of the day-side option (entry 5 reads this)":
                                                    None if day_leg["share"] is None else day_leg["share"] * 100})}
-                    if holiday and rule_ok:      # the rule never trades a holiday night; the trade exists for 'every night'
+                    if holiday and rule_ok and not nine_ok:   # the rule never trades a holiday night; the trade exists for 'every night'
                         seen["status"] = "declined"
                         seen["note"] = (f"holiday night ({holiday_why}) - the rule does not trade it; would have "
                                         + seen["note"].replace("bought", "bought", 1))
@@ -663,9 +960,11 @@ async def run(frm: date, to: date, settings: list[dict]):
                                       holiday_why=holiday_why, spot=spot, day_leg=day_leg, fired=fired, why=why,
                                       rule_ok=rule_ok, trade_side=trade_side, strike=strike, expiry=str(c["expiry"]),
                                       symbol=c["trading_symbol"], paid=entry_bar[2], qty=qty, line=line,
-                                      tv_share=share, rescue_ok=rescue_ok, reverse_ok=reverse_ok)
+                                      entry_on=(ENTRY_MODE is not None and bool(entry_true[ENTRY_MODE]) and not holiday),
+                                      tv_share=share, rescue_ok=rescue_ok, reverse_ok=reverse_ok, nine_ok=nine_ok,
+                                      bal=bal)
                 for first in firsts:
-                    ex = simulate_exit(xrows, line, first)
+                    ex = sell_by_rule(xrows, line, first)
                     if ex["bar"] is None:
                         skips.append(f"{tag} exit>={first}: {ex['reason']} ({c['trading_symbol']}, {exit_day})")
                         continue
@@ -688,7 +987,8 @@ async def run(frm: date, to: date, settings: list[dict]):
                         target=round(line, 2), mfe=mfe, mae=mae, expiry=c["expiry"], option_type=trade_side,
                         variant={"moneyness": steps, "first_exit": first},
                         tags={"direction": ("up day" if side_opt == "CE" else "down day") + f": buy {trade_side}",
-                              SIDE_TAG: AGAINST_DAY if reverse_ok else WITH_DAY, IVIX_TAG: iv_tag,
+                              SIDE_TAG: AGAINST_DAY if reverse_ok or nine_ok else WITH_DAY, IVIX_TAG: iv_tag,
+                              TRADE_TAG: "yes" if trades_tonight else "no",
                               HOLIDAY_TAG: "yes" if holiday else "no",
                               **{entry_tag(k): "yes" if v else "no" for k, v in entry_true.items()},
                               TREND_TAG: checks[TREND_TAG], RULE_TAG: "yes" if rule_ok else "no", WHY_TAG: why,
@@ -703,15 +1003,14 @@ async def run(frm: date, to: date, settings: list[dict]):
                              + (f"time value {share * 100:.1f}% of the 15:19 premium {prem:.2f} (intrinsic "
                                 f"{intrinsic:.2f})" if share is not None else "no 15:19 option price, so no time value")
                              + (f"; the day-side option's time value (entry 5) {day_leg['share'] * 100:.1f}%"
-                                if reverse_ok and day_leg["share"] is not None else "")
+                                if (reverse_ok or nine_ok) and day_leg["share"] is not None else "")
                              + f"; sell-line (paid + costs, sale tax at the {exit_day} rate) {line:.2f} drawn as "
-                               f"'target'; exits scanned from {first}"))
+                               f"'target'; sold in the {exit_bar[0]} minute ({ex['reason']})"))
                     if steps == chart_rung and first == rule_first and d in DETAILS:
-                        lows = [r for r in xrows if first <= r[0] < TIME_EXIT]
-                        best = max(lows, key=lambda r: r[3]) if lows else None
                         DETAILS[d].update(trigger=ex["trigger"], exit_bar=exit_bar, exit_reason=ex["reason"],
                                           gross=trades[-1]["gross"], costs=trades[-1]["costs"], net=trades[-1]["net"],
-                                          best_low=best)
+                                          exit_story=exit_story(c["trading_symbol"], entry_px, qty, line, d, exit_day,
+                                                                xrows, ex, trades[-1], first))
                 if steps == chart_rung:      # only the charted rung is kept: holding all seven
                     sym = c["trading_symbol"]    # cost 365 MB of RAM for charts build_payload drops
                     option_sessions.setdefault(sym, {})[d] = orows
@@ -761,8 +1060,9 @@ ENTRY_POINTS = [
     ("5", "scenario E", "a late pull-back", f"time value {TV_MAX_SHARE * 100:.0f}% or less", "pull", "tv", True),
     ("6", "scenario F", "a small day", "a middle close", "small", "middle", True),
     ("7", "Asia", "at most half of the Asian markets moved our day's way", "a strong close", "asia", "strong", True),
-    ("8", "opposite side", f"the day moved {REVERSE_MOVE}% or more", f"India VIX at 15:19 is {REVERSE_IVIX:.0f} or more",
-     "move", "vix", False),
+    ("8", "opposite side", f"India VIX at 15:19 is {REVERSE_IVIX:.0f} or more and the range is not normal",
+     f"the day moved {REVERSE_MOVE}% or more and more than half of the Asian markets moved our day's way",
+     "nervous", "pushed", False),
 ]
 
 
@@ -781,10 +1081,16 @@ def _parts(x: dict) -> dict[str, tuple[bool, str]]:
         "middle": (MIDDLE_CLOSE[0] <= loc < MIDDLE_CLOSE[1], f"close location {loc:.2f}"),
         "small": (bool(ck["small"]), f"moved {ck['day move %']:.2f}%"),
         "pull": (bool(ck["late pull-back"]), f"14:59 {_n(ck['late close'])} -> 15:14 {_n(c)}"),
-        "tv": (dl["share"] <= TV_MAX_SHARE, f"time value {dl['share'] * 100:.1f}%"),
+        "tv": (dl["share"] is not None and dl["share"] <= TV_MAX_SHARE,
+               f"time value {dl['share'] * 100:.1f}%" if dl["share"] is not None else "no 15:19 option price"),
         "asia": (a["open"] >= ASIA_MIN_OPEN and a["agree"] / a["open"] <= ASIA_MAX_AGREE,
                  f"{a['agree']} of {a['open']} Asian markets moved our way"),
         "move": (ck["day move %"] >= REVERSE_MOVE, f"moved {ck['day move %']:.2f}%"),
+        "nervous": (x["iv"] is not None and x["iv"] >= REVERSE_IVIX and ck["range ratio"] is not None and not ck["normal"],
+                    f"India VIX {_n(x['iv'])}, range {ck['range ratio']:.2f} x the usual" if ck["range ratio"] is not None
+                    else f"India VIX {_n(x['iv'])}, no 20-session average yet"),
+        "pushed": (not ck["small"] and a["open"] >= ASIA_MIN_OPEN and a["agree"] / a["open"] > ASIA_MAX_AGREE,
+                   f"moved {ck['day move %']:.2f}%, {a['agree']} of {a['open']} Asian markets moved our way"),
         "vix": (x["iv"] is not None and x["iv"] >= REVERSE_IVIX, f"India VIX {_n(x['iv'])}"),
     }
 
@@ -797,7 +1103,7 @@ def _entry_true(x: dict, e: tuple) -> bool:
 def _entries(x: dict) -> tuple[list[str], bool]:
     """(numbers of entries 1-7 that are true, is entry 8 true) - entry 8 counts only when 1-7 are all false."""
     ones = [e[0] for e in ENTRY_POINTS[:7] if _entry_true(x, e)]
-    return ones, (not ones) and _entry_true(x, ENTRY_POINTS[7])
+    return ones, (USE_ENTRY_8 or ENTRY_MODE == "8") and (not ones) and _entry_true(x, ENTRY_POINTS[7])
 
 
 def _buy(up: bool, with_day: bool) -> str:
@@ -873,6 +1179,12 @@ def _entry_example(e: tuple, x: dict) -> str:
             moves = ", ".join(f"{m} {v:+.2f}%" for m, v in a["moves"].items())
             return (f"Asia today (each market's close against its previous close): {moves}. {a['agree']} of the "
                     f"{a['open']} markets that traded moved {way} like our day, which is at most half.")
+        if k == "nervous":
+            return (f"India VIX at 15:19 was {_n(x['iv'])}, which is {REVERSE_IVIX:.0f} or more, and today's range was "
+                    f"{ck['range ratio']:.2f} times the usual, which is not normal.")
+        if k == "pushed":
+            return (f"The day moved {ck['day move %']:.2f}%, which is {REVERSE_MOVE}% or more, and {a['agree']} of the "
+                    f"{a['open']} Asian markets that traded moved {way} like our day, which is more than half.")
         if k == "move":
             return f"The day moved {ck['day move %']:.2f}%, which is {REVERSE_MOVE}% or more."
         if k == "vix":
@@ -904,14 +1216,12 @@ def _entry_example(e: tuple, x: dict) -> str:
         f"sell-line was {_n(x['line'])}.")
     if "exit_bar" in x:
         eb, tg = x["exit_bar"], x.get("trigger")
-        if tg:
+        if x["exit_reason"].startswith(("low above", "in profit")):
             lines.append(f"On {_long(x['exit_day'])} the {tg[0]} candle's low ({_n(tg[3])}) was above the sell-line, so we sold "
                          f"in the {eb[0]} minute at {_n(eb[3])}.")
         else:
-            bl = x.get("best_low")
-            lines.append(f"On {_long(x['exit_day'])} no candle's low got above the sell-line"
-                         + (f" (the best was {_n(bl[3])} at {bl[0]})" if bl else "")
-                         + f", so we sold in the 15:14 minute at {_n(eb[3])}.")
+            lines.append(f"On {_long(x['exit_day'])} the sell-line was not reached, so we sold in the {eb[0]} minute at "
+                         f"{_n(eb[3])}.")
         lines.append(f"Result after costs: Rs {x['net']:+,.0f} ({'a profit' if x['net'] > 0 else 'a loss'}).")
     return "\n".join(lines)
 
@@ -937,14 +1247,16 @@ def rule_sections(with_examples: bool = True) -> list[dict]:
         "- Asia: look at the five Asian markets - Nikkei 225 (Japan), Hang Seng (Hong Kong), KOSPI (Korea), Shanghai "
         "(China) and ASX 200 (Australia). A market 'traded today' if it had a normal session today, not a local "
         f"holiday. If fewer than {ASIA_MIN_OPEN} of the 5 traded today, there is no trade today.\n"
-        "- US: we hold the option overnight, and tonight's US session (New York 09:30 to 16:00, which is 19:00 to 01:30 "
-        "India time in the US summer and 20:00 to 02:30 in the US winter) is the main thing that moves our index's "
-        "opening price tomorrow. If the US market is closed tonight, there is no trade today. In this backtest that "
+        "- US: on a normal night the US market trades WHILE we hold the option. Tonight's US session (New York 09:30 to "
+        "16:00, which is 19:00 to 01:30 India time in the US summer and 20:00 to 02:30 in the US winter) starts after our "
+        "15:20 buy, ends before our sale the next morning, and is the main thing that moves our index's opening price "
+        "tomorrow. If the US market is closed on today's date (a US holiday), there is no US session in the night we hold, "
+        "so there is no trade today. A normal Friday is NOT a holiday night: the US trades on Friday night. In this backtest that "
         "happened on 1 January (New Year), 19 January (Martin Luther King Day), 16 February (Presidents' Day), 25 May "
         "(Memorial Day), 19 June (Juneteenth) and 3 July (Independence Day), plus Sunday 1 February (India's Budget-day "
         "session, a weekend in the US).\n"
         "Why skip these nights: with the region or the US shut there is little to carry the index overnight, so the "
-        "option rarely gets far above the sell-line by the next morning. The losses are normal size, the wins are tiny. "
+        "option rarely gains much by the next morning. The losses are normal size, the wins are tiny. "
         "(Each index's holiday-night results in this backtest are in the assumptions.)",
         "Work out these facts about today:\n"
         f"- Small day: the 15:14 close is less than {SMALL_MOVE}% away from the 09:15 open, up or down. (Open 25,000: a "
@@ -982,22 +1294,46 @@ def rule_sections(with_examples: bool = True) -> list[dict]:
         "the index must also have a strong close for entry 7 to be true.\n"
         "  Why: when Asia went the other way and our index still closed near its best point, the index's own move "
         "tended to carry on overnight.",
-        f"Only if entries 1 to 7 are all false, check entry 8: the day moved {REVERSE_MOVE}% or more, and India VIX at "
-        f"15:19 is {REVERSE_IVIX:.0f} or more. If both are true, buy the other way round: a PE on an UP day, a CE on a "
-        "DOWN day. If entry 8 is false too, there is no trade today.",
+        f"Only if entries 1 to 7 are all false, check entry 8. It needs all four of these: India VIX at 15:19 is "
+        f"{REVERSE_IVIX:.0f} or more; the range is NOT normal; the day moved {REVERSE_MOVE}% or more; and MORE than half of "
+        "the Asian markets that traded today moved our day's way. If all four are true, buy the other way round: a PE "
+        "on an UP day, a CE on a DOWN day.",
+        "Only if entries 1 to 8 give no trade - none of them is true, or it is a holiday night - check entry 9, the "
+        "balance check. First find today's value area: split the day up to 15:14 into 30-minute blocks, and for every "
+        "price count how many blocks traded there; the value area is the price band around the busiest price that "
+        "holds 70% of that count. Do the same for yesterday, and for the previous five sessions taken together.\n"
+        "- Balance A: today's value area overlaps yesterday's value area.\n"
+        "- Balance B: the 15:14 close is inside the value area of the previous five sessions.\n"
+        "If A or B is true, the market is in balance and the day's move tends to be given back overnight, so buy the "
+        "other way round: a PE on an UP day, a CE on a DOWN day. If entry 9 is false too, there is no trade today.",
         f"Choose the contract. Round the index's 15:19 close to {rnd}: that is the at-the-money strike. For a CE go "
         f"{below} below it; for a PE go the same distance above it. Use the nearest expiry that is at least one day "
         "after tomorrow's session.",
         "Buy one lot in the 15:20 minute. (The backtest assumes you paid the highest price of that minute.) If the "
         "option did not trade at all in the 15:20 minute, the backtest has nothing to buy at, so there is no trade "
         "that night.",
-        "Work out the sell-line: the price you paid plus all the costs of buying and selling (brokerage, taxes and "
-        "exchange charges), per unit. The sale tax is charged at the rate in force on the day you sell: 0.10% of the "
-        "premium until 31 March 2026, 0.15% from 1 April 2026. Above the sell-line the trade is in profit after costs.",
-        "The next day, from the 09:30 candle onward, watch each 1-minute candle. As soon as a candle's lowest price is "
-        "above the sell-line, sell in the next minute. (The backtest assumes you got the lowest price of that minute.)",
-        f"If no candle gets above the sell-line by {TIME_EXIT}, sell in the {TIME_EXIT} minute. There is no stop-loss and "
-        "no profit target."]}
+        *exit_steps()]}
+    if not (USE_ENTRY_8 or ENTRY_MODE == "8"):      # entry 8 is on the watchlist: its step becomes the 'no trade' line
+        k8 = next(i for i, x in enumerate(steps["items"]) if x.startswith("Only if entries 1 to 7 are all false"))
+        steps["items"][k8] = "If none of the seven entries is true, there is no trade today."
+        steps["items"] = [x.replace(", plus two prices read from the 15:19 candle: the option's price and India VIX",
+                                    ", plus the option's price read from the 15:19 candle")
+                           .replace(" Asia is used in only two places", " Asia is used in only two places")
+                           .replace("\n- India VIX: its value at 15:19.", "") for x in steps["items"]]
+    if USE_ENTRY_10:            # a day-side entry: it is listed with entries 1 to 7
+        k7 = next(i for i, x in enumerate(steps["items"]) if x.startswith("Check entries 1 to 7"))
+        steps["items"].insert(k7 + 1,
+            f"Check entry 10, the crude read. It needs all three of these: the day moved {SMALL_MOVE}% or more; at most half "
+            "of the Asian markets that traded today moved our way; and crude oil is moving AGAINST our day - down on an UP "
+            "day, up on a DOWN day (crude futures at 14:30 against their price at 02:30 this morning). If all three are "
+            "true, buy a CE on an UP day or a PE on a DOWN day, exactly as for entries 1 to 7.")
+        steps["items"] = [x.replace("If none of the seven entries is true, there is no trade today.",
+                                    "If none of entries 1 to 7 and 10 is true, there is no trade today.") for x in steps["items"]]
+    if not USE_ENTRY_9:
+        steps["items"] = [x for x in steps["items"] if "check entry 9" not in x]
+    elif not USE_ENTRY_8:
+        steps["items"] = [x.replace("Only if entries 1 to 8 give no trade", "Only if entries 1 to 7 give no trade")
+                          for x in steps["items"]]
     out = [steps]
     if not with_examples:
         return out
@@ -1013,7 +1349,7 @@ def rule_sections(with_examples: bool = True) -> list[dict]:
 
 
 def holiday_note() -> str:
-    """This index's holiday nights on which an entry was true, from its own trades (the rule's strike, first exit 09:30):
+    """This index's holiday nights on which an entry was true, from its own trades (the rule's strike, the rule's first exit candle):
     what trading them would have made.  Written with this index's name, so each index shows its own line."""
     hol = [x for x in DETAILS.values() if x["holiday"] and x["rule_ok"] and x.get("net") is not None]
     book = [x for x in DETAILS.values() if x["rule_ok"] and x.get("net") is not None]
@@ -1034,6 +1370,34 @@ def plain_steps() -> list[str]:
     """The rule-only report's steps (meta['rule_steps']): the 11 plain steps of `rule_sections`, line breaks kept, no
     examples (the user, 2026-10-01).  `rule_sections` runs `check_entry_points` first."""
     return rule_sections(with_examples=False)[0]["items"]
+
+
+def data_sources(with_es: bool = False, with_crude: bool | None = None, options_used: str | None = None) -> list[dict]:
+    """meta["sources"] - every file the rule reads and where it came from (the report's 'Data sources' table).
+    The rows that are the same on every index carry no index name, so the combined report shows them once."""
+    import urllib.parse
+    with_crude = USE_ENTRY_10 if with_crude is None else with_crude
+    rows = upstox_sources(options_used=options_used or
+                          "every fill - the 15:20 buy and the next session's sale - and entry 5's time value (15:19 price)")
+    rows.append(source_row("India VIX, 1-minute candles", "watchlist entry 8 reads its 15:19 close",
+                           [("Upstox API - historical candle data", UPSTOX_DOCS["candles"])],
+                           f"analysis/candle_datas/{IVIX_NAME}_candles.json", local_period(f"{IVIX_NAME}_candles.json")))
+    rows.append(source_row(
+        "Asian markets, daily closes: " + ", ".join(ASIA.values()),
+        "the holiday-night check (how many traded today) and 'Asia against the day' (entry 7)",
+        [(f"Yahoo Finance - {nm} ({tk})", f"https://finance.yahoo.com/quote/{urllib.parse.quote(tk)}/history/") for tk, nm in ASIA.items()],
+        "analysis/candle_datas/yahoo_<ticker>_daily.json", local_period(os.path.basename(yahoo_file(next(iter(ASIA)))))))
+    rows.append(yahoo_source(US_TICKER, "S&P 500 index, daily bars", "the holiday-night check: is the US market closed tonight"))
+    if with_es:
+        rows.append(yahoo_source("ES=F", "S&P 500 futures, one-hour bars",
+                                 "confirmation 1 (US futures with the day): the price at 14:30 against 21:00 UTC the evening before",
+                                 fname="yahoo_ES_F_hourly.json"))
+    if with_crude:
+        rows.append(yahoo_source("CL=F", "Crude oil futures (WTI), one-hour bars",
+                                 "crude oil against the day (confirmation 3 and entry 10): the price at 14:30 against "
+                                 "21:00 UTC the evening before", fname=os.path.basename(CRUDE_FILE)))
+    rows.append(costs_source())
+    return rows
 
 
 def report_skips(skips: list[str]) -> None:
@@ -1065,12 +1429,12 @@ def main() -> None:
                     help="1 to 8: run that ONE entry alone as its own strategy; writes analysis/onh_v4_entries/")
     ap.add_argument("--rule-only", dest="rule_only", action="store_true",
                     help="write onh_v4_rule.html: the rule alone (6 ITM, direction check on, no time-value check, "
-                         "first exit 09:30), with only its own steps and assumptions - no panel comparisons")
+                         "the selected exit), with only its own steps and assumptions - no panel comparisons")
     a = ap.parse_args()
     if ENTRY_MODE is not None:
         a.rule_only = True               # one strike, one exit candle, the compact assumptions
     if a.rule_only:
-        a.set_confirm, a.set_tv_check, a.set_first_exit = "rule", "off", "09:30"
+        a.set_confirm, a.set_tv_check = "rule", "off"       # both exits stay in the 'Exit' box; the selected one is the default
         a.set_moneyness = a.set_moneyness or "6"
     if a.set_moneyness is None:
         a.set_moneyness = DEFAULT_LADDER
@@ -1085,16 +1449,11 @@ def main() -> None:
         "ASSUMED: '15:20 index' for the strike reference = close of the 15:19 index bar (15:20 has not completed).",
         "ASSUMED: the '15:19 price' and the index level for intrinsic value are the CLOSES of the 15:19 bars.",
         "ASSUMED: a time-value share of exactly the limit passes; negative time value passes every check.",
-        "ASSUMED: the first-exit candle is the first one CHECKED, so the earliest fill is the minute after it.",
-        "ASSUMED: the line = entry price + round-trip costs per unit, costs evaluated with the sale at the line. "
-        "It does not depend on the first-exit setting, so the three exit settings share one line per night.",
+        exit_limit(),
         "ASSUMED: expiry = nearest at least 1 day after the exit day (rule 10); exit day = next complete index session.",
         "ASSUMED: 1 lot, qty from the resolved contract; standard option costs; one position at a time.",
-        "RULES OVERRIDE the prompt: the low-above-line test is a completed-bar signal, so the sale fills at the NEXT "
-        "minute's low (not the tested minute's low); that low can be below the line, so a 'line' exit can be a loss.",
-        "The 'target' drawn on each trade is the sell-line (paid + costs), not a resting order.",
         "THE RULE is strike depth 6 ITM, the v4 rule (any of scenarios A-F, or the Asia rescue), time-value check "
-        "OFF, first exit 09:30 - the panel's defaults. Every other setting is the SAME NIGHTS priced differently; "
+        f"OFF, the selected exit ({EXIT_LABEL[RULE_EXIT]}) - the panel's defaults. Every other setting is the SAME NIGHTS priced differently; "
         "'Direction check' offers only the rule and no check at all (the user, 2026-09-30: the v3 5-day-trend "
         "option was dropped from the panel; the trend still shows as a breakdown).",
         f"THE ASIA RESCUE (the user, 2026-09-30): a night with no scenario is traded when at least {ASIA_MIN_OPEN} of "
@@ -1109,8 +1468,9 @@ def main() -> None:
         "each file carries its source URL and fetch time), read by py_funcs.yahoo_daily - nothing is fetched by "
         "this run. The Yahoo NIFTY close was checked against the local Upstox candles on 152 sessions (median 1.4 "
         "points). A day missing from a market's file is a day that market did not trade.",
-        f"THE REVERSE (the user, 2026-09-30, 'add it first, decide later'): a night with no scenario and no rescue, "
-        f"a day move of at least {REVERSE_MOVE}% (15:14 close vs 09:15 open) and India VIX at least {REVERSE_IVIX:.0f} "
+        f"THE REVERSE (entry 8, redefined by the user on 2026-10-03): a night with no scenario and no rescue, India VIX "
+        f"at least {REVERSE_IVIX:.0f}, a range that is not normal, a day move of at least {REVERSE_MOVE}% and more than "
+        f"half of the open Asian markets with the day "
         f"buys the OPPOSITE side - a put on an up day, a call on a down day - the same strikes ITM for that side, "
         f"same 15:20 entry and the same exit. Only the reverse contract is priced on such a night, so 'no check - "
         f"every night' carries the reverse trade there, not the day's side. Where it comes from: the 54 nights the "
@@ -1128,11 +1488,16 @@ def main() -> None:
         f"the move. Known days ahead from the holiday calendars. Every exit, stop, hedge and morning confirmation tried "
         f"(stops of 10-40%, index stops, time cuts, the 15:20-15:29 window, the 09:15 minute, OI and volume at entry, "
         f"far-OTM hedges) cost more than it saved on both indices - the loss is made in the 09:15 candle.",
+        "ENTRY 9 - THE BALANCE REVERSAL (the user, 2026-10-03). Looked at only when entries 1-8 give no trade (none true, "
+        "or a holiday night): today's value area overlaps yesterday's, or the 15:14 close is inside the value area of "
+        "the previous five sessions -> buy the OPPOSITE side. Value area = the band holding 70% of the time, from "
+        "30-minute brackets of the candles up to 15:14, price bins of 0.02%. FOUND ON THIS WINDOW, on the nights the "
+        "eight entries leave out; it has no edge of its own - the same read with the opposite side on EVERY night of "
+        "2022-2025 (index stand-in, scratchpad) lost heavily. It is weaker in the second half and deepens the drawdown. "
+        "'Direction check' offers the rule without it (entries 1-8 only).",
         "THE PANEL KEEPS ONE VIEW THE RULE REJECTED (the user, 2026-09-30): 'Direction check' also offers the rule "
         "WITH holiday nights (the 103-trade book on NIFTY: PF 5.66, +5.26L, against 95 trades, PF 8.68, +5.62L without "
-        "them). There is ONE exit (the user): the first candle low above the line from 09:30, else 15:14. A 14:00 cut "
-        "was tried and dropped (about +1% on both indices overall, negative on both in May-July); every stop, time "
-        "cut, morning confirmation, hedge and recovery exit tried lost money on both indices.",
+        f"them). The exit is the one selected in the 'Exit' box: {EXIT_LABEL[RULE_EXIT]}.",
         "DATA COMPLETED 2026-09-30 (with the user's permission): the index candles now run from 2025-11-24, so every "
         "January night has its 20-session range, and to 2026-08-07, so the last night of the window (2026-07-31) exits "
         "on 2026-08-03; the 4-Aug (NIFTY) and 6-Aug (SENSEX) expiry contracts the OTM rungs needed in the last week of "
@@ -1180,7 +1545,7 @@ def main() -> None:
         "The time-value check is a FILTER over trades, not a re-simulation: every night is traded and tagged, and "
         "the check selects. Near the money almost the whole premium IS time value, so at 0-2 strikes ITM the 15% "
         "setting removes nearly every night - compare those rungs with the check off.",
-        f"SELECTION: the six scenarios, the strike ({depth_text()} in the money) and 09:30 were chosen on data that "
+        f"SELECTION: the six scenarios, the strike ({depth_text()} in the money) were chosen on data that "
         "includes this window. "
         "The ladder and the other settings are an in-sample comparison - the best cell of a grid is mostly "
         "noise, and nothing here is out of sample.",
@@ -1190,7 +1555,7 @@ def main() -> None:
         "Capital = premium x qty, so it differs by rung and return on capital is comparable across the ladder.",
         "THE LADDER runs 6 ITM through ATM to 6 OTM for this strategy (the user, 2026-09-30); the shared ladder of the "
         "other index strategies stops at ATM. An OTM rung has little or no intrinsic value, so the time-value checks "
-        "refuse nearly every night there, and the sell-line (paid + costs) is a larger share of a small premium.",
+        "refuse nearly every night there, and the costs are a larger share of a small premium.",
         "Only nights with real option bars for both sessions are traded, per rung; the console lists every skip.",
     ]
     lot = trades[-1]["qty"] // LOTS if trades else info["lot_size"]
@@ -1206,17 +1571,14 @@ def main() -> None:
             "Scenario E also reads the option's 15:19 price.",
             f"STRIKE. Reference = the 15:19 index close; the strike is {depth_text()} in the money for the side "
             "bought; expiry = the nearest at least one day after the exit day, so a position never crosses an expiry.",
-            "FILLS - WORST ONLY. Buy in the 15:20 minute at its HIGH. Next session, from the 09:30 candle, the first "
-            "candle whose LOW is above the line sells in the NEXT minute at that minute's LOW; nothing by 15:14 sells "
-            "in the 15:14 minute at its LOW. The line = paid + round-trip costs per unit, so a 'line' exit can still "
-            "lose a little when the next minute dips under it. No stop, no target: every stop, time cut, morning "
-            "confirmation, hedge and recovery exit tried lost money on both indices.",
+            "FILLS - WORST ONLY. Buy in the 15:20 minute at its HIGH; every sale at its minute's LOW. " + exit_limit(),
             f"ASIA RESCUE. The five closes (Nikkei 225, Hang Seng, KOSPI, Shanghai, ASX 200) are daily bars from Yahoo "
             f"Finance on local disk, each in before 13:30 IST. It needs at least {ASIA_MIN_OPEN} of them open today, at "
             f"most half of those open moving the day's way, and a 15:14 close location of at least {STRONG_CLOSE} in "
             "the day's direction.",
-            f"REVERSE. A day move of at least {REVERSE_MOVE}% and India VIX of at least {REVERSE_IVIX:.0f} with no "
-            "scenario and no rescue buys the OPPOSITE side at the same depth. India VIX is its 15:19 one-minute close, "
+            f"REVERSE. India VIX of at least {REVERSE_IVIX:.0f}, a range that is not normal, a day move of at least "
+            f"{REVERSE_MOVE}% and more than half of the open Asian markets with the day, with no "
+            "scenario and no rescue, buys the OPPOSITE side at the same depth. India VIX is its 15:19 one-minute close, "
             "read in the same minute as the option price - known at entry.",
             f"HOLIDAY NIGHT. No trade when fewer than {ASIA_MIN_OPEN} Asian markets were open today or the US market "
             "is shut tonight (no S&P 500 bar for the day). Both are known from the holiday calendars in advance.",
@@ -1236,7 +1598,7 @@ def main() -> None:
         "subtitle": "Buy an ITM NIFTY weekly option at 15:20 on the day's direction when any of six scenarios "
                     "(A-F) fires, or when Asia moved against the day and the close is strong (the Asia rescue); "
                     "on a big day with India VIX 17+ and neither, buy the opposite side (the reverse); "
-                    "sell next session at the first candle low above paid + costs, else 15:14. "
+                    f"sell next session by the selected exit ({EXIT_LABEL[RULE_EXIT]}). "
                     "Worst fill only. The panel prices every other setting on the same nights.",
         "instrument": "NIFTY 50 weekly options",
         "from": frm.isoformat(), "to": to.isoformat(),
@@ -1244,8 +1606,8 @@ def main() -> None:
         "fill_rule": "WORST FILL ONLY: buy at the minute's HIGH, sell at the minute's LOW, entry and exit; "
                      "signals act in the next 1-minute bar",
         "params": {"signal": "09:15 open vs 15:14 close (1m)",
-                   "the rule": f"{rule['moneyness']} strikes ITM, scenarios A-F, the Asia rescue or the reverse, no holiday nights, first exit "
-                               f"{rule['first_exit']}, time-value check off",
+                   "the rule": f"{rule['moneyness']} strikes ITM, scenarios A-F, the Asia rescue or the reverse, no holiday nights, exit: "
+                               f"{EXIT_LABEL[rule['first_exit']]}, time-value check off",
                    "scenarios A-F": " | ".join(SCEN_LABEL[k] for k in "ABCDEF"),
                    "Asia rescue": f"no scenario, but >= {ASIA_MIN_OPEN} of {', '.join(ASIA.values())} open, at most "
                                   f"{ASIA_MAX_AGREE:.0%} of them with the day, close location >= {STRONG_CLOSE}; "
@@ -1254,16 +1616,16 @@ def main() -> None:
                                  f"< {SMALL_MOVE}%; strong close >= {STRONG_CLOSE}; middle close "
                                  f"{MIDDLE_CLOSE[0]}-{MIDDLE_CLOSE[1]}; pull-back = last {LATE_MIN} min; "
                                  f"trend {TREND_N} sessions; time value <= {TV_MAX_SHARE * 100:.0f}%",
-                   "the reverse": f"no scenario, no rescue, day move >= {REVERSE_MOVE}%, India VIX >= "
-                                  f"{REVERSE_IVIX:.0f} -> the opposite side, same depth ITM",
+                   "the reverse": f"no scenario, no rescue, India VIX >= {REVERSE_IVIX:.0f}, range not normal, day "
+                                  f"move >= {REVERSE_MOVE}%, most of Asia with the day -> the opposite side, same depth ITM",
                    "direction checks": "v4 rule (scenarios A-F, Asia rescue, or the reverse; never on a holiday night) | the same rule with holiday nights | none",
                    "holiday night": f"fewer than {ASIA_MIN_OPEN} of 5 Asian markets open today, or the US shut tonight",
                    "strike ladder": ", ".join(rung_label(v) for v in values_of(settings, "moneyness")),
-                   "first exit candles": ", ".join(values_of(settings, "first_exit")),
+                   "exit": EXIT_LABEL[RULE_EXIT] + " (the selected exit)",
                    "time-value checks (earlier rule)": f"<= {TV_MAX_SHARE * 100:.0f}% of premium | "
                                         f"<= {TV_MAX_POINTS:.0f} points | cheapest {TV_RANK_KEEP} in 100 "
                                         f"over {TV_RANK_LOOKBACK} nights | none (the rule)",
-                   "strike step": f"{STEP:.0f}", "entry": ENTRY_MIN, "time exit": TIME_EXIT, "lots": LOTS,
+                   "strike step": f"{STEP:.0f}", "entry": ENTRY_MIN, "lots": LOTS,
                    "expiry": "nearest >= 1 day after exit day"},
         "rule_steps": [
             "Take the session's 09:15 open and the 15:14 close (1-minute bars); a missing one means no trade.",
@@ -1284,19 +1646,21 @@ def main() -> None:
             f"and the 15:14 close is in the day's strongest {100 - STRONG_CLOSE * 100:.0f}%.",
             f"Fewer than {ASIA_MIN_OPEN} Asian indices open: no Asia read, and the night is a HOLIDAY NIGHT (below) - "
             "no trade.",
-            f"No scenario and no rescue, but the day moved at least {REVERSE_MOVE}% and India VIX is at least "
-            f"{REVERSE_IVIX:.0f}: buy the OPPOSITE side (a put on an up day, a call on a down day), the same strikes "
+            f"No scenario and no rescue, but India VIX is at least {REVERSE_IVIX:.0f}, the range is not normal, the day "
+            f"moved at least {REVERSE_MOVE}% and more than half of the open Asian markets moved with the day: buy the "
+            f"OPPOSITE side (a put on an up day, a call on a down day), the same strikes "
             "in the money for that side - the reverse.",
             f"A HOLIDAY NIGHT is never traded, whatever fired: fewer than {ASIA_MIN_OPEN} of the 5 Asian markets open "
             "today, or the US market shut tonight.",
+            "Entries 1-8 give no trade (none true, or a holiday night), and the market is in balance - today's value "
+            "area overlaps yesterday's, or the 15:14 close is inside the previous five sessions' value area: buy the "
+            "OPPOSITE side (entry 9).",
             "Otherwise no trade.",
             f"Reference = index at 15:19 (close), strike = {depth_text()} in the money for the rule, "
             "nearest expiry at least a day after the exit day.",
-            "Buy in the 15:20 minute at that minute's HIGH (worst fill); line = paid + round-trip costs per unit.",
-            "Next session, from the 09:30 candle: if a candle's low is above the line, sell in the next minute "
-            "at its LOW (worst fill). (The panel's first-exit candle moves 09:30.)",
-            "Nothing qualifying by then: sell in the 15:14 minute at its LOW.",
-            "No stop, no target.",
+            "Buy in the 15:20 minute at that minute's HIGH (worst fill); sell-line = paid + round-trip costs per unit.",
+            f"Next session: {EXIT_LABEL[RULE_EXIT]} (worst fill).",
+            f"No stop, no target; nothing is held after {EXIT_END}.",
             "The earlier rule's time-value check (skip the night when time value is above 15% of the premium) "
             "is in the panel, off by default.",
         ],
@@ -1315,23 +1679,58 @@ def main() -> None:
         "coverage": coverage(sessions, frm, to, ROWS_PER_SESSION),
         "rerun": rerun_command(SLUG, settings, frm.isoformat(), to.isoformat()) + (" --rule-only" if a.rule_only else ""),
     }
+    # the watchlist: an entry that is switched off leaves the written rule, and the report says where it went
+    off = [n for n, on in (("8", USE_ENTRY_8), ("9", USE_ENTRY_9), ("10", USE_ENTRY_10)) if not on]
+    if off and ENTRY_MODE is None:
+        drop_steps = (["buy the OPPOSITE side (a put on an up day"] if not USE_ENTRY_8 else []) + (
+            ["OPPOSITE side (entry 9)"] if not USE_ENTRY_9 else [])
+        meta["rule_steps"] = [x for x in meta["rule_steps"] if not any(k in x for k in drop_steps)]
+        drop_lim = (["THE REVERSE (", "REVERSE. "] if not USE_ENTRY_8 else []) + (["ENTRY 9 - "] if not USE_ENTRY_9 else [])
+        meta["limits"] = [x for x in meta["limits"] if not any(x.startswith(k) for k in drop_lim)]
+        meta["limits"].insert(0, "WATCHLIST (the user, 2026-10-03): " + " and ".join(
+            ([f"entry 8 ({W8_TEXT} -> the opposite side)"] if not USE_ENTRY_8 else [])
+            + (["entry 9 (the market in balance on a night the rule skips -> the opposite side)"] if not USE_ENTRY_9 else [])
+            + ([f"entry 10 (the day moved {SMALL_MOVE}% or more, Asia against the day, crude oil moving against the day "
+                "-> the DAY's side)"] if not USE_ENTRY_10 else []))
+            + (" are" if len(off) > 1 else " is") + " PARKED: not traded and not in this report's rule. Entry 8 is the "
+            "user's modified version of 2026-10-03; its nights are all in March-May 2026. Entry 9 deepened the drawdown. "
+            "Each is switched back on in the script only when the user asks.")
+        if "the reverse" in meta["params"] and not USE_ENTRY_8:
+            meta["params"]["the reverse"] = "on the watchlist - not traded"
+            meta["params"]["the rule"] = meta["params"]["the rule"].replace(", the Asia rescue or the reverse", " or the Asia rescue")
+    meta["limits"].insert(0, "EXIT HISTORY. Until 2026-10-03: the sell-line looked for from 09:16 (09:30 before that), else "
+                             "the 15:14 minute. On 2026-10-04 every trade was first sold in the 09:16 minute; that cost about a "
+                             "fifth of the profit, because 09:16 is one of the widest minutes of the day and a trade that opens "
+                             "at a loss tends to recover in the afternoon. The user then chose the two exits now in the 'Exit' "
+                             f"box. Selected: {EXIT_LABEL[RULE_EXIT]}. Both were chosen on this same window.")
     meta["price_ratio"] = dict(PRE_RATIOS)
     meta["price_ratio_basis"] = (f"the median close ratio of the {TREND_LOOKBACK_DAYS} calendar days before {frm} "
                                  "(known before the first trade)")
+    meta["sources"] = data_sources()
+    # the rule in the same plain steps in every v4 report (the user, 2026-10-03: "the rules clearly mentioned")
+    meta["rule_steps"] = plain_steps() + exit_examples() + [
+        "The settings panel prices the same nights with other choices - another strike depth, the other exit, "
+        "the earlier time-value check, holiday nights traded, or every night with no entry check. The steps above are "
+        "the rule: the panel's defaults."]
     if a.rule_only:
-        meta["rule_steps"] = plain_steps()     # the steps only, inside the settings-and-assumptions section
+        meta["rule_steps"] = plain_steps() + exit_examples()     # the steps, then the exit on real nights
         meta["subtitle"] = ("The rule alone, 6 strikes in the money, bought at 15:20. Enter when at least one of entries 1-7 "
-                            "is TRUE (UP day: buy CE, DOWN day: buy PE) or, when 1-7 are all FALSE, entry 8 is TRUE (UP day: "
-                            "buy PE, DOWN day: buy CE). Never on a holiday night. Sell next session at the first candle low "
-                            "above paid + costs, else at 15:14. Worst fill only.")
+                            "is TRUE (UP day: buy CE, DOWN day: buy PE)"
+                            + (" or, when 1-7 are all FALSE, entry 8 is TRUE (UP day: buy PE, DOWN day: buy CE)"
+                               if USE_ENTRY_8 else "") + "; never on a holiday night."
+                            + (" When these give no trade, entry 9 (the market is in balance) buys the opposite side "
+                               "(UP day: buy PE, DOWN day: buy CE)." if USE_ENTRY_9 else "")
+                            + f" Exit: {EXIT_LABEL[RULE_EXIT]}. Worst fill only.")
         meta["params"] = {"signal": "09:15 open vs 15:14 close (1m)", "strike": "6 in the money", "entry": ENTRY_MIN,
-                          "first exit candle": "09:30", "time exit": TIME_EXIT, "lots": LOTS,
+                          "exit": EXIT_LABEL[RULE_EXIT] + " (the selected exit)", "lots": LOTS,
                           "expiry": "nearest >= 1 day after exit day", "scenarios A-F": meta["params"]["scenarios A-F"],
                           "thresholds": meta["params"]["thresholds"], "Asia rescue": meta["params"]["Asia rescue"],
                           "the reverse": meta["params"]["the reverse"], "holiday night": meta["params"]["holiday night"]}
         meta["rejected"] = [
-            ["Every stop, time cut, morning confirmation, hedge and recovery exit", "about forty tried on both indices "
-             "(2026-09-30); all lost money against holding to the line or 15:14. The loss is made in the 09:15 candle."],
+            ["Selling every trade in the 09:16 minute (the exit for one day, 2026-10-04)", "it cost about a fifth of the "
+             "profit: 09:16 is one of the widest minutes of the day, and a trade that opens at a loss tends to recover in "
+             "the afternoon."],
+            ["Holding to 15:14 when the sell-line is not reached (the exit until 2026-10-03)", f"the time limit is now {EXIT_END}."],
             ["The opposite side on EVERY night", "loses 3.5L on this window; it pays only on the nights the rule declines "
              "(the reverse)."],
             ["A stop or a profit target", "not in the rule; tested and rejected."],
@@ -1355,15 +1754,15 @@ def main() -> None:
     if ENTRY_MODE is not None:
         e = next(x for x in ENTRY_POINTS if x[0] == ENTRY_MODE)
         up_buy, dn_buy = _buy(True, e[6]), _buy(False, e[6])
+        st = [x for x in plain_steps() if "check entry 9" not in x]        # entry 9 is not part of a single-entry report
         slug = f"{SLUG}_entry_{ENTRY_MODE}"
         meta["title"] = f"Over night Hold v4 - entry {ENTRY_MODE} alone"
         meta["subtitle"] = (f"ONE entry of the v4 rule run as its own strategy: trade only when {e[2]} AND {e[3]}. "
                             f"UP day: buy {up_buy}. DOWN day: buy {dn_buy}. Never on a holiday night. Same strike (6 in "
-                            "the money), same 15:20 buy, same sell-line and exit as the rule. Worst fill only.")
-        st = plain_steps()
+                            "the money), same 15:20 buy, same exit as the rule. Worst fill only.")
         meta["rule_steps"] = st[:4] + [
             f"Check entry {ENTRY_MODE}: {e[2]}, AND {e[3]}. If both are true, buy a {up_buy} on an UP day or a {dn_buy} "
-            "on a DOWN day. If either is false, there is no trade today."] + st[6:]
+            "on a DOWN day. If either is false, there is no trade today."] + st[6:] + exit_examples()
         meta["limits"] = [
             f"THIS REPORT IS ENTRY {ENTRY_MODE} ALONE. The full v4 rule trades when at least one of its 8 entries is true; "
             "here only this entry counts, so a night traded here may also be true on other entries, and the 8 single-"

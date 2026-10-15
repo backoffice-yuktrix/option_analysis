@@ -1,7 +1,8 @@
 """ONH v4 - the rolling two-week chart (the user, 2026-09-30).
 
 Reads the trades already embedded in analysis/report/index_options/onh_v4.html (no fetching, no
-re-simulation), keeps only THE RULE's own book - the panel's defaults: 6 strikes ITM, first exit 09:30,
+re-simulation), keeps only THE RULE's own book - the panel's defaults: 6 strikes ITM, the selected exit (from 09:20
+sell when a candle's low is above paid + costs, else at 14:00; the user, 2026-10-04),
 the v4 direction check on (a scenario A-F, the Asia rescue or the reverse), never a holiday night -
 and writes analysis/working strategy reports/onh_v4_weekly.html (the user, 2026-10-01: charts of this type -
 analysis pages built on a working strategy's report - live in that folder, not in analysis/report).
@@ -45,7 +46,7 @@ DATA_START, DATA_END = "/*DATA_START*/", "/*DATA_END*/"
 
 # THE RULE, as the report's panel defaults it (onh_v4.py SETTINGS): a sweep value per variant key,
 # and a filter tag per filter setting.
-RULE_VARIANT = {"moneyness": "6", "first_exit": "09:30"}
+RULE_VARIANT = {"moneyness": "6", "first_exit": "above_line"}      # onh_v4.py RULE_EXIT, the selected exit
 RULE_TAGS = {"v4 rule": "yes", "holiday night": "no"}
 DROP_BEST = 2                      # the trimmed mean leaves out this many of the pair's best trades
 DROP_CHEAP = 2                     # the trimmed buy cost leaves out this many of the pair's cheapest trades
@@ -182,7 +183,7 @@ def build(payload: dict) -> dict:
     return {
         "title": meta.get("title", "Over night Hold v4"),
         "from": meta.get("from"), "to": meta.get("to"), "generated": meta.get("generated"),
-        "rule": f"{RULE_VARIANT['moneyness']} strikes ITM, first exit {RULE_VARIANT['first_exit']}, "
+        "rule": f"{RULE_VARIANT['moneyness']} strikes ITM, exit: from 09:20 sell when a candle's low is above paid + costs, else at 14:00, "
                 f"the v4 rule (a scenario A-F, the Asia rescue or the reverse), no holiday nights, "
                 f"time-value check off",
         "drop_best": DROP_BEST, "drop_cheap": DROP_CHEAP,

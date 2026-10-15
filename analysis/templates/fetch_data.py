@@ -32,6 +32,11 @@ if TOOL_DIR not in sys.path:
 import fetch_candles as F  # noqa: E402   (the fetch tool, used as it is)
 
 DATA_DIR = os.path.join(ANALYSIS_DIR, "candle_datas")          # indices and their options
+# The held-out test period (2026-08-08 onwards, the user, 2026-10-03) is kept apart in candle_datas/test_data, the
+# same layout.  It is written and read only with PYFUNCS_TEST_DATA=1, set when the user approved that run (RUN.md, Data).
+TEST_DATA_DIR = os.path.join(DATA_DIR, "test_data")
+if os.environ.get("PYFUNCS_TEST_DATA") == "1":
+    DATA_DIR = TEST_DATA_DIR
 STOCK_DATA_DIR = os.path.join(ANALYSIS_DIR, "stock_datas")     # stocks and their options
 # BSE indices are not in the tool's own key table (its find_instrument searches NSE only); the keys are the ones
 # at the head of the SENSEX files on disk (2026-09-30).

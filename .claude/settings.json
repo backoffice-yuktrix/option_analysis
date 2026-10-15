@@ -13,6 +13,14 @@
       "Bash(./.venv/Scripts/python.exe -c ' *)",
       "WebFetch(domain:upstox.com)"
     ],
+    "ask": [
+      "Read(./analysis/candle_datas/test_data/**)",
+      "Edit(./analysis/candle_datas/test_data/**)",
+      "Bash(*test_data*)",
+      "Bash(*TEST_DATA*)",
+      "PowerShell(*test_data*)",
+      "PowerShell(*TEST_DATA*)"
+    ],
     "additionalDirectories": [
       "\\tmp"
     ]

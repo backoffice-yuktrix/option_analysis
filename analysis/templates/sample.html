@@ -202,6 +202,7 @@
         <div style="font-weight:600;margin:14px 0 6px" id="fillsTitle">Fills and costs</div><div class="kv" id="fills"></div>
         <div id="rejBox"></div></div>
     </div>
+    <div id="srcBox"></div>
     <div id="exBox"></div>
     <div style="font-weight:600;margin:18px 0 6px">What each number means</div><div class="kv" id="defs"></div>
   </details>
@@ -305,8 +306,12 @@ const dirPill = t => ONE_SIDE
 const RULEMARK = d => (HAS_RULE && !d.derived && d.mode !== 'side' && d.mode !== 'instrument') ? '  ← the rule' : '';
 const GD = M.group_defs || {standard: [], custom: []};
 const WIN = {from: M.from || (ALL.length ? ALL[0].day : ''), to: M.to || (ALL.length ? ALL[ALL.length - 1].exit_day : '')};
+/* A report may name its own windows (meta.windows = [{l, a, b}, ...]): the dropdown then offers exactly those,
+   the report opens on the first, and reset returns to it.  Without them the old automatic presets apply. */
+const WINDOWS = Array.isArray(M.windows) && M.windows.length ? M.windows : null;
+const W0 = WINDOWS ? WINDOWS[0] : {a: WIN.from, b: WIN.to};
 
-const S = {f: {}, from: WIN.from, to: WIN.to, group: (M.groups || ['weekday'])[0], sel: null, walk: false, sess: 'all', mxRow: null, mxCol: null, mxMetric: 'net', sortKey: 'id', sortDir: 1,
+const S = {f: {}, from: W0.a, to: W0.b, group: (M.groups || ['weekday'])[0], sel: null, walk: false, sess: 'all', mxRow: null, mxCol: null, mxMetric: 'net', sortKey: 'id', sortDir: 1,
   eq: 'net', trView: 'all', day: null, onlyTraded: true, levels: true, stops: true};
 DIMS.forEach(d => S.f[d.key] = d.default);
 
@@ -505,6 +510,7 @@ function selfCheck() {
    caption with its dropdowns under it, so the whole panel is two lines however many settings
    a strategy declares. Per-control help lives in the select's tooltip, not in the row. */
 function presets() {
+  if (WINDOWS) return WINDOWS.map(w => ({l: w.l, a: w.a, b: w.b}));
   const out = [{l: 'whole window', a: WIN.from, b: WIN.to}];
   const back = n => { const d = new Date(WIN.to + 'T00:00:00'); d.setMonth(d.getMonth() - n);
     const iso = isoOf(d); return iso < WIN.from ? WIN.from : iso; };
@@ -565,7 +571,7 @@ function renderPanel() {
   if (FILLS.length) $('fillSel').onchange = () => { setFill($('fillSel').value); renderAll(); };
   $('dFrom').onchange = () => { S.from = $('dFrom').value || WIN.from; renderPanel(); renderAll(); };
   $('dTo').onchange = () => { S.to = $('dTo').value || WIN.to; renderPanel(); renderAll(); };
-  $('fReset').onclick = () => { DIMS.forEach(d => S.f[d.key] = d.default); S.from = WIN.from; S.to = WIN.to; S.snapped = '';
+  $('fReset').onclick = () => { DIMS.forEach(d => S.f[d.key] = d.default); S.from = W0.a; S.to = W0.b; S.snapped = '';
     setFill('worst'); renderPanel(); renderAll(); };
   $('showAll2').onclick = () => { $('comboSec').open = true; $('comboSec').scrollIntoView({behavior: 'smooth', block: 'start'}); };
   if (M.rerun) $('cmdBtn').onclick = () => {
@@ -1506,7 +1512,7 @@ function renderInfo() {
       const notes = document.createElement('details');
       notes.className = 'sec'; notes.id = 'notesSec';
       notes.innerHTML = '<summary>Settings, assumptions and data notes <span class="hint">the technical detail behind the backtest</span></summary>';
-      [...$('ruleSec').children].filter(el => el.tagName !== 'SUMMARY' && el.id !== 'ruleCore2' && el.id !== 'exBox')
+      [...$('ruleSec').children].filter(el => el.tagName !== 'SUMMARY' && el.id !== 'ruleCore2' && el.id !== 'exBox' && el.id !== 'srcBox')
         .forEach(el => notes.appendChild(el));
       $('ruleSec').after(notes);
     }
@@ -1517,6 +1523,21 @@ function renderInfo() {
   } else {
     $('exBox').innerHTML = exHtml;
   }
+  /* Data sources (meta.sources, optional): where every number comes from, with links.
+     Each = {name, used, links: [{label, url}], file, period}. */
+  const srcs = M.sources || [];
+  $('srcBox').innerHTML = srcs.length
+    ? '<div style="font-size:15px;font-weight:700;margin:22px 0 4px">Data sources</div>' +
+      '<div class="dimc" style="margin-bottom:6px">Where every number in this report comes from. Nothing is fetched when the report is built: the files are on local disk, and the links show where each one was taken from.</div>' +
+      '<table style="margin-top:6px"><thead><tr>' + ['Data', 'Used for', 'Source (link)', 'Local file', 'Period on disk'].map(h =>
+        '<th style="text-align:left;position:static">' + h + '</th>').join('') + '</tr></thead><tbody>' +
+      srcs.map(x => '<tr>' + [esc(x.name), esc(x.used || ''),
+        (x.links || []).map(l => '<a href="' + esc(l.url) + '" target="_blank" rel="noopener" style="color:var(--accent)">' + esc(l.label) + '</a>').join('<br>'),
+        esc(x.file || ''), esc(x.period || '')].map((c, i) =>
+          '<td style="text-align:left;white-space:pre-line;vertical-align:top;line-height:1.5' + (i === 0 ? ';font-weight:600;min-width:150px' : '') +
+          (i === 3 ? ';font-family:ui-monospace,Consolas,monospace;font-size:11px' : '') + '">' + c + '</td>').join('') + '</tr>').join('') +
+      '</tbody></table>'
+    : '';
   const c = M.coverage || {};
   $('cov').innerHTML = kv({'sessions loaded': c.sessions, 'weekdays with no candles': (c.weekday_gaps || []).length ? (c.weekday_gaps.length + ' (holidays or feed misses): ' + c.weekday_gaps.slice(0, 12).join(', ') + (c.weekday_gaps.length > 12 ? ' …' : '')) : 0,
     'short sessions': Object.keys(c.short_sessions || {}).length ? JSON.stringify(c.short_sessions) : 0});

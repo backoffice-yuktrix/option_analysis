@@ -98,6 +98,15 @@ LOCAL_DATA_DIR = os.path.abspath(os.path.join(ANALYSIS_DIR, "candle_datas"))
 # fetch_data.data_dir puts every non-index instrument there.  Both folders are read, candle_datas first.
 STOCK_DATA_DIR = os.path.abspath(os.path.join(ANALYSIS_DIR, "stock_datas"))
 LOCAL_DATA_DIRS = (LOCAL_DATA_DIR, STOCK_DATA_DIR)
+# The held-out test period (2026-08-08 onwards; the user, 2026-10-03) lives apart in candle_datas/test_data, the same
+# layout, continuing the files above.  It is NOT read unless PYFUNCS_TEST_DATA=1, which is set only when the user
+# approved that run.  Then an index file, expiry list and contract list are the main file with the test file joined
+# on, and an option contract is read from whichever folder holds it.
+TEST_DATA_DIR = os.path.join(LOCAL_DATA_DIR, "test_data")
+TEST_DATA = os.environ.get("PYFUNCS_TEST_DATA") == "1"
+if TEST_DATA:
+    LOCAL_DATA_DIRS += (TEST_DATA_DIR,)
+    print("PYFUNCS_TEST_DATA=1: this run reads the held-out test data (analysis/candle_datas/test_data).")
 ALLOW_FETCH = os.environ.get("PYFUNCS_ALLOW_FETCH") == "1"
 NO_FETCH = ("live fetches are off - nothing is fetched without the user's permission "
             "(PYFUNCS_ALLOW_FETCH=1 once they allow it)")
@@ -138,8 +147,32 @@ def _local_path(fname: str) -> str:
 def _local(fname: str) -> dict | None:
     """One file of LOCAL_DATA_DIRS, parsed once per run."""
     if fname not in _BLOBS:
-        _BLOBS[fname] = _read_json(_local_path(fname))
+        path = _local_path(fname)
+        blob = _read_json(path)
+        if TEST_DATA and os.path.dirname(path) != TEST_DATA_DIR:
+            blob = _join_test(blob, _read_json(os.path.join(TEST_DATA_DIR, fname)))
+        _BLOBS[fname] = blob
     return _BLOBS[fname]
+
+
+def _join_test(blob: dict | None, test: dict | None) -> dict | None:
+    """A main data file with the same file of TEST_DATA_DIR joined on: candles in time order (the test
+    file's row wins a shared minute), `fetched` ranges and expiries added together, contract lists merged."""
+    if blob is None or test is None:
+        return test if blob is None else blob
+    if "candles" in blob:
+        rows = {r[0]: r for r in blob["candles"]}
+        rows.update((r[0], r) for r in test["candles"])
+        return dict(blob, candles=[rows[t] for t in sorted(rows)],
+                    fetched=(blob.get("fetched") or []) + (test.get("fetched") or []))
+    if "expiries" in blob:
+        return dict(blob, to=max(blob["to"], test["to"]), expiries=sorted(set(blob["expiries"]) | set(test["expiries"])))
+    if "rows" in blob and "rows" in test:   # Yahoo hourly files ([bar-start seconds, o, h, l, c]); holdout run, 2026-10-05
+        rows = {r[0]: r for r in blob["rows"]}
+        rows.update((r[0], r) for r in test["rows"])
+        return dict(blob, rows=[rows[t] for t in sorted(rows)],
+                    fetched=(blob.get("fetched") or []) + (test.get("fetched") or []))
+    return {**test, **blob}
 
 
 def _local_keys() -> dict[str, str]:
@@ -188,7 +221,8 @@ def _option_name(option_type: str, strike: float, expiry: str) -> str:
 def _option_file(fname: str) -> tuple[list, dict] | None:
     """(fetched ranges, {day: [[HH:MM, o, h, l, c, volume], ...]}) of one contract file, or None.
     Kept for the last 32 contracts: a trade reads its contract on the entry day and the exit day."""
-    blob = _read_json(_local_path(fname))
+    blob = _local(fname)        # joined with test_data under the flag, exactly like every other file (fix 2026-10-06:
+    #                             a contract in BOTH folders - e.g. an expiry spanning July and August - lost its test days)
     if blob is None:
         return None
     days: dict[str, list[list]] = {}
@@ -196,6 +230,81 @@ def _option_file(fname: str) -> tuple[list, dict] | None:
         days.setdefault(r[0][:10], []).append(
             [r[0][11:16], float(r[1]), float(r[2]), float(r[3]), float(r[4]), int(r[5]) if len(r) > 5 else 0])
     return blob["fetched"], days
+
+
+def option_open_interest(contract: dict, day: date) -> dict[str, int]:
+    """{HH:MM: open interest} of one option contract on one session, from the seventh column of its local candle file
+    ({} when the contract has no file or did not trade that day).  `contract` is what `resolve_option` returned.
+    Open interest is a level, not a flow: a rule reads its CHANGE between two finished minutes."""
+    c = contract if contract.get("underlying") else _contract_by_key(contract["instrument_key"])
+    if c is None:
+        return {}
+    # joined with test_data under the flag, like _option_file (fix 2026-10-11: a contract in BOTH folders read only the
+    # main file, so its test days had no open interest - SENSEX 3 Aug 2026 'no reading')
+    blob = _local(f"{c['underlying']}_{_option_name(c.get('option_type') or c['type'], c['strike'], c['expiry'])}_candles.json")
+    d_ = day.isoformat()
+    return {} if blob is None else {r[0][11:16]: int(r[6]) for r in blob["candles"] if r[0][:10] == d_ and len(r) > 6}
+
+
+UPSTOX_DOCS = {"candles": "https://upstox.com/developer/api-documentation/v3/get-historical-candle-data",
+               "expired": "https://upstox.com/developer/api-documentation/get-expired-historical-candle-data",
+               "instruments": "https://upstox.com/developer/api-documentation/instruments",
+               "charges": "https://upstox.com/developer/api-documentation/get-brokerage"}
+
+
+def source_row(name: str, used: str, links: list[tuple[str, str]], file: str = "", period: str = "") -> dict:
+    """One row of meta["sources"] - the report's 'Data sources' table: what the data is, what the rule uses it for,
+    [(link text, url), ...], the local file and the period on disk.  Keep an index's own name out of a row that is the
+    same for every index, or the combined report cannot merge the two copies."""
+    return {"name": name, "used": used, "links": [{"label": a, "url": b} for a, b in links], "file": file, "period": period}
+
+
+def _period(fetched) -> str:
+    return "; ".join(f"{a} to {b}" for a, b in fetched or [])
+
+
+def local_period(fname: str) -> str:
+    """The period a local data file covers ('2025-11-22 to 2026-08-07'), from its own `fetched` record."""
+    return _period((_local(fname) or {}).get("fetched"))
+
+
+def upstox_sources(name: str | None = None, options_used: str = "every fill") -> list[dict]:
+    """The rows every index-option report shares: the index's 1-minute candles, its option contracts' candles, and the
+    contract and expiry lists - all fetched from Upstox by fetch_data.py into analysis/candle_datas."""
+    name = name or instrument()
+    idx = _local(f"{name}_candles.json") or {}
+    exch = "BSE" if name in BSE_UNDERLYINGS else "NSE"
+    return [
+        source_row(f"{name} index, 1-minute candles", "the day's direction and every fact read from the index",
+                   [("Upstox API - historical candle data", UPSTOX_DOCS["candles"])],
+                   f"analysis/candle_datas/{name}_candles.json", _period(idx.get("fetched"))),
+        source_row(f"{name} option contracts, 1-minute candles (price, volume, open interest)", options_used,
+                   [("Upstox API - expired-instrument historical candles", UPSTOX_DOCS["expired"]),
+                    ("Upstox API - historical candle data", UPSTOX_DOCS["candles"])],
+                   f"analysis/candle_datas/{name}_<CE|PE>_<strike>_<expiry>_candles.json", "the sessions each contract is used on"),
+        source_row(f"{name} contract and expiry lists", "strike step, lot size, the expiry of each trade",
+                   [("Upstox instruments file (" + exch + ")", INSTRUMENTS_URL.format(exchange=exch)),
+                    ("Upstox API - instruments", UPSTOX_DOCS["instruments"])],
+                   f"analysis/candle_datas/{name}_contracts.json, {name}_expiry.json", ""),
+    ]
+
+
+def yahoo_source(ticker: str, name: str, used: str, fname: str | None = None) -> dict:
+    """A Yahoo Finance series kept on local disk: a link to its page and the exact request recorded in the file."""
+    import urllib.parse
+    path = fname or yahoo_file(ticker)                       # a file name inside the local data folder
+    blob = _local(os.path.basename(path)) or {}
+    links = [(f"Yahoo Finance - {ticker}", f"https://finance.yahoo.com/quote/{urllib.parse.quote(ticker)}/history/")]
+    if blob.get("source"):
+        links.append(("the exact request", blob["source"]))
+    return source_row(name, used, links, "analysis/candle_datas/" + os.path.basename(path), _period(blob.get("fetched")))
+
+
+def costs_source() -> dict:
+    return source_row("Brokerage, taxes and exchange charges", "the cost of every trade, and the sell-line",
+                      [("Upstox API - brokerage details", UPSTOX_DOCS["charges"])],
+                      "analysis/templates/py_funcs.py (the rates, with their dates)",
+                      f"read from the broker on {BROKER_READ_ON} (NSE) and {BSE_READ_ON} (BSE)")
 
 
 def _gaps(frm: date, to: date, fetched: list[list[str]]) -> list[tuple[date, date]]:
@@ -355,6 +464,13 @@ def rung_label(n) -> str:
 def instrument() -> str:
     """The index this run trades - NIFTY unless `run_instruments` is running the script for another."""
     return _ACTIVE["instrument"]
+
+
+def ladder_rung() -> int | None:
+    """The strike rung `run_instruments` is pricing now (0 = ATM, 6 = 6 ITM), None outside it.  At every rung
+    but the rule's the runner keeps only the trades of the rule's own settings, so a script may simulate just
+    `default_combo(settings)` there instead of the whole panel."""
+    return _ACTIVE["ladder_rung"]
 
 
 def exchange_of(symbol: str | None = None) -> str:
@@ -876,6 +992,12 @@ def excursion(rows: list[list], side: str, entry_px: float, t0: str, t1: str) ->
 # No individual strategy script should define its own defaults.
 START_DATE = date(2026, 1, 1)
 END_DATE = date(2026, 7, 31)
+if TEST_DATA:
+    # The holdout run (the user, 2026-10-05, in writing): with the test-data flag on - set only when the
+    # user approved that run - the window may extend over the held-out August-September sessions.
+    # the owner's standing split (2026-10-06): research stops at 2026-07-31; the TEST period is 1 Aug up to
+    # the CURRENT date, so under the flag the window simply follows the calendar (candles stop at yesterday anyway)
+    END_DATE = datetime.now(IST).date()
 
 # Keep the historical one-year guard, but never reject the shared growing default window once
 # it becomes older than a year.
@@ -1729,6 +1851,10 @@ def rerun_command(slug: str, settings: list[dict] | None, frm, to) -> str:
     needs new data is one paste away instead of a guess."""
     cat = script_category()
     where = f"analysis/scripts/{cat}/{slug}.py" if cat else f"analysis/scripts/{slug}.py"
+    here = os.path.normcase(os.path.abspath(sys.argv[0] or ""))
+    if not cat and here.endswith(".py") and here.startswith(os.path.normcase(ANALYSIS_DIR) + os.sep):
+        # a script kept outside scripts/<category>/ (analysis/Indicators/, the user, 2026-10-03): its own path
+        where = "analysis/" + os.path.relpath(os.path.abspath(sys.argv[0]), ANALYSIS_DIR).replace(os.sep, "/")
     parts = [PYTHON_HINT, where, f"--from {frm}", f"--to {to}"]
     for s in settings or []:
         if s.get("derived"):        # inferred from variants, so the script has no such flag
@@ -2040,7 +2166,7 @@ def _price_fills(trades: list[dict], index: dict, option_sessions: dict | None) 
     done, kept = 0, {"entry": 0, "exit": 0, "scheduled": 0}
     for t in trades:
         src = opt.get(t["symbol"])          # the traded instrument's own bars: an option, or one stock of a book
-        if src is None:
+        if src is None and t.get("kind") != "option":   # an option with no candles kept is never priced off the index
             src = index
         e = _bar_at((src or {}).get(t["day"]), t["entry_time"])
         x = _bar_at((src or {}).get(t["exit_day"]), t["exit_time"])
@@ -2626,6 +2752,11 @@ def _combine(parts: list[dict], failed: dict[str, str], own_ladder: bool, rule_r
     m["lot_size"] = " · ".join(f"{i} {x.get('lot_size')}" for i, x in zip(insts, metas))
     for k in ("rule_steps", "limits", "rejected"):
         m[k] = _merge_lines([x.get(k) or [] for x in metas], insts)
+    if any(x.get("sources") for x in metas):                 # one table: a row shared by the indices appears once
+        seen_src: set = set()
+        rows_ = [x.get("sources") or [] for x in metas]      # row by row across the indices, so each index's own
+        m["sources"] = [r_ for k in range(max(len(r) for r in rows_)) for r in rows_ if k < len(r) for r_ in [r[k]]
+                        if not (json.dumps(r_, sort_keys=True) in seen_src or seen_src.add(json.dumps(r_, sort_keys=True)))]
     if any(x.get("rule_sections") for x in metas):           # a part that differs by index appears once per index
         m["rule_sections"] = _merge_lines([x.get("rule_sections") or [] for x in metas], insts)
     params: dict = {}
@@ -2700,7 +2831,7 @@ def _combine(parts: list[dict], failed: dict[str, str], own_ladder: bool, rule_r
                          chart=base["chart"], sessions_log=log, worst_only=base["worst_only"], index_by=index_by)
 
 
-def run_instruments(script: str, instruments=INDEX_INSTRUMENTS, ladder=STRIKE_LADDER) -> str:
+def run_instruments(script: str, instruments=INDEX_INSTRUMENTS, ladder=STRIKE_LADDER, keep=()) -> str:
     """Run an index strategy on every index on local disk and every strike of the ladder (6 ITM ..
     ATM), and write ONE report: an Instrument selector ('all' adds the books together) and a Strike
     depth setting (the user, 2026-09-30).
@@ -2718,7 +2849,9 @@ def run_instruments(script: str, instruments=INDEX_INSTRUMENTS, ladder=STRIKE_LA
     of the rule's own settings are kept (the user's choice: the report stays a size a browser can
     open).  Build_payload() inputs are collected, write_report() is held back, and the combined
     report is written at the end.  --instruments NIFTY and --rungs 6,0 narrow the runs.  An index
-    whose rule run fails is left out and the report says so."""
+    whose rule run fails is left out and the report says so.
+    `keep`: setting keys kept in full at EVERY strike, e.g. ("first_exit",) - otherwise the page snaps the
+    other settings back to the rule's values when a strike is changed (the owner, 2026-10-11, onh_v5_rule)."""
     import runpy
     import traceback
     argv = list(sys.argv)
@@ -2777,7 +2910,7 @@ def run_instruments(script: str, instruments=INDEX_INSTRUMENTS, ladder=STRIKE_LA
                 p = parts[-1]
                 if r == rule_rung:
                     if combo is None:
-                        combo = _rule_combo(p["settings"], p["trades"])
+                        combo = {k: v for k, v in _rule_combo(p["settings"], p["trades"]).items() if k not in keep}
                     continue
                 # another strike: the rule's own settings only
                 p["trades"] = [t for t in p["trades"] if all(t["variant"].get(k) == v for k, v in combo.items())]

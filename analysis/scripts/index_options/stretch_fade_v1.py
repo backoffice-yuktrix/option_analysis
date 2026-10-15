@@ -1,11 +1,12 @@
-"""5-Day Stretch Fade - v3: fade a stretched NIFTY on a confirmed rejection of the day's average line, with a real 1:2
+"""5-Day Stretch Fade - v1 (the former v3, renamed on 2026-10-03 when the old v1 - the plain 11:00 fade - was removed
+at the user's request): fade a stretched NIFTY on a confirmed rejection of the day's average line, with a real 1:2
 in rupees - a stop that follows volatility and a target of twice the stop plus the cost of the fills.
 
 THE PROMPT (the user, 2026-09-29): "if we do not enter at the right entry point the risk is higher than the reward - so
 find the exact thing ... if you risk 25 points in the nifty the target is only 50, think like that and then for premium
 too; you can place the stop based on the volatility too but your reward is to be 2x ... use multiple time frame
 analysis - use only the 1 min candle for the backtest but the open/high/low/close of multiple time frames", then
-"make this as v3" - the rule found in that day's precise-entry research (scratchpad; summarised below).
+"make this as v3" (now v1) - the rule found in that day's precise-entry research (scratchpad; summarised below).
 
 THE RULE   (range = the average daily range of the last 10 sessions, true range - high to low, or the gap from the
             previous close when bigger - simple average; about 224 NIFTY points this year)
@@ -59,7 +60,7 @@ import argparse
 import numpy as np
 
 CATEGORY = "index_options"
-SLUG = "stretch_fade_v3"
+SLUG = "stretch_fade_v1"
 SIGNAL_MIN = "11:00"            # the decision candle
 CUT_RULE = "12:30"              # the last minute a signal candle may end, in the rule
 CUT_MAX = "13:30"               # signals are simulated to here; 'Entries until' selects among them
@@ -601,7 +602,7 @@ def main() -> None:
     ]
     lot = trades[-1]["qty"] // LOTS if trades else None
     meta = {
-        "title": "5-Day Stretch Fade v3",
+        "title": "5-Day Stretch Fade v1",
         "subtitle": "At 11:00, when NIFTY is stretched 0.8 x its 10-day average range from its close 5 sessions ago or "
                     "the middle of its 10-day range, wait for a 10-minute close back through the day's average line "
                     "that the last 15-minute candle confirms, and buy a 6-ITM option against the stretch. Stop 1 x the "
