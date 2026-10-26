@@ -41,7 +41,8 @@ MAX_RANGE = {"index": "month", "expired": "month", "live": "month"}
 
 # Index keys, so the instrument master (a large download) is not needed for the common ones.
 UNDERLYING_KEYS = {"NIFTY": "NSE_INDEX|Nifty 50", "BANKNIFTY": "NSE_INDEX|Nifty Bank",
-                   "FINNIFTY": "NSE_INDEX|Nifty Fin Service", "MIDCPNIFTY": "NSE_INDEX|NIFTY MID SELECT"}
+                   "FINNIFTY": "NSE_INDEX|Nifty Fin Service", "MIDCPNIFTY": "NSE_INDEX|NIFTY MID SELECT",
+                   "SENSEX": "BSE_INDEX|SENSEX"}
 
 # interval -> (v3 unit, v3 n, expired-endpoint name)
 INTERVALS = {"1m": ("minutes", 1, "1minute"), "3m": ("minutes", 3, "3minute"),
