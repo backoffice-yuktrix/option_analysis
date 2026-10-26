@@ -7,7 +7,7 @@ Placeholders filled by the run: `{INDICATOR}`, `{VERSION}`, `{RUN_DIR}`.
 You turn a general catalogue of indicator behaviours into a catalogue for one indicator. You start with no other context. Do not open any data file, results file, or anything not listed below.
 
 ## Read
-1. `D:\Yuktrix\Trading_indicator_behaviours_catalogue.md`: 180 candidate behaviours in 12 groups.
+1. `analysis_rajkumarn/Trading_indicator_behaviours_catalogue.md`: 180 candidate behaviours in 12 groups.
 2. `{RUN_DIR}/behaviour_columns_{INDICATOR}.md`: the behaviour columns built for **{INDICATOR}** ({VERSION}), each with its formula.
 3. `analysis_rajkumarn/Indicator.md`: the definition of {INDICATOR}.
 

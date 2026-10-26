@@ -3,7 +3,7 @@
 Status: **draft for discussion**, fourth version (2026-10-25). Nothing here is decided until it is moved into `Approach_Steps.md`. Section 11 lists what the user still has to decide; where this draft needs a value it uses the suggested default from there, marked **[G#]**.
 
 How this version was made:
-1. Version 1 from `Approach_Steps.md` (Instructions, Phases 0-3), `Indicator.md`, and the user's notes `D:\Yuktrix\Trading_llm_pattern_discovery_workflow.md`, `D:\Yuktrix\Trading_indicator_categories.md`, `D:\Yuktrix\Trading_indicator_behaviours_catalogue.md`.
+1. Version 1 from `Approach_Steps.md` (Instructions, Phases 0-3), `Indicator.md`, and the user's notes `analysis_rajkumarn/Trading_llm_pattern_discovery_workflow.md`, `analysis_rajkumarn/Trading_llm_pattern_discovery_workflow2.md`, `analysis_rajkumarn/Trading_indicator_categories.md`, `analysis_rajkumarn/Trading_indicator_behaviours_catalogue.md`.
 2. Version 2 after a cold review by a separate agent with no memory of the discussion.
 3. Version 3 rebuilt Phases 4 and 5 on the user's flow (4.1 - 4.3, 5.1 - 5.8) and added one prompt file per subagent.
 4. **Version 4 (this one)** after a second cold review of version 3 and the seven prompt files (`Approach_Steps_SubAgent_Reviewer.md`). Its findings were checked against the documents. The prompt files still have the version-3 wording; they are updated once section 11 is decided, because several of them depend on those answers.

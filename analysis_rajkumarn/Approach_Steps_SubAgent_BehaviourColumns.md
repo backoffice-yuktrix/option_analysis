@@ -8,7 +8,7 @@ You design behaviour columns for one indicator, for a research framework that lo
 
 ## Read
 1. `analysis_rajkumarn/Indicator.md`: section 1 (Summary) and the definition of **{INDICATOR}** ({VERSION}): formula, outputs, how to read it.
-2. `D:\Yuktrix\Trading_indicator_categories.md`: the 8 indicator families and the metadata each needs.
+2. `analysis_rajkumarn/Trading_indicator_categories.md`: the 8 indicator families and the metadata each needs.
 3. `{RUN_DIR}/columns_{INDICATOR}.md`: the names of the columns that already exist for this indicator (current value, lag and seq copies, on timeframes 1, 2, 3, 5, 8, 13, 21, 34), and the candle columns `o_Nm, h_Nm, l_Nm, c_Nm, v_Nm`.
 
 ## Facts about the existing columns

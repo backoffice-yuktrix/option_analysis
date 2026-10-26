@@ -9,7 +9,7 @@ You are reviewing a research-method document with no prior context. Be a rigorou
 ## Read fully
 1. `analysis_rajkumarn/Approach_Steps.md`: the agreed method so far (Instructions, Phases 0-3). Authoritative for anything already decided.
 2. `analysis_rajkumarn/Indicator.md`: the indicator definitions.
-3. `D:\Yuktrix\Trading_llm_pattern_discovery_workflow.md`, `D:\Yuktrix\Trading_indicator_categories.md`, `D:\Yuktrix\Trading_indicator_behaviours_catalogue.md`: the user's design notes.
+3. `analysis_rajkumarn/Trading_llm_pattern_discovery_workflow.md`, `analysis_rajkumarn/Trading_indicator_categories.md`, `analysis_rajkumarn/Trading_indicator_behaviours_catalogue.md`: the user's design notes.
 4. `{DRAFT}` and `{EXTRA}`.
 
 ## Look for
